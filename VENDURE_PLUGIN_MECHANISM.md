@@ -739,7 +739,7 @@ vendure-config.ts 执行
     └─→ 配置 entityOptions.metadataModifiers 数组
     ↓
 preBootstrapConfig 阶段
-    ├─→ getAllEntities(userConfig.plugins) 收集实体类引用
+    ├─→ getAllEntities(userConfig) 收集实体类引用（内部调用 getEntitiesFromPlugins(userConfig.plugins)
     ├─→ registerCustomEntityFields() 添加自定义字段
     └─→ runEntityMetadataModifiers() 执行统一修改器
     ↓
