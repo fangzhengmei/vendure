@@ -12,9 +12,9 @@ Vendure 的插件加载遵循一个严格的、分阶段的启动流程，确保
 ```
 调用顺序:
 1. setConfig(userConfig)          - 初始化用户配置
-2. getAllEntities(userConfig)     - 从原始 userConfig 收集核心实体 + 插件定义的实体
+2. getAllEntities(userConfig)     - 从 userConfig.plugins 收集核心实体 + 插件定义的实体
 3. setConfig(dbConnectionOptions) - 将实体注册到数据库连接配置
-4. runPluginConfigurations()      - 按顺序执行所有插件的 configuration 函数
+4. runPluginConfigurations()      - 按顺序执行所有插件的 configuration 函数（可修改 config.plugins）
 5. setEntityIdStrategy()          - 应用实体 ID 策略
 6. setMoneyStrategy()             - 应用货币策略
 7. validateCustomFieldsConfig()   - 验证自定义字段配置
@@ -24,26 +24,104 @@ Vendure 的插件加载遵循一个严格的、分阶段的启动流程，确保
 
 **阶段 2: 插件兼容性检查（checkPluginCompatibility）**
 - 在 `preBootstrapConfig` 完成之后执行
-- 遍历所有插件，检查其 `compatibility` 字段与当前 Vendure 版本
+- 遍历 `config.plugins`（经过 configuration 函数可能修改后的最终列表）
+- 检查每个插件的 `compatibility` 字段与当前 Vendure 版本
 - 使用 semver 的 `satisfies` 函数验证版本兼容性
 - 不兼容的插件会阻止启动，除非在 `ignoreCompatibilityErrorsForPlugins` 中明确豁免
 
 **阶段 3: NestJS 模块加载**
 - `PluginModule.forRoot()` 动态导入 `getConfig().plugins` 中的所有插件
+- `createDynamicGraphQlModulesForPlugins()` 遍历 `getConfig().plugins` 创建 Resolver 模块
+- `extendSchemaWithPluginApiExtensions()` 使用 `config.plugins` 应用 Schema 扩展
 - 插件作为 NestJS Module 被加载，其 imports、providers、controllers 等被注册到 DI 容器
 - ⚠️ **重要时序约束**：此时所有实体已注册完成，模块加载时可安全依赖数据库 schema
 
-### 1.2 实体注册先于模块加载的时序约束
+### 1.2 config.plugins 的阶段化影响
+
+**⚠️ 核心结论**：`config.plugins` 在不同阶段有不同的来源，插件 configuration 函数对其修改的影响范围有明确边界。
+
+| 阶段 | 使用的 plugins 来源 | configuration 函数修改 config.plugins 是否生效 |
+|------|-------------------|-----------------------------------------------|
+| **实体收集阶段** | `userConfig.plugins`（原始配置） | ❌ **不生效** - 实体在 runPluginConfigurations 之前收集 |
+| **兼容性检查阶段** | `config.plugins`（最终配置） | ✅ **生效** - 检查的是经过修改后的最终列表 |
+| **模块加载阶段** | `getConfig().plugins`（最终配置） | ✅ **生效** - 加载的是经过修改后的最终列表 |
+
+**代码证据链**：
+
+```typescript
+// 证据 1：实体收集使用原始 userConfig.plugins
+// bootstrap.ts:379-381
+export function getAllEntities(userConfig: Partial<VendureConfig>): Array<Type<any>> {
+    const coreEntities = Object.values(coreEntitiesMap) as Array<Type<any>>;
+    const pluginEntities = getEntitiesFromPlugins(userConfig.plugins);  // ✅ 原始 userConfig
+    // ...
+}
+
+// 证据 2：runPluginConfigurations 可修改 config.plugins
+// bootstrap.ts:365-373
+export async function runPluginConfigurations(config: RuntimeVendureConfig): Promise<RuntimeVendureConfig> {
+    for (const plugin of config.plugins) {
+        const configFn = getConfigurationFunction(plugin);
+        if (typeof configFn === 'function') {
+            const result = await configFn(config);
+            Object.assign(config, result);  // ✅ 浅拷贝合并，可修改 plugins
+        }
+    }
+    return config;
+}
+
+// 证据 3：兼容性检查使用修改后的 config.plugins
+// bootstrap.ts:328-332
+function checkPluginCompatibility(config: RuntimeVendureConfig, ...): void {
+    for (const plugin of config.plugins) {  // ✅ 最终 config
+        // ... 检查兼容性
+    }
+}
+
+// 证据 4：模块加载使用最终配置
+// plugin.module.ts:14-19
+export class PluginModule {
+    static forRoot(): DynamicModule {
+        return {
+            module: PluginModule,
+            imports: [...getConfig().plugins],  // ✅ 最终 config
+        };
+    }
+}
+
+// dynamic-plugin-api.module.ts:15-17
+export function createDynamicGraphQlModulesForPlugins(apiType: 'shop' | 'admin'): DynamicModule[] {
+    return getConfig().plugins.map(plugin => {  // ✅ 最终 config
+        // ... 创建动态模块
+    });
+}
+
+// get-final-vendure-schema.ts:99, 126
+schema = extendSchemaWithPluginApiExtensions(schema, config.plugins, apiType);  // ✅ 最终 config
+getPluginAPIExtensions(plugins, apiType)  // ✅ 接收最终 plugins
+```
+
+**实际影响场景**：
+- 如果插件 A 的 configuration 函数向 `config.plugins` 中添加了新插件 B
+  - ✅ 插件 B 会被进行兼容性检查
+  - ✅ 插件 B 会作为 NestJS Module 被加载
+  - ❌ 插件 B 定义的实体不会被收集（因为实体收集在 configuration 之前执行）
+- 如果插件 A 的 configuration 函数从 `config.plugins` 中移除了插件 B
+  - ✅ 插件 B 不会被进行兼容性检查
+  - ✅ 插件 B 不会作为 NestJS Module 被加载
+  - ❌ 插件 B 定义的实体已经被收集，仍然会存在于数据库 schema 中
+
+### 1.3 实体注册先于模块加载的时序约束
 
 ```
 时序图:
-preBootstrapConfig()
+preBootstrapConfig(userConfig)
     ↓
-getAllEntities(userConfig)  →  从原始配置收集核心实体 + 插件实体
+getAllEntities(userConfig)  →  从 userConfig.plugins 收集实体（不可再改变）
     ↓
-setConfig(dbConnectionOptions.entities)  →  实体注册到 TypeORM 配置
+setConfig(dbConnectionOptions.entities)  →  实体注册到 TypeORM
     ↓
-runPluginConfigurations(config)  →  插件配置函数执行（可修改 config 对象）
+runPluginConfigurations(config)  →  可修改 config.plugins（影响后续阶段）
     ↓
 registerCustomEntityFields()  →  自定义字段注册
     ↓
@@ -51,21 +129,23 @@ runEntityMetadataModifiers()  →  实体元数据修改完成
     ↓
 preBootstrapConfig 返回 config  →  ✅ 实体层完全就绪
     ↓
-checkPluginCompatibility(config)  →  版本兼容性检查
+checkPluginCompatibility(config.plugins)  →  使用最终 plugins 列表
     ↓
 import('./app.module.js')  →  模块加载开始
     ↓
 PluginModule.forRoot()  →  从 getConfig().plugins 加载插件为 NestJS Module
     ↓
+createDynamicGraphQlModulesForPlugins()  →  从 getConfig().plugins 创建 Resolver 模块
+    ↓
 NestFactory.create()  →  DI 容器初始化完成
 ```
 
-**设计意图：**
+**设计意图**：
 - 确保 TypeORM 连接建立时，所有实体元数据已就绪
 - 避免模块加载时因实体未注册导致的运行时错误
-- 插件的 configuration 函数可以修改配置，但对实体集合的影响有明确边界
+- 插件的 configuration 函数可以动态增删插件，但对实体集合的影响有明确边界
 
-### 1.3 插件 configuration 函数执行顺序
+### 1.4 插件 configuration 函数执行顺序
 
 `runPluginConfigurations()` 函数（bootstrap.ts:365-374）按照插件在配置数组中的顺序依次执行：
 
@@ -82,20 +162,21 @@ export async function runPluginConfigurations(config: RuntimeVendureConfig): Pro
 }
 ```
 
-**关键特性：**
+**关键特性**：
 - 顺序执行：插件 A 的配置修改会被插件 B 看到
 - 可链式修改：后执行的插件可以覆盖先执行插件的配置
 - 支持异步：configuration 函数可以是 async
 - 执行时机：在实体注册之后、模块加载之前
+- 可修改 `config.plugins`：影响后续的兼容性检查和模块加载
 
-### 1.4 GraphQL Schema 扩展加载顺序
+### 1.5 GraphQL Schema 扩展加载顺序
 
 在 `get-final-vendure-schema.ts` 中，Schema 构建遵循以下顺序：
 
 ```
 1. 加载基础 Schema（从 .graphql 文件）
 2. 应用插件 API 扩展（extendSchemaWithPluginApiExtensions）
-   - 按插件配置顺序应用 shopApiExtensions / adminApiExtensions
+   - 遍历 config.plugins（最终列表）按顺序应用扩展
 3. 生成 ListOptions 类型
 4. 添加自定义字段
 5. 生成认证类型
@@ -103,7 +184,7 @@ export async function runPluginConfigurations(config: RuntimeVendureConfig): Pro
 7. 生成权限枚举
 ```
 
-**重要：** 插件 Schema 扩展在自定义字段之前应用，这意味着自定义字段可以基于插件扩展的类型。
+**重要**：插件 Schema 扩展在自定义字段之前应用，这意味着自定义字段可以基于插件扩展的类型。
 
 ---
 
@@ -128,7 +209,7 @@ Vendure 插件的依赖注入基于 NestJS 的 DI 系统，但增加了特定的
 | `ProcessContextModule` | 进程上下文 |
 | `DataImportModule` | 数据导入服务 |
 
-**插件使用示例：**
+**插件使用示例**：
 ```typescript
 @VendurePlugin({
     imports: [PluginCommonModule],
@@ -158,7 +239,7 @@ const exportedProviders = (nestModuleMetadata.providers || []).filter(provider =
 nestModuleMetadata.exports = [...(nestModuleMetadata.exports || []), ...exportedProviders];
 ```
 
-**设计意图：**
+**设计意图**：
 - GraphQL Resolvers 被动态创建在单独的 Module 中
 - 这些 Resolvers 需要依赖插件中定义的服务
 - 自动导出确保了这些服务对动态创建的 Resolver Module 可见
@@ -170,7 +251,7 @@ nestModuleMetadata.exports = [...(nestModuleMetadata.exports || []), ...exported
 ```typescript
 export function createDynamicGraphQlModulesForPlugins(apiType: 'shop' | 'admin'): DynamicModule[] {
     return getConfig()
-        .plugins.map(plugin => {
+        .plugins.map(plugin => {  // ✅ 使用最终 config.plugins
             const pluginModule = isDynamicModule(plugin) ? plugin.module : plugin;
             const resolvers = graphQLResolversFor(plugin, apiType) || [];
 
@@ -186,7 +267,7 @@ export function createDynamicGraphQlModulesForPlugins(apiType: 'shop' | 'admin')
 }
 ```
 
-**依赖注入流程：**
+**依赖注入流程**：
 1. 动态模块 imports 原插件模块，继承其所有 providers
 2. Resolvers 作为 providers 注册到动态模块
 3. NestJS DI 系统自动解析 Resolver 的构造函数依赖
@@ -197,7 +278,7 @@ export function createDynamicGraphQlModulesForPlugins(apiType: 'shop' | 'admin')
 - **请求范围**：可以使用 `@Injectable({ scope: Scope.REQUEST })` 创建请求范围的 provider
 - **Transient 范围**：每次注入都创建新实例
 
-**注意：** RequestContext 不是通过 DI 注入的，而是通过 `@Ctx()` 装饰器作为方法参数传递。
+**注意**：RequestContext 不是通过 DI 注入的，而是通过 `@Ctx()` 装饰器作为方法参数传递。
 
 ---
 
@@ -226,7 +307,7 @@ Vendure 提供了**两条独立的实体元数据扩展路径**，以及明确�
 ```typescript
 export function getAllEntities(userConfig: Partial<VendureConfig>): Array<Type<any>> {
     const coreEntities = Object.values(coreEntitiesMap) as Array<Type<any>>;
-    const pluginEntities = getEntitiesFromPlugins(userConfig.plugins);
+    const pluginEntities = getEntitiesFromPlugins(userConfig.plugins);  // ✅ 原始 userConfig
 
     const allEntities: Array<Type<any>> = coreEntities;
 
@@ -244,7 +325,7 @@ export function getAllEntities(userConfig: Partial<VendureConfig>): Array<Type<a
 
 **⚠️ 关键证据**：`getAllEntities(userConfig)` 的参数是原始的 `userConfig`，而不是经过 `runPluginConfigurations` 修改后的 `config`。
 
-**实体收集流程：**
+**实体收集流程**：
 1. 收集核心实体（coreEntitiesMap）
 2. 调用 `getEntitiesFromPlugins(userConfig.plugins)` 收集所有插件的实体
 3. 按实体名称检查冲突
@@ -268,7 +349,7 @@ export function getEntitiesFromPlugins(plugins?: Array<Type<any> | DynamicModule
 }
 ```
 
-**支持两种实体定义方式：**
+**支持两种实体定义方式**：
 - 静态数组：`entities: [Entity1, Entity2]`
 - 函数形式：`entities: () => [Entity1, Entity2]`（支持条件逻辑）
 
@@ -397,20 +478,27 @@ const entities = getAllEntities(userConfig);  // ✅ 使用原始 userConfig
 
 `getAllEntities()` 的参数是传入 `preBootstrapConfig` 的原始 `userConfig`，此时 `runPluginConfigurations` 尚未执行。
 
-**证据 2：配置函数通过 Object.assign 浅合并**
+**证据 2：实体注册后 configuration 才执行**
+```typescript
+// bootstrap.ts:294-312
+const entities = getAllEntities(userConfig);       // 第 2 步：收集实体
+await setConfig({ dbConnectionOptions: { entities } }); // 第 3 步：注册实体
+// ...
+config = await runPluginConfigurations(config);   // 第 4 步：执行配置函数（在实体注册之后！）
+```
+
+**证据 3：配置函数通过 Object.assign 浅合并**
 ```typescript
 // bootstrap.ts:369-370
 const result = await configFn(config);
 Object.assign(config, result);  // ✅ 浅拷贝合并
 ```
 
-`Object.assign` 是浅拷贝，只会合并 result 的顶层属性到 config。
-
 **影响边界总结表**：
 
 | 操作 | 是否可行 | 说明 |
 |------|---------|------|
-| 修改 `config.plugins` 数组 | ❌ 无效 | 实体已从 `userConfig.plugins` 收集，修改不影响已收集的实体 |
+| 修改 `config.plugins` 增删插件 | ✅ 部分生效 | 影响兼容性检查和模块加载，但不影响已收集的实体 |
 | 修改 `config.dbConnectionOptions.entities` | ✅ 有效 | 直接替换实体数组，后续 TypeORM 连接会使用修改后的列表 |
 | 通过 `config.entityOptions.metadataModifiers` 添加修改器 | ✅ 有效 | 修改器在后续的 `runEntityMetadataModifiers` 中执行 |
 | 添加新的实体类到 `entities` 数组 | ✅ 条件可行 | 必须确保实体类已导入且元数据已注册 |
@@ -419,6 +507,7 @@ Object.assign(config, result);  // ✅ 浅拷贝合并
 - 虽然技术上可以修改 `dbConnectionOptions.entities`，但这不是推荐的做法
 - 推荐方式是在插件的 `entities` 元数据中声明实体，让系统统一收集
 - 修改 `entities` 数组可能导致实体名称冲突检查被绕过
+- 在 configuration 函数中增删插件时，新增插件的实体会缺失，被删插件的实体会残留
 
 ### 3.7 迁移命令复用预启动配置管线
 
@@ -456,8 +545,8 @@ export async function revertLastMigration(userConfig: Partial<VendureConfig>) {
 
 | 阶段 | 迁移时执行 | 运行时执行 | 作用 |
 |------|-----------|-----------|------|
-| getAllEntities() | ✅ | ✅ | 收集核心 + 插件实体 |
-| runPluginConfigurations() | ✅ | ✅ | 应用插件配置修改 |
+| getAllEntities() | ✅ | ✅ | 从 userConfig.plugins 收集核心 + 插件实体 |
+| runPluginConfigurations() | ✅ | ✅ | 应用插件配置修改（可修改 config.plugins） |
 | registerCustomEntityFields() | ✅ | ✅ | 注册自定义字段 |
 | runEntityMetadataModifiers() | ✅ | ✅ | 应用实体元数据修改 |
 
@@ -472,7 +561,7 @@ export async function revertLastMigration(userConfig: Partial<VendureConfig>) {
 1. 开发者添加插件或修改自定义字段配置
 2. 运行 `vendure migration:generate -n MyChange`
    → 内部调用 preBootstrapConfig()
-   → 收集所有实体（含插件实体）
+   → 从 userConfig.plugins 收集所有实体（含插件实体）
    → 比较数据库 schema 与实体元数据
    → 生成迁移脚本
 3. 运行 `vendure migration:run`
@@ -508,7 +597,7 @@ function checkPluginCompatibility(
     config: RuntimeVendureConfig,
     ignoredPlugins: Array<DynamicModule | Type<any>> = [],
 ): void {
-    for (const plugin of config.plugins) {
+    for (const plugin of config.plugins) {  // ✅ 使用最终 config.plugins
         const compatibility = getCompatibility(plugin);
         const pluginName = (plugin as any).name as string;
         if (!compatibility) {
@@ -528,7 +617,7 @@ function checkPluginCompatibility(
 
 ### 4.2 执行时机
 
-**⚠️ 关键事实**：兼容性检查在 `preBootstrapConfig` **之后**执行，而不是之前。
+**⚠️ 关键事实**：兼容性检查在 `preBootstrapConfig` **之后**执行，检查的是 `config.plugins`（经过 configuration 函数可能修改后的列表）。
 
 **bootstrap 函数中的实际顺序**：
 ```typescript
@@ -536,10 +625,10 @@ export async function bootstrap(
     userConfig: Partial<VendureConfig>,
     options?: BootstrapOptions,
 ): Promise<INestApplication> {
-    const config = await preBootstrapConfig(userConfig);  // 1. 预启动配置
+    const config = await preBootstrapConfig(userConfig);  // 1. 预启动配置（内部可能修改 config.plugins）
     Logger.useLogger(config.logger);
     Logger.info(`Bootstrapping Vendure Server...`);
-    checkPluginCompatibility(config, options?.ignoreCompatibilityErrorsForPlugins);  // 2. 兼容性检查
+    checkPluginCompatibility(config, options?.ignoreCompatibilityErrorsForPlugins);  // 2. 检查最终 config.plugins
     
     // ... 后续模块加载
 }
@@ -574,6 +663,7 @@ export async function bootstrap(
 4. **分阶段加载**：配置 → 实体 → Schema → 服务，确保依赖顺序正确
 5. **时序强约束**：实体注册先于模块加载，保证 TypeORM 连接安全
 6. **多路径扩展**：提供插件 init() 和统一修改器两条实体元数据扩展路径
+7. **阶段化插件列表**：`userConfig.plugins` 用于实体收集，`config.plugins` 用于兼容性检查和模块加载
 
 ### 5.2 插件能力边界
 
@@ -588,6 +678,7 @@ export async function bootstrap(
 | REST API | `controllers` |
 | 事件监听 | 注入 `EventBus` 订阅事件 |
 | 后台任务 | `JobQueueService` + `JobQueueStrategy` |
+| 动态增删插件 | configuration 函数中修改 `config.plugins` |
 
 ### 5.3 关键数据流
 
@@ -596,21 +687,24 @@ export async function bootstrap(
     ↓
 Plugin.init() 被调用  →  [可选] 插件直接修改自有实体元数据
     ↓
+bootstrap(userConfig)
+    ↓
 preBootstrapConfig(userConfig)
-    ├─→ getAllEntities(userConfig) 从原始配置收集所有实体
+    ├─→ getAllEntities(userConfig) 从 userConfig.plugins 收集所有实体（快照）
     ├─→ setConfig() 注册实体到 TypeORM
     ├─→ runPluginConfigurations(config) 执行插件配置函数
-    │   └─→ 可修改 config.dbConnectionOptions.entities
+    │   ├─→ 可修改 config.plugins（影响后续阶段）
+    │   ├─→ 可修改 config.dbConnectionOptions.entities
     │   └─→ 可添加/修改 config.entityOptions.metadataModifiers
     ├─→ registerCustomEntityFields() 注册自定义字段
     └─→ runEntityMetadataModifiers() 应用统一元数据修改器
     ↓
-checkPluginCompatibility(config) 验证版本兼容性
+checkPluginCompatibility(config.plugins) 验证最终列表的版本兼容性
     ↓
 import('./app.module.js') 模块加载开始
-    ├─→ PluginModule.forRoot() 从 getConfig().plugins 加载插件
-    ├─→ ApiModule 构建 GraphQL Schema（含插件扩展）
-    └─→ 动态创建 Resolver 模块
+    ├─→ PluginModule.forRoot() 从 getConfig().plugins 加载插件为 NestJS Module
+    ├─→ createDynamicGraphQlModulesForPlugins() 从 getConfig().plugins 创建 Resolver 模块
+    └─→ extendSchemaWithPluginApiExtensions() 从 config.plugins 应用 Schema 扩展
     ↓
 NestFactory.create() 启动应用
     └─→ 触发 OnApplicationBootstrap 生命周期钩子
@@ -645,7 +739,7 @@ vendure-config.ts 执行
     └─→ 配置 entityOptions.metadataModifiers 数组
     ↓
 preBootstrapConfig 阶段
-    ├─→ getAllEntities() 收集实体类引用
+    ├─→ getAllEntities(userConfig.plugins) 收集实体类引用
     ├─→ registerCustomEntityFields() 添加自定义字段
     └─→ runEntityMetadataModifiers() 执行统一修改器
     ↓
