@@ -1,8 +1,8 @@
 # Vendure 插件机制分析
 
-## 一、插件加载顺序
+## 一、插件加载顺序与时序约束
 
-Vendure 的插件加载遵循一个严格的、分阶段的启动流程，确保所有扩展在应用启动前正确配置。
+Vendure 的插件加载遵循一个严格的、分阶段的启动流程，确保所有扩展在应用启动前正确配置。其中**实体注册先于模块加载**是核心时序约束。
 
 ### 1.1 启动引导流程（bootstrap）
 
@@ -12,7 +12,7 @@ Vendure 的插件加载遵循一个严格的、分阶段的启动流程，确保
 ```
 调用顺序:
 1. setConfig(userConfig)          - 初始化用户配置
-2. getAllEntities()               - 收集核心实体 + 插件定义的实体
+2. getAllEntities()               - 收集核心实体 + 插件定义的实体 ✓ 实体注册完成
 3. setConfig(dbConnectionOptions) - 将实体注册到数据库连接配置
 4. runPluginConfigurations()      - 按顺序执行所有插件的 configuration 函数
 5. setEntityIdStrategy()          - 应用实体 ID 策略
@@ -23,6 +23,7 @@ Vendure 的插件加载遵循一个严格的、分阶段的启动流程，确保
 ```
 
 **阶段 2: 插件兼容性检查（checkPluginCompatibility）**
+- 在 `preBootstrapConfig` 完成之后执行
 - 遍历所有插件，检查其 `compatibility` 字段与当前 Vendure 版本
 - 使用 semver 的 `satisfies` 函数验证版本兼容性
 - 不兼容的插件会阻止启动，除非在 `ignoreCompatibilityErrorsForPlugins` 中明确豁免
@@ -30,8 +31,39 @@ Vendure 的插件加载遵循一个严格的、分阶段的启动流程，确保
 **阶段 3: NestJS 模块加载**
 - `PluginModule.forRoot()` 动态导入所有配置的插件
 - 插件作为 NestJS Module 被加载，其 imports、providers、controllers 等被注册到 DI 容器
+- ⚠️ **重要时序约束**：此时所有实体已注册完成，模块加载时可安全依赖数据库 schema
 
-### 1.2 插件 configuration 函数执行顺序
+### 1.2 实体注册先于模块加载的时序约束
+
+```
+时序图:
+preBootstrapConfig()
+    ↓
+getAllEntities()  →  收集核心实体 + 插件实体
+    ↓
+setConfig(dbConnectionOptions.entities)  →  实体注册到 TypeORM 配置
+    ↓
+runPluginConfigurations()  →  插件配置函数执行
+    ↓
+registerCustomEntityFields()  →  自定义字段注册
+    ↓
+runEntityMetadataModifiers()  →  实体元数据修改完成
+    ↓
+preBootstrapConfig 返回  →  ✅ 实体层完全就绪
+    ↓
+import('./app.module.js')  →  模块加载开始
+    ↓
+PluginModule.forRoot()  →  插件作为 NestJS Module 加载
+    ↓
+NestFactory.create()  →  DI 容器初始化完成
+```
+
+**设计意图：**
+- 确保 TypeORM 连接建立时，所有实体元数据已就绪
+- 避免模块加载时因实体未注册导致的运行时错误
+- 插件的 configuration 函数可以修改配置，但不能改变已注册的实体集合
+
+### 1.3 插件 configuration 函数执行顺序
 
 `runPluginConfigurations()` 函数（bootstrap.ts:365-374）按照插件在配置数组中的顺序依次执行：
 
@@ -52,8 +84,9 @@ export async function runPluginConfigurations(config: RuntimeVendureConfig): Pro
 - 顺序执行：插件 A 的配置修改会被插件 B 看到
 - 可链式修改：后执行的插件可以覆盖先执行插件的配置
 - 支持异步：configuration 函数可以是 async
+- 执行时机：在实体注册之后、模块加载之前
 
-### 1.3 GraphQL Schema 扩展加载顺序
+### 1.4 GraphQL Schema 扩展加载顺序
 
 在 `get-final-vendure-schema.ts` 中，Schema 构建遵循以下顺序：
 
@@ -249,26 +282,119 @@ await setConfig({
 });
 ```
 
-### 3.5 动态实体字段扩展
+### 3.5 动态实体字段扩展（EntityMetadataModifier）
 
-除了完整的自定义实体，插件还可以通过 `EntityMetadataModifier` 动态修改现有实体：
+⚠️ **修正说明**：动态字段扩展不是通过插件直接实现的，而是通过 `config.entityOptions.metadataModifiers` 配置。
+
+`EntityMetadataModifier` 是一个配置级别的扩展点，定义在 `entity-metadata-modifier.ts`:
 
 ```typescript
-// 在 DefaultSearchPlugin 中动态添加字段
-private static addStockColumnsToEntity() {
-    const instance = new SearchIndexItem();
-    Column({ type: 'boolean', default: true })(instance, 'inStock');
-    Column({ type: 'boolean', default: true })(instance, 'productInStock');
+export type EntityMetadataModifier = (metadata: MetadataArgsStorage) => void | Promise<void>;
+```
+
+**使用方式（在 vendure-config.ts 中配置）：**
+```typescript
+export const config: VendureConfig = {
+    entityOptions: {
+        metadataModifiers: [
+            // 为 ProductVariant.sku 添加唯一索引
+            (metadata) => {
+                const instance = new ProductVariant();
+                Index({ unique: true })(instance, 'sku');
+            },
+            // 修改 ProductTranslation.description 的列类型
+            (metadata) => {
+                const descriptionColumnIndex = metadata.columns.findIndex(
+                    col => col.propertyName === 'description' && col.target === ProductTranslation,
+                );
+                if (-1 < descriptionColumnIndex) {
+                    metadata.columns.splice(descriptionColumnIndex, 1);
+                    const instance = new ProductTranslation();
+                    Column({ type: 'mediumtext' })(instance, 'description');
+                }
+            }
+        ]
+    }
+};
+```
+
+**执行时机**：在 `preBootstrapConfig` 的最后阶段调用 `runEntityMetadataModifiers()`：
+
+```typescript
+export async function runEntityMetadataModifiers(config: VendureConfig) {
+    if (config.entityOptions?.metadataModifiers?.length) {
+        const metadataArgsStorage = getMetadataArgsStorage();
+        for (const modifier of config.entityOptions.metadataModifiers) {
+            await modifier(metadataArgsStorage);
+        }
+    }
 }
 ```
 
-这通过 `runEntityMetadataModifiers()` 在启动时执行。
+**与插件自定义实体的区别：**
+- 插件 `entities`：添加全新的数据库表
+- `EntityMetadataModifier`：修改现有实体的元数据（添加索引、修改列类型等）
 
-### 3.6 迁移管理
+### 3.6 迁移命令复用预启动配置管线
 
-- 插件定义的实体需要通过 TypeORM 迁移来创建表
-- 开发者需要运行 `migration:generate` 来生成包含插件实体的迁移
-- 建议插件文档中明确说明需要的迁移步骤
+所有迁移命令（`runMigrations`、`generateMigration`、`revertLastMigration`）都复用同一套预启动配置管线，确保迁移时看到的实体 schema 与运行时完全一致。
+
+**migrate.ts 中的实现：**
+
+```typescript
+// 运行迁移
+export async function runMigrations(userConfig: Partial<VendureConfig>): Promise<string[]> {
+    const config = await preBootstrapConfig(userConfig);  // ✅ 复用预启动配置
+    const connection = await createConnection(createConnectionOptions(config));
+    // ... 执行迁移
+}
+
+// 生成迁移
+export async function generateMigration(
+    userConfig: Partial<VendureConfig>,
+    options: MigrationOptions,
+): Promise<string | undefined> {
+    const config = await preBootstrapConfig(userConfig);  // ✅ 复用预启动配置
+    const connection = await createConnection(createConnectionOptions(config));
+    // ... 生成迁移文件
+}
+
+// 回滚迁移
+export async function revertLastMigration(userConfig: Partial<VendureConfig>) {
+    const config = await preBootstrapConfig(userConfig);  // ✅ 复用预启动配置
+    const connection = await createConnection(createConnectionOptions(config));
+    // ... 回滚迁移
+}
+```
+
+**复用 preBootstrapConfig 带来的一致性保证：**
+
+| 阶段 | 迁移时执行 | 运行时执行 | 作用 |
+|------|-----------|-----------|------|
+| getAllEntities() | ✅ | ✅ | 收集核心 + 插件实体 |
+| runPluginConfigurations() | ✅ | ✅ | 应用插件配置修改 |
+| registerCustomEntityFields() | ✅ | ✅ | 注册自定义字段 |
+| runEntityMetadataModifiers() | ✅ | ✅ | 应用实体元数据修改 |
+
+**设计优势：**
+1. **Schema 一致性**：迁移生成的 schema 与运行时完全一致，避免"在我机器上能跑"问题
+2. **插件友好**：插件定义的实体会被自动包含在迁移中
+3. **配置感知**：插件 configuration 函数对配置的修改会影响迁移
+4. **单一真相源**：只有一套实体构建逻辑，避免重复代码
+
+**迁移工作流：**
+```
+1. 开发者添加插件或修改自定义字段配置
+2. 运行 `vendure migration:generate -n MyChange`
+   → 内部调用 preBootstrapConfig()
+   → 收集所有实体（含插件实体）
+   → 比较数据库 schema 与实体元数据
+   → 生成迁移脚本
+3. 运行 `vendure migration:run`
+   → 再次调用 preBootstrapConfig()
+   → 确保 TypeORM 连接使用完整的实体配置
+   → 执行迁移
+```
 
 ### 3.7 Worker 进程的数据库同步
 
@@ -286,38 +412,111 @@ async function validateDbTablesForWorker(worker: INestApplicationContext) {
 
 ---
 
-## 四、架构设计总结
+## 四、兼容性规则修正
 
-### 4.1 核心设计原则
+### 4.1 兼容性检查机制
+
+`checkPluginCompatibility()`（bootstrap.ts:328-360）的执行时机和规则：
+
+```typescript
+function checkPluginCompatibility(
+    config: RuntimeVendureConfig,
+    ignoredPlugins: Array<DynamicModule | Type<any>> = [],
+): void {
+    for (const plugin of config.plugins) {
+        const compatibility = getCompatibility(plugin);
+        const pluginName = (plugin as any).name as string;
+        if (!compatibility) {
+            Logger.info(
+                `The plugin "${pluginName}" does not specify a compatibility range, so it is not guaranteed to be compatible with this version of Vendure.`,
+            );
+        } else {
+            // 使用 semver.satisfies 验证
+            // 参数: { loose: true, includePrerelease: true }
+            if (!satisfies(VENDURE_VERSION, compatibility, { loose: true, includePrerelease: true })) {
+                // ... 处理不兼容
+            }
+        }
+    }
+}
+```
+
+### 4.2 执行时机修正
+
+⚠️ **修正说明**：兼容性检查在 `preBootstrapConfig` **之后**执行，而不是之前。
+
+**bootstrap 函数中的实际顺序：**
+```typescript
+export async function bootstrap(
+    userConfig: Partial<VendureConfig>,
+    options?: BootstrapOptions,
+): Promise<INestApplication> {
+    const config = await preBootstrapConfig(userConfig);  // 1. 预启动配置
+    Logger.useLogger(config.logger);
+    Logger.info(`Bootstrapping Vendure Server...`);
+    checkPluginCompatibility(config, options?.ignoreCompatibilityErrorsForPlugins);  // 2. 兼容性检查
+    
+    // ... 后续模块加载
+}
+```
+
+**设计原因：**
+- `preBootstrapConfig` 中的 `runPluginConfigurations()` 可能会动态修改 plugins 数组
+- 兼容性检查需要看到最终的插件列表
+
+### 4.3 兼容性规则详解
+
+| 场景 | 行为 |
+|------|------|
+| 插件未定义 `compatibility` | 记录 info 日志，继续加载 |
+| 插件定义 `compatibility` 且版本兼容 | 无日志，正常加载 |
+| 插件定义 `compatibility` 但版本不兼容 | 抛出错误，阻止启动 |
+| 不兼容但在 `ignoreCompatibilityErrorsForPlugins` 中 | 记录 warn 日志，继续加载 |
+
+**semver 验证参数说明：**
+- `loose: true`：允许宽松的版本号解析
+- `includePrerelease: true`：预发布版本（如 `3.0.0-beta.1`）可以匹配正常范围
+
+---
+
+## 五、架构设计总结
+
+### 5.1 核心设计原则
 
 1. **基于 NestJS Module 系统**：插件本质上是增强版的 NestJS Module
 2. **元数据驱动**：通过 Reflect metadata 存储和提取插件配置
 3. **约定优于配置**：自动导出 providers、标准化的扩展点
 4. **分阶段加载**：配置 → 实体 → Schema → 服务，确保依赖顺序正确
+5. **时序强约束**：实体注册先于模块加载，保证 TypeORM 连接安全
 
-### 4.2 插件能力边界
+### 5.2 插件能力边界
 
 | 能力 | 实现方式 |
 |------|----------|
 | 配置修改 | `configuration` 函数 |
-| 数据库扩展 | `entities` 字段 + TypeORM 实体 |
+| 数据库扩展（新表） | `entities` 字段 + TypeORM 实体 |
+| 数据库扩展（修改现有表） | `config.entityOptions.metadataModifiers` |
 | GraphQL 扩展 | `shopApiExtensions` / `adminApiExtensions` |
 | 业务逻辑 | `providers` + NestJS DI |
 | REST API | `controllers` |
 | 事件监听 | 注入 `EventBus` 订阅事件 |
 | 后台任务 | `JobQueueService` + `JobQueueStrategy` |
 
-### 4.3 关键数据流
+### 5.3 关键数据流
 
 ```
 用户配置 (vendure-config.ts)
     ↓
 preBootstrapConfig()
-    ├─→ 收集所有实体（核心 + 插件）
-    ├─→ 执行插件 configuration 函数
-    ├─→ 应用自定义字段和元数据修改器
+    ├─→ getAllEntities() 收集所有实体（核心 + 插件）
+    ├─→ setConfig() 注册实体到 TypeORM
+    ├─→ runPluginConfigurations() 执行插件配置函数
+    ├─→ registerCustomEntityFields() 注册自定义字段
+    └─→ runEntityMetadataModifiers() 应用实体元数据修改
     ↓
-AppModule 加载
+checkPluginCompatibility() 验证版本兼容性
+    ↓
+import('./app.module.js') 模块加载开始
     ├─→ PluginModule 导入所有插件
     ├─→ ApiModule 构建 GraphQL Schema（含插件扩展）
     └─→ 动态创建 Resolver 模块
@@ -326,9 +525,20 @@ NestFactory.create() 启动应用
     └─→ 触发 OnApplicationBootstrap 生命周期钩子
 ```
 
-### 4.4 版本兼容性管理
+### 5.4 预启动配置管线的复用
 
-- 插件必须声明 `compatibility` 字段（semver 范围）
-- 启动时自动验证版本兼容性
-- 提供 `ignoreCompatibilityErrorsForPlugins` 作为逃生门
-- 未声明兼容性的插件会记录警告日志
+`preBootstrapConfig()` 是 Vendure 架构的核心抽象，被多个入口复用：
+
+| 入口 | 调用 preBootstrapConfig | 用途 |
+|------|------------------------|------|
+| `bootstrap()` | ✅ | 启动 Server |
+| `bootstrapWorker()` | ✅ | 启动 Worker |
+| `runMigrations()` | ✅ | 执行数据库迁移 |
+| `generateMigration()` | ✅ | 生成迁移脚本 |
+| `revertLastMigration()` | ✅ | 回滚迁移 |
+
+**这种设计确保了：**
+- 所有场景下的实体 schema 完全一致
+- 插件配置在所有入口点生效
+- 自定义字段和元数据修改器统一应用
+- 迁移生成的 schema 与运行时无差异
