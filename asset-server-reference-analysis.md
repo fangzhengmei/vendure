@@ -943,6 +943,143 @@ it('no resize, crop top left', () => {
 
 > **重要发现**：测试用例直接调用 `resizeToFocalPoint()` 函数，传入 `x: 0, y: 0` 是有效的。但在实际请求链路中，参数解析环节已经把 `fpx=0` 转换成了 `undefined`，所以这个测试用例**无法覆盖实际的 HTTP 请求场景**。
 
+### 6.7 焦点参数范围限制缺失与缓存一致性问题
+
+#### 6.7.1 文档语义与实现对比
+
+**文档语义** (`packages/asset-server-plugin/src/plugin.ts:77`)：
+> These are normalized coordinates (i.e. a number between 0 and 1), so the `fpx=0&fpy=0` corresponds to the top left of the image.
+
+文档明确说明 fpx/fpy 是 **0 到 1 之间的归一化坐标**。
+
+**实际实现**：三个环节都**没有对参数范围进行限制**：
+
+| 环节 | 代码位置 | 处理逻辑 | 范围限制 |
+|-----|---------|---------|---------|
+| **参数解析** | `asset-server.ts:198-199` | `const fpx = +queryParams.fpx || undefined;` | ❌ 无限制，可传入任意数字（负数、>1、甚至NaN） |
+| **缓存键生成** | `asset-server.ts:217` | `const focalPoint = fpx && fpy ? \`_fpx${fpx}_fpy${fpy}\` : '';` | ❌ 直接使用原始参数值，不做范围检查 |
+| **裁剪执行** | `transform-image.ts:35-36` | `const xCenter = parameters.fpx * metadata.width;` | ❌ 直接相乘，不限制 fpx 范围 |
+
+**对比 quality 参数**（有正确的范围限制）：
+```typescript
+// asset-server.ts:195-196
+const quality =
+    queryParams.q != null ? Math.round(Math.max(Math.min(+queryParams.q, 100), 1)) : undefined;
+```
+quality 参数使用了 `Math.max(Math.min(..., 100), 1)` 明确限制在 1-100 范围内，而 fpx/fpy 没有类似处理。
+
+#### 6.7.2 越界值在裁剪阶段的 clamp 处理
+
+虽然参数解析不限制范围，但在裁剪执行的**最后一步**，`getExtractionRegion` 函数会对最终的裁剪区域进行 clamp：
+
+```typescript
+// transform-image.ts:144-148
+if (intermediate.h < intermediate.w) {
+    region.left = clamp(0, intermediate.w - target.w, Math.round(newXCenter - target.w / 2));
+} else {
+    region.top = clamp(0, intermediate.h - target.h, Math.round(newYCenter - target.h / 2));
+}
+
+// transform-image.ts:155-157
+function clamp(min: number, max: number, input: number) {
+    return Math.min(Math.max(min, input), max);
+}
+```
+
+**越界值处理流程**（以 fpx 为例，图片宽度 1000px，目标裁剪宽度 200px）：
+
+```
+fpx = 1.5 (越界，大于 1)
+  ↓
+xCenter = 1.5 * 1000 = 1500
+  ↓
+newXCenter = 1500 / factor (假设 factor=1) = 1500
+  ↓
+region.left = 1500 - 200/2 = 1400
+  ↓
+clamp(0, 1000-200=800, 1400) → 800 (被限制到右边界)
+  ↓
+最终裁剪区域 left=800, width=200 → 裁剪图片最右侧 200px
+```
+
+**不同越界值的裁剪结果**：
+
+| fpx 值 | 计算 xCenter | 计算 region.left | clamp 后 left | 实际裁剪区域 |
+|--------|-------------|-----------------|--------------|------------|
+| 0.0 | 0 | -100 | 0 | 最左侧 200px |
+| 0.5 | 500 | 400 | 400 | 中间 200px |
+| 1.0 | 1000 | 900 | 800 | 最右侧 200px |
+| 1.5 | 1500 | 1400 | 800 | 最右侧 200px |
+| 2.0 | 2000 | 1900 | 800 | 最右侧 200px |
+| -0.5 | -500 | -600 | 0 | 最左侧 200px |
+
+**关键发现**：
+- `fpx=1.0`、`fpx=1.5`、`fpx=2.0` 最终裁剪结果**完全相同**（都是最右侧 200px）
+- `fpx=-0.5` 和 `fpx=0.0` 最终裁剪结果**完全相同**（都是最左侧 200px）
+- 越界值最终都会被 clamp 到边界，但中间计算过程使用了原始值
+
+#### 6.7.3 缓存一致性问题：相同结果，不同缓存键
+
+**核心问题**：缓存键使用**原始参数值**生成，但裁剪结果被 clamp 到边界。这导致**不同参数可能得到相同裁剪结果，但写入不同缓存键**。
+
+**示例场景**（图片宽度 1000px，目标裁剪宽度 200px）：
+
+```
+请求 1: ?w=200&h=200&mode=crop&fpx=1.0&fpy=0.5
+  → 缓存键包含: _fpx1_fpy0.5
+  → 实际裁剪: 最右侧 200px
+  → 写入缓存: cache/..._fpx1_fpy0.5_<hash1>.jpg
+
+请求 2: ?w=200&h=200&mode=crop&fpx=1.5&fpy=0.5
+  → 缓存键包含: _fpx1.5_fpy0.5
+  → 实际裁剪: 最右侧 200px (与请求 1 完全相同)
+  → 写入缓存: cache/..._fpx1.5_fpy0.5_<hash2>.jpg  ❌ 重复缓存！
+
+请求 3: ?w=200&h=200&mode=crop&fpx=2.0&fpy=0.5
+  → 缓存键包含: _fpx2_fpy0.5
+  → 实际裁剪: 最右侧 200px (与请求 1 完全相同)
+  → 写入缓存: cache/..._fpx2_fpy0.5_<hash3>.jpg  ❌ 再次重复缓存！
+```
+
+**缓存浪费分析**：
+- 3 个不同的请求
+- 产生完全相同的裁剪结果
+- 写入 3 个不同的缓存文件
+- 占用 3 倍存储空间
+
+**越界值的边界范围**：
+
+对于 fpx，理论上：
+- `fpx <= target.w / (2 * original.w)` 时，都会被 clamp 到 left=0
+- `fpx >= 1 - target.w / (2 * original.w)` 时，都会被 clamp 到 left=original.w - target.w
+
+对于 1000px 宽的图片，裁剪 200px：
+- `fpx <= 0.1` → left=0
+- `fpx >= 0.9` → left=800
+
+这意味着在 `(-∞, 0.1]` 范围内的所有 fpx 值都会得到相同的裁剪结果，但每个不同的值都会生成不同的缓存键。
+
+#### 6.7.4 完整证据链总结
+
+| 环节 | 输入语义 | 实际行为 | 与缓存一致性的关系 |
+|-----|---------|---------|-------------------|
+| **参数解析** | 0-1 归一化坐标 | 接受任意数字，无范围限制 | 越界值进入后续流程 |
+| **缓存键生成** | 应使用有效参数哈希 | 使用原始参数值哈希 | 不同越界值生成不同缓存键 |
+| **裁剪计算** | 基于归一化坐标计算 | 直接使用原始值计算 | 越界值参与中间计算 |
+| **区域提取** | 应得到合理裁剪区域 | 最终结果被 clamp 到边界 | 不同越界值可能得到相同结果 |
+| **缓存写入** | 相同结果应共享缓存 | 相同结果写入不同缓存 | 产生大量重复缓存 |
+
+**根本原因**：参数范围验证缺失 + 缓存键在 clamp 之前生成。
+
+正确的设计应该是：
+1. 参数解析时就将 fpx/fpy clamp 到 [0, 1] 范围
+2. 使用 clamp 后的值生成缓存键
+3. 使用 clamp 后的值进行裁剪计算
+
+这样可以保证：
+- 相同的有效裁剪结果使用相同的缓存键
+- 避免缓存空间浪费
+
 ---
 
 ## 七、业务实体更新资源引用
@@ -1123,7 +1260,9 @@ sendAsset()
    - Local 和 S3 策略的标识符格式相同，仅前缀配置不同
    - 切换存储策略时需要注意迁移现有文件的 URL
 
-### 9. **fpx/fpy 0 值处理不一致 Bug**
+### 9. **fpx/fpy 焦点参数设计缺陷汇总**
+
+#### 9.1 0 值处理不一致 Bug
    - **文档语义**：`fpx=0&fpy=0` 表示左上角，是合法有效的焦点坐标
    - **实现问题**：三个环节都使用 `||` 或 `&&` 运算符，0 被当作 falsy 值忽略
      - 参数解析：`+queryParams.fpx || undefined` → 0 变成 undefined
@@ -1134,3 +1273,17 @@ sendAsset()
      - 回退到默认熵裁剪，结果可能不符合用户预期
      - 带 `fpx=0&fpy=0` 的请求与不带焦点参数的请求共享缓存
    - **测试漏洞**：单元测试直接调用 `resizeToFocalPoint()` 传入 0 值，未覆盖实际 HTTP 请求链路
+
+#### 9.2 范围限制缺失与缓存一致性问题
+   - **文档语义**：fpx/fpy 是 0 到 1 之间的归一化坐标
+   - **实现问题**：参数解析环节完全没有范围限制（对比 quality 参数有 `Math.max(Math.min(..., 100), 1)`）
+   - **越界值处理**：仅在裁剪区域提取的最后一步通过 `clamp()` 限制到边界
+   - **缓存一致性问题**：
+     - 缓存键使用原始参数值生成，但裁剪结果被 clamp 到边界
+     - 不同越界参数可能得到相同裁剪结果，但写入不同缓存键
+     - 例如 `fpx=1.0`、`fpx=1.5`、`fpx=2.0` 裁剪结果相同，但生成 3 个不同缓存
+     - 造成缓存空间浪费
+   - **边界范围**（以 1000px 宽图片裁剪 200px 为例）：
+     - `fpx <= 0.1` → 都被 clamp 到 left=0，生成不同缓存键
+     - `fpx >= 0.9` → 都被 clamp 到 left=800，生成不同缓存键
+   - **根本原因**：参数范围验证缺失 + 缓存键在 clamp 之前生成
