@@ -833,6 +833,116 @@ private async deleteUnconditional(ctx: RequestContext, assets: Asset[]): Promise
   3. 检查该原始路径对应的 Asset 是否还存在
   4. 不存在则删除缓存文件
 
+### 6.6 焦点参数 (fpx/fpy) 0 值处理不一致问题
+
+#### 6.6.1 文档语义
+
+`packages/asset-server-plugin/src/plugin.ts:77` 明确说明：
+> These are normalized coordinates (i.e. a number between 0 and 1), so the `fpx=0&fpy=0` corresponds to the top left of the image.
+
+即 `fpx=0&fpy=0` 表示左上角，是**合法有效的焦点坐标**。
+
+#### 6.6.2 三个环节对 0 值的处理对比
+
+| 环节 | 代码位置 | 处理逻辑 | 对 0 值的处理 |
+|-----|---------|---------|-------------|
+| **参数解析** | `asset-server.ts:198-199` | `const fpx = +queryParams.fpx || undefined;` | ❌ 0 被当作 falsy 值，被替换为 `undefined` |
+| **缓存键生成** | `asset-server.ts:217` | `const focalPoint = fpx && fpy ? ... : '';` | ❌ 0 被当作 falsy 值，不加入缓存键 |
+| **裁剪执行** | `transform-image.ts:32` | `if (parameters.fpx && parameters.fpy && ...)` | ❌ 0 被当作 falsy 值，不执行焦点裁剪 |
+
+#### 6.6.3 详细代码证据
+
+**1. 参数解析环节 (`asset-server.ts:190-212`)**：
+```typescript
+private getInitialImageTransformParameters(
+    queryParams: Record<string, string>,
+): ImageTransformParameters {
+    const fpx = +queryParams.fpx || undefined;  // +'0' = 0 → 0 || undefined → undefined
+    const fpy = +queryParams.fpy || undefined;  // 同上
+    return { fpx, fpy, ... };
+}
+```
+**问题**：使用 `||` 短路运算符，`0` 被当作 falsy 值，合法的 `fpx=0` 会被替换为 `undefined`。
+
+**2. 缓存键生成环节 (`asset-server.ts:214-248`)**：
+```typescript
+private getFileNameFromParameters(filePath: string, params: ImageTransformParameters): string {
+    const { fpx, fpy } = params;
+    const focalPoint = fpx && fpy ? `_fpx${fpx}_fpy${fpy}` : '';  // 0 && 0 = 0 → falsy
+    // ...
+    if (imageParamsString !== '') {
+        const imageParamHash = this.md5(imageParamsString);  // 不包含 fpx/fpy
+        return path.join(this.cacheDir, this.addSuffix(decodedReqPath, imageParamHash, ...));
+    }
+}
+```
+**问题**：同样使用 `&&` 运算符，`fpx=0&fpy=0` 时 `focalPoint` 为空字符串，焦点参数不参与哈希计算。
+
+**3. 裁剪执行环节 (`transform-image.ts:14-51`)**：
+```typescript
+export async function transformImage(
+    originalImage: Buffer,
+    parameters: ImageTransformParameters,
+): Promise<sharp.Sharp> {
+    const options: ResizeOptions = {};
+    if (mode === 'crop') {
+        options.position = sharp.strategy.entropy;  // 默认使用熵裁剪
+    }
+    // ...
+    if (parameters.fpx && parameters.fpy && width && height && mode === 'crop') {
+        // 0 && 0 = 0 → falsy，条件不成立
+        // 焦点裁剪逻辑永远不会执行
+        const xCenter = parameters.fpx * metadata.width;
+        // ...
+        return image.resize(resizedWidth, resizedHeight).extract(region);
+    }
+    return image.resize(width, height, options);  // 回退到默认熵裁剪
+}
+```
+**问题**：同样使用 `&&` 运算符，`fpx=0&fpy=0` 时条件不成立，直接跳过焦点裁剪，使用默认的熵裁剪。
+
+#### 6.6.4 实际行为偏差
+
+| 场景 | 用户预期（按文档语义） | 实际行为 | 偏差说明 |
+|-----|----------------------|---------|---------|
+| `fpx=0&fpy=0&mode=crop` | 以左上角为焦点裁剪 | 使用默认熵裁剪 | 完全忽略焦点参数，裁剪结果可能不包含左上角 |
+| `fpx=0&fpy=0.5&mode=crop` | 以左边缘中点为焦点裁剪 | 使用默认熵裁剪 | 因为 fpx=0 被忽略，整个焦点参数失效 |
+| `fpx=0.5&fpy=0&mode=crop` | 以上边缘中点为焦点裁剪 | 使用默认熵裁剪 | 因为 fpy=0 被忽略，整个焦点参数失效 |
+
+**缓存一致性问题**：
+```
+请求 1: ?w=100&h=100&mode=crop&fpx=0&fpy=0
+  → fpx=undefined, fpy=undefined
+  → 缓存键: cache/source/0a/photo_transform_w100_h100_mcrop_<hash1>.jpg
+
+请求 2: ?w=100&h=100&mode=crop
+  → fpx=undefined, fpy=undefined
+  → 缓存键: cache/source/0a/photo_transform_w100_h100_mcrop_<hash1>.jpg
+
+结果：两个不同的请求命中同一个缓存！
+```
+因为 `fpx=0&fpy=0` 被当作无焦点参数处理，所以带 `fpx=0&fpy=0` 的请求会与不带焦点参数的请求共享缓存。如果后者先访问，前者会得到熵裁剪的结果而不是焦点裁剪的结果。
+
+#### 6.6.5 测试用例佐证
+
+`transform-image.spec.ts:22-36` 中的测试用例：
+```typescript
+it('no resize, crop top left', () => {
+    const original: Dimensions = { w: 200, h: 100 };
+    const target: Dimensions = { w: 100, h: 100 };
+    const focalPoint: Point = { x: 0, y: 0 };  // 传入 0 值
+    const result = resizeToFocalPoint(original, target, focalPoint);
+    expect(result.region).toEqual({
+        left: 0,
+        top: 0,
+        width: 100,
+        height: 100,
+    });
+});
+```
+
+> **重要发现**：测试用例直接调用 `resizeToFocalPoint()` 函数，传入 `x: 0, y: 0` 是有效的。但在实际请求链路中，参数解析环节已经把 `fpx=0` 转换成了 `undefined`，所以这个测试用例**无法覆盖实际的 HTTP 请求场景**。
+
 ---
 
 ## 七、业务实体更新资源引用
@@ -1012,3 +1122,15 @@ sendAsset()
    - 数据库存储内部标识符，输出时通过 `toAbsoluteUrl` 转换
    - Local 和 S3 策略的标识符格式相同，仅前缀配置不同
    - 切换存储策略时需要注意迁移现有文件的 URL
+
+### 9. **fpx/fpy 0 值处理不一致 Bug**
+   - **文档语义**：`fpx=0&fpy=0` 表示左上角，是合法有效的焦点坐标
+   - **实现问题**：三个环节都使用 `||` 或 `&&` 运算符，0 被当作 falsy 值忽略
+     - 参数解析：`+queryParams.fpx || undefined` → 0 变成 undefined
+     - 缓存键生成：`fpx && fpy ? ... : ''` → 0 不参与哈希
+     - 裁剪执行：`if (parameters.fpx && parameters.fpy)` → 0 跳过焦点裁剪
+   - **实际影响**：
+     - `fpx=0&fpy=0` 等合法焦点坐标被完全忽略
+     - 回退到默认熵裁剪，结果可能不符合用户预期
+     - 带 `fpx=0&fpy=0` 的请求与不带焦点参数的请求共享缓存
+   - **测试漏洞**：单元测试直接调用 `resizeToFocalPoint()` 传入 0 值，未覆盖实际 HTTP 请求链路
