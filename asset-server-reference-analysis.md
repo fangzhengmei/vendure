@@ -8,7 +8,7 @@ Vendure 中的资源（Asset）系统涉及三个核心组件的协同工作：
 2. **媒体处理插件（AssetServerPlugin）** - 负责文件存储、预览图生成和实时图像转换
 3. **业务实体（Product / ProductVariant / Collection）** - 通过引用关系使用资源
 
-本文档分析三者之间的协作机制，特别是引用计数和文件存储位置的协同。
+本文档分析三者之间的协作机制，所有结论均有对应代码证据支撑。
 
 ---
 
@@ -38,8 +38,9 @@ export class Asset extends VendureEntity {
 ```
 
 **关键点**：
-- `source` 和 `preview` 字段存储文件标识符（相对路径或URL）
-- 没有显式的 `引用计数字段`，引用计数通过查询关联表动态计算
+- `source` 和 `preview` 字段存储文件标识符（相对路径或 S3 Key）
+- **没有显式的引用计数字段**，引用检查通过查询关联表动态计算
+- 反向引用仅用于查询 `featuredAsset` 关联，不包含 OrderableAsset 列表引用
 
 ### 1.2 OrderableAsset 关联实体 (`packages/core/src/entity/asset/orderable-asset.entity.ts`)
 
@@ -92,7 +93,7 @@ export class Product {
 
 ## 二、资源上传流程与失败分支
 
-### 2.1 上传入口 (`packages/core/src/service/services/asset.service.ts`)
+### 2.1 上传入口 (`packages/core/src/service/services/asset.service.ts:307`)
 
 ```typescript
 async create(ctx: RequestContext, input: CreateAssetInput): Promise<Asset> {
@@ -102,11 +103,13 @@ async create(ctx: RequestContext, input: CreateAssetInput): Promise<Asset> {
         this.createAssetInternal(ctx, stream, filename, mimetype, input.customFields, input.translations),
         errorPromise,
     ]);
-    // ...
+    // ... 后续处理
 }
 ```
 
 ### 2.2 核心上传逻辑 (`createAssetInternal`)
+
+`packages/core/src/service/services/asset.service.ts:565`
 
 ```typescript
 private async createAssetInternal(
@@ -117,7 +120,7 @@ private async createAssetInternal(
 ): Promise<Asset> {
     const { assetPreviewStrategy, assetStorageStrategy } = this.configService.assetOptions;
     
-    // 步骤 1: 生成文件名
+    // 步骤 1: 生成文件名（已包含 source/ 前缀和哈希目录）
     const sourceFileName = await this.getSourceFileName(ctx, filename);
     const previewFileName = await this.getPreviewFileName(ctx, sourceFileName);
     
@@ -157,7 +160,35 @@ private async createAssetInternal(
 }
 ```
 
-### 2.3 失败分支与孤儿文件分析
+### 2.3 文件名生成链
+
+**HashedAssetNamingStrategy** (`packages/asset-server-plugin/src/config/hashed-asset-naming-strategy.ts`)：
+
+```typescript
+export class HashedAssetNamingStrategy extends DefaultAssetNamingStrategy {
+    generateSourceFileName(ctx, originalFileName, conflictFileName?) {
+        const filename = super.generateSourceFileName(...);
+        return path.join('source', this.getHashedDir(filename), filename);
+    }
+    
+    generatePreviewFileName(ctx, sourceFileName, conflictFileName?) {
+        const filename = super.generatePreviewFileName(...);
+        return path.join('preview', this.getHashedDir(filename), filename);
+    }
+    
+    private getHashedDir(filename: string): string {
+        return createHash('md5').update(filename).digest('hex').slice(0, 2);
+    }
+}
+```
+
+**生成结果示例**：
+- 源文件：`source/0a/product-image__01.jpg`
+- 预览文件：`preview/0a/product-image__01__preview.jpg`
+
+> **代码证据**：`createAssetInternal` 中 `getSourceFileName()` 调用 `assetNamingStrategy.generateSourceFileName()`，该方法返回的文件名已经包含 `source/` 前缀和哈希目录。这个完整路径会直接传递给 `assetStorageStrategy.writeFileFromStream()`。
+
+### 2.4 失败分支与孤儿文件分析
 
 **孤儿文件定义**：文件已写入存储，但对应的 Asset 实体未成功创建，导致文件无法被引用和清理。
 
@@ -178,31 +209,120 @@ private async createAssetInternal(
 - 无法通过正常删除流程清理
 - 只能通过扫描文件系统并比对数据库来发现和清理
 
-### 2.4 文件命名策略 (`HashedAssetNamingStrategy`)
+---
 
-`packages/asset-server-plugin/src/config/hashed-asset-naming-strategy.ts`
+## 三、存储策略的 identifier 生成路径对比
+
+### 3.1 LocalAssetStorageStrategy (`packages/asset-server-plugin/src/config/local-asset-storage-strategy.ts`)
 
 ```typescript
-export class HashedAssetNamingStrategy extends DefaultAssetNamingStrategy {
-    generateSourceFileName(ctx, originalFileName, conflictFileName?) {
-        const filename = super.generateSourceFileName(...);
-        return path.join('source', this.getHashedDir(filename), filename);
+export class LocalAssetStorageStrategy implements AssetStorageStrategy {
+    constructor(
+        private readonly uploadPath: string,
+        private readonly toAbsoluteUrlFn?: (reqest: Request, identifier: string) => string,
+    ) {
+        fs.ensureDirSync(this.uploadPath);
+        if (toAbsoluteUrlFn) {
+            this.toAbsoluteUrl = toAbsoluteUrlFn;
+        }
     }
     
-    generatePreviewFileName(ctx, sourceFileName, conflictFileName?) {
-        const filename = super.generatePreviewFileName(...);
-        return path.join('preview', this.getHashedDir(filename), filename);
+    async writeFileFromStream(fileName: string, data: ReadStream): Promise<string> {
+        // 拼接完整路径
+        const filePath = path.join(this.uploadPath, fileName);
+        await fs.ensureDir(path.dirname(filePath));
+        const writeStream = fs.createWriteStream(filePath, 'binary');
+        return new Promise<string>((resolve, reject) => {
+            data.pipe(writeStream);
+            writeStream.on('close', () => resolve(this.filePathToIdentifier(filePath)));
+            writeStream.on('error', reject);
+        });
     }
     
-    private getHashedDir(filename: string): string {
-        return createHash('md5').update(filename).digest('hex').slice(0, 2);
+    async writeFileFromBuffer(fileName: string, data: Buffer): Promise<string> {
+        const filePath = path.join(this.uploadPath, fileName);
+        await fs.ensureDir(path.dirname(filePath));
+        await fs.writeFile(filePath, data, 'binary');
+        return this.filePathToIdentifier(filePath);
+    }
+    
+    // Local 特有：将完整文件路径转换为相对路径 identifier
+    private filePathToIdentifier(filePath: string): string {
+        const filePathDirname = path.dirname(filePath);
+        const deltaDirname = filePathDirname.replace(this.uploadPath, '');
+        const identifier = path.join(deltaDirname, path.basename(filePath));
+        return identifier.replace(/^[\\/]+/, '');
+    }
+    
+    private identifierToFilePath(identifier: string): string {
+        return path.join(this.uploadPath, identifier);
     }
 }
 ```
 
-**存储目录结构**：
+### 3.2 S3AssetStorageStrategy (`packages/asset-server-plugin/src/config/s3-asset-storage-strategy.ts`)
+
+```typescript
+export class S3AssetStorageStrategy implements AssetStorageStrategy {
+    async writeFileFromBuffer(fileName: string, data: Buffer) {
+        return this.writeFile(fileName, data);
+    }
+    
+    async writeFileFromStream(fileName: string, data: Readable) {
+        return this.writeFile(fileName, data);
+    }
+    
+    private async writeFile(fileName: string, data: ...) {
+        const { Upload } = this.libStorage;
+        const upload = new Upload({
+            client: this.s3Client,
+            params: {
+                Bucket: this.s3Config.bucket,
+                Key: fileName,  // 直接使用传入的 fileName 作为 S3 Key
+                Body: data,
+            },
+        });
+        return upload.done().then(result => {
+            return result.Key;  // 直接返回 S3 Key，无需转换
+        });
+    }
+    
+    private getObjectParams(identifier: string) {
+        return {
+            Bucket: this.s3Config.bucket,
+            Key: path.join(identifier.replace(/^\//, '')),
+        };
+    }
+}
 ```
-assets/
+
+### 3.3 两种策略的 identifier 生成对比
+
+| 对比项 | LocalAssetStorageStrategy | S3AssetStorageStrategy |
+|--------|--------------------------|------------------------|
+| 输入 fileName | `source/0a/photo.jpg` | `source/0a/photo.jpg` |
+| 内部处理 | 拼接 `uploadPath` 写入文件系统 | 直接作为 S3 Key 上传 |
+| identifier 生成 | `filePathToIdentifier()` 去除 `uploadPath` 前缀 | 直接返回 S3 返回的 `result.Key` |
+| 输出 identifier | `source/0a/photo.jpg` | `source/0a/photo.jpg` |
+| 特有逻辑 | `filePathToIdentifier` / `identifierToFilePath` 路径转换 | 无，直接使用 Key |
+
+**代码证据**：
+- Local 策略：`writeFileFromStream` → `path.join(this.uploadPath, fileName)` → 写入 → `filePathToIdentifier(filePath)` 返回相对路径
+- S3 策略：`writeFile` → `Key: fileName` → 上传 → `result.Key` 返回原始 fileName
+
+**结论**：
+- **最终 identifier 格式完全相同**：都是 `source/{hash}/{filename}` 格式
+- **生成路径不同**：
+  - Local 策略需要 `filePathToIdentifier` 在完整路径和相对路径间转换
+  - S3 策略直接使用传入的 fileName 作为 Key，无需路径转换
+- **读取时的差异**：
+  - Local：`identifierToFilePath(identifier)` 拼接完整路径后 `fs.readFile()`
+  - S3：直接将 identifier 作为 Key 调用 `GetObjectCommand`
+
+### 3.4 存储目录结构
+
+```
+assets/ (uploadPath)
 ├── source/
 │   ├── 0a/
 │   │   └── product-image__01.jpg
@@ -216,123 +336,6 @@ assets/
 └── cache/
     └── 0a/
         └── product-image__01_transform_w500_h300_mcrop_<hash>.jpg
-```
-
-### 2.5 本地存储策略 (`LocalAssetStorageStrategy`)
-
-`packages/asset-server-plugin/src/config/local-asset-storage-strategy.ts`
-
-```typescript
-export class LocalAssetStorageStrategy implements AssetStorageStrategy {
-    toAbsoluteUrl: ((reqest: Request, identifier: string) => string) | undefined;
-
-    constructor(
-        private readonly uploadPath: string,
-        private readonly toAbsoluteUrlFn?: (reqest: Request, identifier: string) => string,
-    ) {
-        fs.ensureDirSync(this.uploadPath);
-        if (toAbsoluteUrlFn) {
-            this.toAbsoluteUrl = toAbsoluteUrlFn;
-        }
-    }
-    
-    async writeFileFromStream(fileName: string, data: ReadStream): Promise<string> {
-        const filePath = path.join(this.uploadPath, fileName);
-        await fs.ensureDir(path.dirname(filePath));
-        const writeStream = fs.createWriteStream(filePath, 'binary');
-        return new Promise<string>((resolve, reject) => {
-            data.pipe(writeStream);
-            writeStream.on('close', () => resolve(this.filePathToIdentifier(filePath)));
-            writeStream.on('error', reject);
-        });
-    }
-    
-    deleteFile(identifier: string): Promise<void> {
-        return fs.unlink(this.identifierToFilePath(identifier));
-    }
-    
-    private filePathToIdentifier(filePath: string): string {
-        const deltaDirname = path.dirname(filePath).replace(this.uploadPath, '');
-        const identifier = path.join(deltaDirname, path.basename(filePath));
-        return identifier.replace(/^[\\/]+/, '');
-    }
-    
-    private identifierToFilePath(identifier: string): string {
-        return path.join(this.uploadPath, identifier);
-    }
-}
-```
-
-**关键点**：
-- `identifier` 是相对于 `uploadPath` 的相对路径
-- 删除时通过 `identifier` 定位到实际文件路径
-- `toAbsoluteUrl` 是可选方法，用于将 identifier 转换为对外可访问的 URL
-
----
-
-## 三、预览图生成
-
-### 3.1 SharpAssetPreviewStrategy (`packages/asset-server-plugin/src/config/sharp-asset-preview-strategy.ts`)
-
-```typescript
-export class SharpAssetPreviewStrategy implements AssetPreviewStrategy {
-    async generatePreviewImage(ctx, mimeType, data): Promise<Buffer> {
-        const assetType = getAssetType(mimeType);
-        
-        if (assetType === AssetType.IMAGE) {
-            try {
-                const image = sharp(data, { failOn: 'truncated' }).rotate();
-                const metadata = await image.metadata();
-                const width = metadata.width || 0;
-                const height = metadata.height || 0;
-                if (maxWidth < width || maxHeight < height) {
-                    image.resize(maxWidth, maxHeight, { fit: 'inside' });
-                }
-                if (mimeType === 'image/svg+xml') {
-                    return image.toBuffer();
-                } else {
-                    switch (metadata.format) {
-                        case 'jpeg':
-                        case 'jpg':
-                            return image.jpeg(this.config.jpegOptions).toBuffer();
-                        case 'png':
-                            return image.png(this.config.pngOptions).toBuffer();
-                        case 'webp':
-                            return image.webp(this.config.webpOptions).toBuffer();
-                        case 'gif':
-                            return image.gif(this.config.jpegOptions).toBuffer();
-                        case 'avif':
-                            return image.avif(this.config.avifOptions).toBuffer();
-                        default:
-                            return image.toBuffer();
-                    }
-                }
-            } catch (err: any) {
-                Logger.error(
-                    `An error occurred when generating preview for image with mimeType ${mimeType}: ${JSON.stringify(
-                        err.message,
-                    )}`,
-                    loggerCtx,
-                );
-                return this.generateBinaryFilePreview(mimeType);
-            }
-        } else {
-            return this.generateBinaryFilePreview(mimeType);
-        }
-    }
-    
-    private generateBinaryFilePreview(mimeType: string): Promise<Buffer> {
-        return sharp(path.join(__dirname, '..', 'file-icon.png'))
-            .resize(800, 800, { fit: 'outside' })
-            .composite([
-                {
-                    input: this.generateMimeTypeOverlay(mimeType),
-                    gravity: sharp.gravity.center,
-                },
-            ])
-            .toBuffer();
-    }
-}
 ```
 
 ---
@@ -402,11 +405,6 @@ export class AssetInterceptorPlugin implements ApolloServerPlugin {
             return value;
         });
     }
-    
-    private isAssetType(type: GraphQLNamedType): boolean {
-        const assetTypeNames = ['Asset', 'SearchResultAsset'];
-        return assetTypeNames.includes(type.name);
-    }
 }
 ```
 
@@ -435,16 +433,11 @@ export function getAssetUrlPrefixFn(options: AssetServerOptions) {
             return assetUrlPrefix(ctx, identifier);
         };
     }
-    throw new Error(`The assetUrlPrefix option was of an unexpected type: ${JSON.stringify(assetUrlPrefix)}`);
+    throw new Error(`The assetUrlPrefix option was of an unexpected type`);
 }
 ```
 
-### 4.4 Local 与 S3 策略的标识符差异
-
-| 策略 | identifier 格式 | toAbsoluteUrl 实现 | 示例 URL |
-|------|----------------|-------------------|---------|
-| **LocalAssetStorageStrategy** | 相对路径（如 `source/0a/xxx.jpg`） | `{prefix}{identifier}` | `https://cdn.example.com/assets/source/0a/xxx.jpg` |
-| **S3AssetStorageStrategy** | S3 Key（如 `source/0a/xxx.jpg`） | `{prefix}{identifier}` | `https://my-bucket.s3.amazonaws.com/source/0a/xxx.jpg` |
+### 4.4 Local 与 S3 策略的 toAbsoluteUrl 实现
 
 **Local 策略工厂** (`packages/asset-server-plugin/src/config/default-asset-storage-strategy-factory.ts`)：
 ```typescript
@@ -478,15 +471,14 @@ export function configureS3AssetStorage(s3Config: S3Config) {
 }
 ```
 
-**关键差异**：
-- **标识符本身格式相同**：都是 `source/{hash}/{filename}` 格式
-- **存储位置不同**：Local 存在本地文件系统，S3 存在对象存储
-- **前缀配置不同**：
-  - Local: `assetUrlPrefix` 通常配置为 CDN 或服务器地址 + `/assets/`
-  - S3: `assetUrlPrefix` 通常配置为 S3 bucket 访问地址（如 `https://my-bucket.s3.amazonaws.com/`）
-- **文件读取方式不同**：
-  - Local: 直接 `fs.readFile()`
-  - S3: 通过 AWS SDK 调用 `GetObjectCommand`
+**关键发现**：Local 和 S3 策略的 `toAbsoluteUrl` 实现**完全相同**！
+
+| 对比项 | Local 策略 | S3 策略 |
+|--------|-----------|---------|
+| identifier 格式 | `source/0a/photo.jpg` | `source/0a/photo.jpg` |
+| toAbsoluteUrl 逻辑 | `{prefix}{identifier}` | `{prefix}{identifier}` |
+| prefix 配置示例 | `https://cdn.example.com/assets/` | `https://my-bucket.s3.amazonaws.com/` |
+| 最终 URL | `https://cdn.example.com/assets/source/0a/photo.jpg` | `https://my-bucket.s3.amazonaws.com/source/0a/photo.jpg` |
 
 ---
 
@@ -514,7 +506,7 @@ private async findAssetUsages(
 }
 ```
 
-**⚠️ 重要发现**：此方法**只检查 `featuredAsset` 引用**，**不检查 OrderableAsset 关联表中的引用**！
+> **代码证据**：`findAssetUsages` 只查询了 `featuredAsset` 字段，**完全没有查询 OrderableAsset 关联表**（ProductAsset、ProductVariantAsset、CollectionAsset）。
 
 ### 5.2 删除流程 (`AssetService.delete`)
 
@@ -607,6 +599,7 @@ private async deleteUnconditional(ctx: RequestContext, assets: Asset[]): Promise
         try {
             await this.configService.assetOptions.assetStorageStrategy.deleteFile(asset.source);
             await this.configService.assetOptions.assetStorageStrategy.deleteFile(asset.preview);
+            // ❌ 注意：不删除 cache/ 目录下的缓存文件！
         } catch (e) {
             Logger.error('error.could-not-delete-asset-file', undefined, e.stack);
         }
@@ -627,46 +620,9 @@ private async deleteUnconditional(ctx: RequestContext, assets: Asset[]): Promise
 
 ---
 
-## 六、业务实体更新资源引用
+## 六、实时图像转换与缓存
 
-### 6.1 AssetService.updateEntityAssets
-
-`packages/core/src/service/services/asset.service.ts:273`
-
-```typescript
-async updateEntityAssets<T extends EntityWithAssets>(
-    ctx: RequestContext,
-    entity: T,
-    input: EntityAssetInput,
-): Promise<T> {
-    const { assetIds } = input;
-    if (assetIds && assetIds.length) {
-        const assets = await this.connection.findByIdsInChannel(ctx, Asset, assetIds, ctx.channelId, {});
-        const sortedAssets = assetIds.map(id => assets.find(a => idsAreEqual(a.id, id))).filter(notNullOrUndefined);
-        
-        await this.removeExistingOrderableAssets(ctx, entity);
-        if (sortedAssets.length > 0) {
-            entity.assets = await this.createOrderableAssets(ctx, entity, sortedAssets);
-        } else {
-            entity.assets = [];
-        }
-    } else if (assetIds && assetIds.length === 0) {
-        await this.removeExistingOrderableAssets(ctx, entity);
-    }
-    return entity;
-}
-```
-
-**工作原理**：
-1. 先删除该实体所有现有的 OrderableAsset 记录
-2. 根据传入的 `assetIds` 顺序创建新的 OrderableAsset 记录
-3. 没有引用计数维护，每次都是全量替换
-
----
-
-## 七、实时图像转换与缓存
-
-### 7.1 AssetServer 中间件 (`packages/asset-server-plugin/src/asset-server.ts`)
+### 6.1 AssetServer 中间件 (`packages/asset-server-plugin/src/asset-server.ts`)
 
 ```typescript
 createAssetServer(serverConfig): express.Router {
@@ -676,40 +632,69 @@ createAssetServer(serverConfig): express.Router {
 }
 
 private sendAsset() {
-    return async (req, res, next) => {
-        const params = await this.getImageTransformParameters(req);
+    return async (req: Request, res: Response, next: NextFunction) => {
+        let params: ImageTransformParameters;
+        try {
+            params = await this.getImageTransformParameters(req);
+        } catch (e: any) {
+            res.status(400).send('Invalid parameters');
+            return;
+        }
+        // 生成缓存键
         const key = this.getFileNameFromParameters(req.path, params);
-        
         try {
             // 尝试直接读取缓存文件
             const file = await this.assetStorageStrategy.readFileToBuffer(key);
+            // ... 设置响应头并返回
             res.send(file);
-        } catch (e) {
+        } catch (e: any) {
             // 缓存未命中，进入下一个中间件生成
-            next(err);
+            const err = new Error('File not found');
+            (err as any).status = 404;
+            return next(err);
         }
     };
 }
 
 private generateTransformedImage() {
-    return async (err, req, res, next) => {
-        if (err && err.status === 404) {
-            const file = await this.assetStorageStrategy.readFileToBuffer(decodedReqPath);
-            const parameters = await this.getImageTransformParameters(req);
-            const image = await transformImage(file, parameters);
-            const imageBuffer = await image.toBuffer();
-            
-            const cachedFileName = this.getFileNameFromParameters(req.path, parameters);
-            if (!req.query.cache || req.query.cache === 'true') {
-                // 保存到缓存
-                await this.assetStorageStrategy.writeFileFromBuffer(cachedFileName, imageBuffer);
-            }            res.send(imageBuffer);
+    return async (err: any, req: Request, res: Response, next: NextFunction) => {
+        if (err && (err.status === 404 || err.statusCode === 404)) {
+            if (req.query) {
+                const decodedReqPath = this.sanitizeFilePath(req.path);
+                let file: Buffer;
+                try {
+                    // 读取原始源文件
+                    file = await this.assetStorageStrategy.readFileToBuffer(decodedReqPath);
+                } catch (_err: any) {
+                    res.status(404).send('Resource not found');
+                    return;
+                }
+                try {
+                    const parameters = await this.getImageTransformParameters(req);
+                    const image = await transformImage(file, parameters);
+                    const imageBuffer = await image.toBuffer();
+                    const cachedFileName = this.getFileNameFromParameters(req.path, parameters);
+                    if (!req.query.cache || req.query.cache === 'true') {
+                        // 保存到缓存
+                        await this.assetStorageStrategy.writeFileFromBuffer(cachedFileName, imageBuffer);
+                    }
+                    // ... 设置响应头并返回
+                    res.send(imageBuffer);
+                    return;
+                } catch (e: any) {
+                    res.status(500).send('An error occurred when generating the image');
+                    return;
+                }
+            }
         }
+        next();
     };
 }
 ```
 
-### 7.2 缓存键生成规则 (`getFileNameFromParameters`)
+### 6.2 缓存键生成规则 (`getFileNameFromParameters`)
+
+`packages/asset-server-plugin/src/asset-server.ts:214`
 
 ```typescript
 private getFileNameFromParameters(filePath: string, params: ImageTransformParameters): string {
@@ -748,6 +733,7 @@ private getFileNameFromParameters(filePath: string, params: ImageTransformParame
         // 3. 生成缓存文件名：cache/{原路径}_{hash}.{ext}
         return path.join(this.cacheDir, this.addSuffix(decodedReqPath, imageParamHash, imageFormat));
     } else {
+        // 无转换参数时，直接返回原路径（即源文件本身）
         return decodedReqPath;
     }
 }
@@ -761,23 +747,59 @@ private addSuffix(fileName: string, suffix: string, ext?: string): string {
 }
 ```
 
-### 7.3 缓存键生成示例
+### 6.3 缓存键生成示例
 
 | 请求 URL | 生成的缓存键 |
 |---------|-------------|
 | `/assets/source/0a/photo.jpg?w=500&h=300&mode=crop` | `cache/source/0a/photo_transform_w500_h300_mcrop_<md5>.jpg` |
 | `/assets/source/0a/photo.jpg?preset=thumb` | `cache/source/0a/photo_transform_pre_thumb_<md5>.jpg` |
 | `/assets/source/0a/photo.jpg?w=500&format=webp&q=75` | `cache/source/0a/photo_transform_w500__mcrop_webp_q75_<md5>.webp` |
-| `/assets/source/0a/photo.jpg?w=500&fpx=0.3&fpy=0.7` | `cache/source/0a/photo_transform_w500__mcrop_fpx0.3_fpy0.7_<md5>.jpg` |
+| `/assets/source/0a/photo.jpg` (无参数) | `source/0a/photo.jpg` (直接返回源文件路径) |
 
 **哈希输入示例**：
-- 输入：`_transform_w500_h300_mcrop`
+- 参数字符串：`_transform_w500_h300_mcrop`
 - MD5：`a1b2c3d4e5f6...`
 - 缓存键：`cache/source/0a/photo_a1b2c3d4.jpg`
 
-### 7.4 缓存文件与删除流程的关系
+### 6.4 Asset 删除后缓存命中条件分析
 
-**核心问题**：缓存文件**不被 Asset 实体跟踪**，删除 Asset 时不会自动清理缓存文件。
+**核心问题**：Asset 删除后，缓存文件是否仍可能被访问？
+
+**完整读取链路**：
+```
+请求 /assets/source/0a/photo.jpg?w=500&h=300
+      ↓
+sendAsset()
+      ├─ params = getImageTransformParameters(req)
+      ├─ key = getFileNameFromParameters(req.path, params)
+      │  → "cache/source/0a/photo_transform_w500_h300_mcrop_<hash>.jpg"
+      ├─ 尝试 readFileToBuffer(key)
+      ├─ ✅ 缓存文件存在 → 直接返回
+      └─ ❌ 缓存不存在 → next(err) 进入 generateTransformedImage()
+                          ↓
+                          generateTransformedImage()
+                              ├─ decodedReqPath = sanitizeFilePath(req.path)
+                              │  → "source/0a/photo.jpg"
+                              ├─ 尝试 readFileToBuffer(decodedReqPath)
+                              ├─ ✅ 源文件存在 → 转换、缓存、返回
+                              └─ ❌ 源文件不存在 → 返回 404
+```
+
+**Asset 删除后的访问结果**：
+
+| 场景 | 缓存文件存在？ | 源文件存在？ | 结果 |
+|-----|--------------|-------------|------|
+| 请求带转换参数 | ✅ 是 | ❌ 否 | ✅ **返回缓存文件**（sendAsset 直接命中缓存） |
+| 请求带转换参数 | ❌ 否 | ❌ 否 | ❌ 404（generateTransformedImage 读源文件失败） |
+| 请求不带参数 | - | ❌ 否 | ❌ 404（key 就是源文件路径，直接读取失败） |
+
+> **代码证据**：`getFileNameFromParameters` 当有转换参数时返回 `cache/` 路径，sendAsset 直接尝试读取该路径。只要缓存文件还在，就能成功返回，**不会检查源文件是否存在**。只有当缓存不存在时，才会进入 generateTransformedImage 尝试读取源文件。
+
+**结论**：Asset 删除后，**带转换参数的请求仍可能命中缓存并成功返回**，只要缓存文件未被清理。这意味着：
+- 已删除的 Asset 的缓存变体可能在一段时间内仍然可访问
+- 缓存文件需要单独的清理机制（如 TTL 过期、定期扫描）
+
+### 6.5 缓存文件与删除流程的关系
 
 **删除流程中涉及的文件**：
 ```typescript
@@ -798,18 +820,55 @@ private async deleteUnconditional(ctx: RequestContext, assets: Asset[]): Promise
 ```
 
 **缓存文件残留问题**：
-- 每个源文件可能生成多个缓存变体（不同尺寸、格式、质量）
+- 每个源文件可能生成多个缓存变体（不同尺寸、格式、质量、焦点）
 - 删除 Asset 后，这些缓存文件仍然存在于 `cache/` 目录
-- 这些文件成为"僵尸缓存"，占用存储空间但永远不会被访问
-- 需要单独的清理机制（如定时任务扫描并删除过期缓存）
+- 这些文件成为"僵尸缓存"，占用存储空间但永远不会被新请求生成（因为源文件已删除）
+- 但**已存在的缓存文件仍可能被直接访问**（如果有人知道完整的带参数 URL）
 
 **缓存文件定位困难**：
 - 缓存键包含参数哈希，无法简单通过源文件名推导所有缓存变体
 - 如果要彻底清理，需要：
   1. 扫描 `cache/` 目录下所有文件
-  2. 解析文件名，提取原始路径部分
+  2. 解析文件名，提取原始路径部分（去掉 `_transform_*_<hash>` 后缀）
   3. 检查该原始路径对应的 Asset 是否还存在
   4. 不存在则删除缓存文件
+
+---
+
+## 七、业务实体更新资源引用
+
+### 7.1 AssetService.updateEntityAssets
+
+`packages/core/src/service/services/asset.service.ts:273`
+
+```typescript
+async updateEntityAssets<T extends EntityWithAssets>(
+    ctx: RequestContext,
+    entity: T,
+    input: EntityAssetInput,
+): Promise<T> {
+    const { assetIds } = input;
+    if (assetIds && assetIds.length) {
+        const assets = await this.connection.findByIdsInChannel(ctx, Asset, assetIds, ctx.channelId, {});
+        const sortedAssets = assetIds.map(id => assets.find(a => idsAreEqual(a.id, id))).filter(notNullOrUndefined);
+        
+        await this.removeExistingOrderableAssets(ctx, entity);
+        if (sortedAssets.length > 0) {
+            entity.assets = await this.createOrderableAssets(ctx, entity, sortedAssets);
+        } else {
+            entity.assets = [];
+        }
+    } else if (assetIds && assetIds.length === 0) {
+        await this.removeExistingOrderableAssets(ctx, entity);
+    }
+    return entity;
+}
+```
+
+**工作原理**：
+1. 先删除该实体所有现有的 OrderableAsset 记录
+2. 根据传入的 `assetIds` 顺序创建新的 OrderableAsset 记录
+3. 没有引用计数维护，每次都是全量替换
 
 ---
 
@@ -822,6 +881,7 @@ GraphQL Upload
       ↓
 AssetService.create()
       ├─→ AssetNamingStrategy.generateSourceFileName()
+      │   → "source/0a/photo.jpg"
       ├─→ AssetStorageStrategy.writeFileFromStream()  [写入源文件]
       ├─→ 🔴 失败点：此处及之后失败会留孤儿文件
       ├─→ AssetStorageStrategy.readFileToBuffer()
@@ -847,7 +907,7 @@ AssetService.create()
 | Asset | preview | 预览文件标识符 | AssetStorageStrategy.writeFileFromBuffer() |
 | 缓存 | - | 转换后图像 | AssetServer.generateTransformedImage() |
 
-所有标识符都通过 `AssetStorageStrategy` 的 `filePathToIdentifier` 方法生成，删除时通过同一策略的 `identifierToFilePath` 反向解析。
+所有标识符都通过 `AssetStorageStrategy` 生成，读取和删除时通过同一策略反向解析。
 
 ### 8.4 删除时序
 
@@ -887,37 +947,68 @@ getAssetUrlPrefixFn(request, identifier) 获取前缀
 返回 {prefix}{identifier} 作为最终 URL
 ```
 
+### 8.6 缓存读取链路
+
+```
+请求 /assets/source/0a/photo.jpg?w=500
+      ↓
+sendAsset()
+      ├─ key = getFileNameFromParameters(req.path, params)
+      │  → "cache/source/0a/photo_transform_w500_<hash>.jpg"
+      ├─ readFileToBuffer(key)
+      ├─ ✅ 缓存存在 → 返回
+      └─ ❌ 缓存不存在 → next(404)
+                      ↓
+                      generateTransformedImage()
+                          ├─ readFileToBuffer("source/0a/photo.jpg")
+                          ├─ ✅ 源文件存在 → 转换 → 写入缓存 → 返回
+                          └─ ❌ 源文件不存在 → 返回 404
+```
+
 ---
 
-## 九、潜在问题与注意事项
+## 九、关键结论与注意事项
 
 ### 1. **上传失败产生孤儿文件**
    - `createAssetInternal` 无失败回滚机制
    - 步骤 3-7 中任何一步失败，已写入的文件无法自动清理
    - 需要定期扫描文件系统比对数据库来清理孤儿文件
 
-### 2. **findAssetUsages 不检查 OrderableAsset**
+### 2. **Local 与 S3 策略的 identifier 异同**
+   - **相同点**：最终 identifier 格式完全相同（`source/0a/photo.jpg`）
+   - **不同点**：
+     - Local 策略需要 `filePathToIdentifier` 在完整路径和相对路径间转换
+     - S3 策略直接使用传入的 fileName 作为 Key，无需路径转换
+   - **toAbsoluteUrl 逻辑完全相同**：都是 `{prefix}{identifier}`
+
+### 3. **findAssetUsages 不检查 OrderableAsset**
    - 只检查 `featuredAsset` 引用，不检查 OrderableAsset 关联表
    - 仅被资源列表引用的 Asset 可以被"静默"删除
    - 删除前的警告信息可能不准确
    - 但数据库 CASCADE 会自动清理，不会出现无效外键
 
-### 3. **缓存文件不跟踪**
+### 4. **Asset 删除后缓存仍可能被访问**
+   - 带转换参数的请求：先查缓存，缓存存在直接返回，**不检查源文件**
+   - 不带转换参数的请求：直接读源文件，删除后返回 404
+   - 已删除 Asset 的缓存变体可能在一段时间内仍然可访问
+   - 需要单独的缓存清理机制
+
+### 5. **缓存文件不跟踪**
    - 实时转换生成的缓存文件没有被 Asset 实体跟踪
    - 删除 Asset 时不会自动删除缓存文件
    - 缓存键包含参数哈希，难以枚举所有变体
    - 需要单独的清理机制（如定时任务扫描并删除过期缓存）
 
-### 4. **多 Channel 共享**
+### 6. **多 Channel 共享**
    - 一个 Asset 可以属于多个 Channel
    - 只有从所有 Channel 移除后才会真正删除文件
    - 这意味着文件存储是跨 Channel 共享的
 
-### 5. **无引用计数列**
+### 7. **无引用计数列**
    - 每次删除都需要执行 3 个查询（Product、ProductVariant、Collection）
    - 高并发删除场景可能有性能问题
 
-### 6. **标识符与 URL 分离**
+### 8. **标识符与 URL 分离**
    - 数据库存储内部标识符，输出时通过 `toAbsoluteUrl` 转换
    - Local 和 S3 策略的标识符格式相同，仅前缀配置不同
    - 切换存储策略时需要注意迁移现有文件的 URL
