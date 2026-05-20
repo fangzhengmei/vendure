@@ -205,19 +205,19 @@ private getBestConfiguration(channelCode: string, languageCode: LanguageCode) {
    - 先调用 `addTemplate()` 的配置排在数组前面，优先被匹配
    - **没有固定优先级**，完全取决于配置顺序
 
-**⚠️ 陷阱示例**：
+**⚠️ 陷阱示例（逐项校验）**：
 
 假设配置顺序如下：
 ```typescript
 orderConfirmationHandler
-    // 先添加 default 渠道的英文配置
+    // Config 1（先添加）：default 渠道的英文配置
     .addTemplate({
         channelCode: 'default',
         languageCode: LanguageCode.en,
         templateFile: 'body.default.en.hbs',
         subject: 'Default: Order #{{ order.code }}',
     })
-    // 后添加 my-channel 渠道的英文配置
+    // Config 2（后添加）：my-channel 渠道的英文配置
     .addTemplate({
         channelCode: 'my-channel',
         languageCode: LanguageCode.en,
@@ -226,9 +226,52 @@ orderConfirmationHandler
     });
 ```
 
-当 `channelCode='my-channel', languageCode='en'` 时：
-- 遍历第一个配置：`('my-channel' === 'my-channel' || 'default' === 'default') && 'en' === 'en'` → **true**
-- 命中第一个配置 `body.default.en.hbs`，而不是预期的 `body.my-channel.en.hbs`！
+**场景**：当前请求 `channelCode='my-channel'`, `languageCode='en'`
+
+**条件表达式**：`(c.channelCode === channelCode || c.channelCode === 'default') && c.languageCode === languageCode`
+
+---
+
+**逐项校验 Config 1（channelCode='default'）**：
+
+| 子表达式 | 代入值 | 结果 | 原因 |
+|---------|--------|------|------|
+| `c.channelCode === channelCode` | `'default' === 'my-channel'` | ❌ false | 配置的渠道是 'default'，当前渠道是 'my-channel'，不相等 |
+| `c.channelCode === 'default'` | `'default' === 'default'` | ✅ true | 配置的渠道就是 'default'，与右侧 'default' 相等 |
+| `\|\|` 结果 | `false \|\| true` | ✅ true | 逻辑或运算，只要有一个为 true 结果为 true |
+| `c.languageCode === languageCode` | `'en' === 'en'` | ✅ true | 配置的语言是 'en'，当前语言也是 'en'，相等 |
+| `&&` 最终结果 | `true && true` | ✅ **true** | 逻辑与运算，两边都为 true 结果为 true |
+
+✅ **Config 1 满足条件**，`Array.find()` 返回它，遍历终止，Config 2 不会被检查。
+
+---
+
+**如果 Config 2 排在前面会怎样（逐项校验）**：
+
+```typescript
+// 调换顺序：Config 2 在前，Config 1 在后
+.addTemplate({ channelCode: 'my-channel', languageCode: 'en', ... })  // Config 2
+.addTemplate({ channelCode: 'default', languageCode: 'en', ... })      // Config 1
+```
+
+**逐项校验 Config 2（channelCode='my-channel'）**：
+
+| 子表达式 | 代入值 | 结果 | 原因 |
+|---------|--------|------|------|
+| `c.channelCode === channelCode` | `'my-channel' === 'my-channel'` | ✅ true | 配置的渠道是 'my-channel'，当前渠道也是 'my-channel'，相等 |
+| `c.channelCode === 'default'` | `'my-channel' === 'default'` | ❌ false | 配置的渠道是 'my-channel'，与 'default' 不相等 |
+| `\|\|` 结果 | `true \|\| false` | ✅ true | 逻辑或运算，只要有一个为 true 结果为 true |
+| `c.languageCode === languageCode` | `'en' === 'en'` | ✅ true | 配置的语言是 'en'，当前语言也是 'en'，相等 |
+| `&&` 最终结果 | `true && true` | ✅ **true** | 逻辑与运算，两边都为 true 结果为 true |
+
+✅ **Config 2 满足条件**，`Array.find()` 返回它。
+
+---
+
+**结论**：
+- 当 `default` 配置排在前面时，即使当前渠道是 `my-channel`，也会命中 `default` 配置
+- 原因是条件 `(c.channelCode === channelCode || c.channelCode === 'default')` 对于 `default` 配置来说，右边的 `c.channelCode === 'default'` 永远为 true
+- **解决方法**：具体渠道的配置必须放在 `default` 渠道配置的前面
 
 **正确的配置顺序**（精确渠道配置放前面）：
 ```typescript
