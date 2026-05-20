@@ -159,7 +159,7 @@ export interface EmailTemplateConfig {
 }
 ```
 
-**getBestConfiguration 匹配算法**：
+**getBestConfiguration 匹配算法（真实代码逻辑）**：
 ```typescript
 // event-handler.ts:473-496
 private getBestConfiguration(channelCode: string, languageCode: LanguageCode) {
@@ -167,9 +167,11 @@ private getBestConfiguration(channelCode: string, languageCode: LanguageCode) {
         return;
     }
     
-    // 优先级1: 精确匹配（渠道匹配 + 语言匹配）
+    // ⚠️  重要：exactMatch 阶段会把 default 渠道一起参与匹配
+    // Array.find() 返回第一个满足条件的元素，所以匹配结果受 addTemplate 配置顺序影响！
     const exactMatch = this.configurations.find(c => {
         return (
+            // 条件：(渠道匹配 OR 渠道是default) AND 语言完全匹配
             (c.channelCode === channelCode || c.channelCode === 'default') &&
             c.languageCode === languageCode
         );
@@ -178,7 +180,7 @@ private getBestConfiguration(channelCode: string, languageCode: LanguageCode) {
         return exactMatch;
     }
     
-    // 优先级2: 渠道匹配 + 默认语言
+    // 第二阶段：渠道完全匹配 + 语言是 default
     const channelMatch = this.configurations.find(
         c => c.channelCode === channelCode && c.languageCode === 'default',
     );
@@ -191,11 +193,113 @@ private getBestConfiguration(channelCode: string, languageCode: LanguageCode) {
 }
 ```
 
-**配置匹配优先级**：
-1. `channelCode=当前渠道, languageCode=当前语言` → 精确匹配
-2. `channelCode='default', languageCode=当前语言` → 默认渠道，精确语言
-3. `channelCode=当前渠道, languageCode='default'` → 精确渠道，默认语言
-4. 无匹配 → 使用 `setSubject` 和默认 `'body.hbs'`
+**关键理解点**：
+
+1. **exactMatch 阶段的匹配逻辑**：
+   - 条件表达式：`(c.channelCode === channelCode || c.channelCode === 'default') && c.languageCode === languageCode`
+   - 这意味着：只要 languageCode 匹配，无论是 `channelCode=当前渠道` 还是 `channelCode='default'` 都会被纳入候选
+   - `Array.find()` 按数组顺序遍历，返回**第一个**满足条件的元素
+
+2. **匹配结果受 addTemplate 配置顺序影响**：
+   - `this.configurations` 数组的顺序由 `addTemplate()` 调用顺序决定
+   - 先调用 `addTemplate()` 的配置排在数组前面，优先被匹配
+   - **没有固定优先级**，完全取决于配置顺序
+
+**⚠️ 陷阱示例**：
+
+假设配置顺序如下：
+```typescript
+orderConfirmationHandler
+    // 先添加 default 渠道的英文配置
+    .addTemplate({
+        channelCode: 'default',
+        languageCode: LanguageCode.en,
+        templateFile: 'body.default.en.hbs',
+        subject: 'Default: Order #{{ order.code }}',
+    })
+    // 后添加 my-channel 渠道的英文配置
+    .addTemplate({
+        channelCode: 'my-channel',
+        languageCode: LanguageCode.en,
+        templateFile: 'body.my-channel.en.hbs',
+        subject: 'MyChannel: Order #{{ order.code }}',
+    });
+```
+
+当 `channelCode='my-channel', languageCode='en'` 时：
+- 遍历第一个配置：`('my-channel' === 'my-channel' || 'default' === 'default') && 'en' === 'en'` → **true**
+- 命中第一个配置 `body.default.en.hbs`，而不是预期的 `body.my-channel.en.hbs`！
+
+**正确的配置顺序**（精确渠道配置放前面）：
+```typescript
+orderConfirmationHandler
+    // 先添加具体渠道的配置
+    .addTemplate({
+        channelCode: 'my-channel',
+        languageCode: LanguageCode.en,
+        templateFile: 'body.my-channel.en.hbs',
+        subject: 'MyChannel: Order #{{ order.code }}',
+    })
+    // 后添加 default 渠道的兜底配置
+    .addTemplate({
+        channelCode: 'default',
+        languageCode: LanguageCode.en,
+        templateFile: 'body.default.en.hbs',
+        subject: 'Default: Order #{{ order.code }}',
+    });
+```
+
+**最小配置验证示例**：
+
+```typescript
+import { EmailEventListener, LanguageCode } from '@vendure/email-plugin';
+import { OrderStateTransitionEvent } from '@vendure/core';
+
+const testHandler = new EmailEventListener('test-order')
+    .on(OrderStateTransitionEvent)
+    .filter(event => event.toState === 'PaymentSettled')
+    .setRecipient(event => event.order.customer.emailAddress)
+    .setFrom('no-reply@example.com')
+    // 配置顺序1：default 在前，my-channel 在后
+    .addTemplate({
+        channelCode: 'default',
+        languageCode: LanguageCode.en,
+        templateFile: 'body.default.hbs',
+        subject: '[DEFAULT] Order #{{ order.code }}',
+    })
+    .addTemplate({
+        channelCode: 'my-channel',
+        languageCode: LanguageCode.en,
+        templateFile: 'body.my-channel.hbs',
+        subject: '[MY-CHANNEL] Order #{{ order.code }}',
+    });
+
+// 当 channelCode='my-channel', languageCode='en' 时
+// 预期命中：body.my-channel.hbs
+// 实际命中：body.default.hbs （因为 default 排在前面！）
+```
+
+**匹配流程总结**：
+```
+获取 channelCode 和 languageCode
+    │
+    ▼
+遍历 configurations 数组（按 addTemplate 顺序）
+    │
+    ├─▶ 检查 (c.channelCode === channelCode || c.channelCode === 'default') 
+    │    && c.languageCode === languageCode
+    │
+    ├─▶ 第一个满足条件的 → 返回该配置
+    │
+    └─▶ 都不满足 → 进入第二阶段
+            │
+            ▼
+        检查 c.channelCode === channelCode && c.languageCode === 'default'
+            │
+            ├─▶ 找到 → 返回该配置
+            │
+            └─▶ 未找到 → 返回 undefined（使用默认 subject 和 'body.hbs'）
+```
 
 #### templateFile 确定流程
 
