@@ -662,18 +662,44 @@ async applyChannelPriceAndTax(variant: ProductVariant, ctx: RequestContext, orde
 
 **【仓库契约】** `SearchStrategy` 继承自 `InjectableStrategy`，必须通过 `init(injector)` 方法获取依赖，不能使用构造函数注入（参考 `PostgresSearchStrategy` 已有实现）。
 
-**【SearchResult 真实字段说明】** `SearchResult` 只有以下字段：`channelIds`, `collectionIds`, `currencyCode`, `description`, `enabled`, `facetIds`, `facetValueIds`, `price`, `priceWithTax`, `productAsset`, `productId`, `productName`, `productVariantAsset`, `productVariantId`, `productVariantName`, `score`, `sku`, `slug`。**没有** `item.product` 或 `item.product.customFields`。
+**【SearchResult 字段差异说明（Shop vs Admin）】**
+
+`SearchResult` 在 Shop API 和 Admin API 中有不同的字段定义：
+
+| 字段 | Admin API | Shop API | 说明 |
+|------|-----------|----------|------|
+| `collectionIds` | ✅ | ✅ | 商品所属集合ID数组 |
+| `currencyCode` | ✅ | ✅ | 货币编码 |
+| `description` | ✅ | ✅ | 商品描述 |
+| `facetIds` | ✅ | ✅ | 商品属性ID数组 |
+| `facetValueIds` | ✅ | ✅ | 商品属性值ID数组 |
+| `price` | ✅ | ✅ | 价格 |
+| `priceWithTax` | ✅ | ✅ | 含税价格 |
+| `productAsset` | ✅ | ✅ | 商品主图 |
+| `productId` | ✅ | ✅ | 商品ID |
+| `productName` | ✅ | ✅ | 商品名称 |
+| `productVariantAsset` | ✅ | ✅ | 变体主图 |
+| `productVariantId` | ✅ | ✅ | 变体ID |
+| `productVariantName` | ✅ | ✅ | 变体名称 |
+| `score` | ✅ | ✅ | 搜索匹配度分数 |
+| `sku` | ✅ | ✅ | SKU编码 |
+| `slug` | ✅ | ✅ | URL slug |
+| `channelIds` | ✅ | ❌ | 仅Admin端可用，商品所属频道ID数组 |
+| `enabled` | ✅ | ❌ | 仅Admin端可用，商品是否启用 |
+
+**重要**：两侧都**没有** `item.product` 或 `item.product.customFields`。如果需要访问 `customFields`，必须通过 `productId` 二次查询 `Product` 实体。
 
 ```typescript
 // 【可选扩展】自定义搜索策略
 // 参考【已有实现】PostgresSearchStrategy.init(injector) 方式获取依赖
 import { Injector } from '@vendure/core';
-import { CustomerService, ProductService } from '@vendure/core';
+import { CustomerService, ProductService, ConfigService } from '@vendure/core';
 
 export class CustomerGroupSearchStrategy extends PostgresSearchStrategy {
     // 依赖通过 init 方法获取，不使用构造函数注入
     private customerService: CustomerService;
     private productService: ProductService;
+    private configService: ConfigService;
 
     // 【仓库契约】InjectableStrategy.init(injector) 方法
     async init(injector: Injector) {
@@ -681,6 +707,7 @@ export class CustomerGroupSearchStrategy extends PostgresSearchStrategy {
         await super.init(injector);
         this.customerService = injector.get(CustomerService);
         this.productService = injector.get(ProductService);
+        this.configService = injector.get(ConfigService);
     }
 
     async getSearchResults(ctx: RequestContext, input: SearchInput, enabledOnly: boolean) {
@@ -716,19 +743,39 @@ export class CustomerGroupSearchStrategy extends PostgresSearchStrategy {
     ): Promise<SearchResult[]> {
         // 基于 SearchResult 真实字段进行过滤
         // 方案A：通过 productId 查询 Product 实体获取 customFields
+        
+        // 【前置条件】需要先在 VendureConfig 中配置 Product customFields
+        // 这一步是【必须二次开发】的内容，不属于现有能力
+        // 参考【已有实现】config.customFields.Product 配置方式
+        
         const productIds = unique(results.map(r => r.productId));
+        
+        // 【已有实现调用】ProductService.findOne - relations 参数不需要特殊断言
+        // customFields 是 Product 实体的固有属性（@Column 装饰），会自动加载
         const products = await Promise.all(
-            productIds.map(id => this.productService.findOne(ctx, id, ['customFields' as never]))
+            productIds.map(id => this.productService.findOne(ctx, id, []))
         );
         const productMap = new Map(products.filter(Boolean).map(p => [p!.id, p!]));
         
+        const customerGroupIds = customerGroups.map(g => g.id.toString());
+        
         return results.filter(item => {
             const product = productMap.get(item.productId);
-            // 检查商品 customFields 中的客户分组白名单
-            const allowedGroupIds = product?.customFields?.allowedCustomerGroupIds || [];
+            if (!product) return false;
+            
+            // 【注意】allowedCustomerGroupIds 字段必须先在配置中定义
+            // 【必须二次开发】在 VendureConfig 中添加：
+            // config.customFields.Product.push({
+            //   name: 'allowedCustomerGroupIds',
+            //   type: 'string',
+            //   list: true,
+            //   nullable: true,
+            // });
+            const allowedGroupIds = (product.customFields as any).allowedCustomerGroupIds as string[] || [];
+            
             if (allowedGroupIds.length === 0) return true;
-            return customerGroups.some(g => 
-                allowedGroupIds.includes(g.id.toString())
+            return customerGroupIds.some(groupId => 
+                allowedGroupIds.includes(groupId)
             );
         });
     }
@@ -788,9 +835,15 @@ export class CustomerGroupPriceSelectionStrategy implements ProductVariantPriceS
         prices: ProductVariantPrice[], 
         group: CustomerGroup
     ): ProductVariantPrice | undefined {
-        // 示例：从 customFields 中查找客户分组特定价格
+        // 【必须二次开发】需要先在配置中添加 ProductVariantPrice customFields
+        // 参考【已有实现】config.customFields.ProductVariantPrice 配置方式
+        // config.customFields.ProductVariantPrice.push({
+        //   name: 'customerGroupId',
+        //   type: 'string',
+        //   nullable: true,
+        // });
         return prices.find(p => 
-            p.customFields?.customerGroupId === group.id.toString()
+            (p.customFields as any).customerGroupId === group.id.toString()
         );
     }
 }
@@ -803,12 +856,14 @@ export class CustomerGroupPriceSelectionStrategy implements ProductVariantPriceS
 ```typescript
 // 【可选扩展】自定义解析器
 // Resolver 可以使用构造函数注入，符合 NestJS 常规模式
+import { FacetValueService } from '@vendure/core';
+
 @Resolver('SearchResponse')
 export class CustomShopSearchResolver {
     constructor(
         private fulltextSearchService: FulltextSearchService,
         private customerService: CustomerService,  // 构造函数注入在 Resolver 中是允许的
-        private productService: ProductService,
+        private facetValueService: FacetValueService,  // 已有服务，用于查询 facetValue 信息
     ) {}
 
     @Query()
@@ -850,11 +905,20 @@ export class CustomShopSearchResolver {
         groups: CustomerGroup[]
     ): Promise<SearchResult[]> {
         // 基于 SearchResult 真实字段进行过滤
-        // 方案B：通过 facetValueIds 或 collectionIds 进行过滤（不需要额外查询）
-        const allowedFacetValueIds = this.getAllowedFacetValueIdsForGroups(groups);
+        // 方案B：通过 facetValueIds 或 collectionIds 进行过滤（不需要额外查询 Product）
+        
+        // 【已有实现调用】获取客户分组关联的 facetValueIds
+        // 【必须二次开发】需要先在配置中添加 CustomerGroup customFields
+        // config.customFields.CustomerGroup.push({
+        //   name: 'visibleFacetValueCodes',
+        //   type: 'string',
+        //   list: true,
+        //   nullable: true,
+        // });
+        const allowedFacetValueIds = await this.getAllowedFacetValueIdsForGroups(ctx, groups);
         
         return items.filter(item => {
-            // 示例：如果商品有特定 facetValue，则对该客户分组可见
+            // 【SearchResult 真实字段】facetValueIds 在 Shop API 中是可用的
             if (allowedFacetValueIds.length === 0) return true;
             return item.facetValueIds.some(fid => 
                 allowedFacetValueIds.includes(fid.toString())
@@ -862,10 +926,20 @@ export class CustomShopSearchResolver {
         });
     }
 
-    private getAllowedFacetValueIdsForGroups(groups: CustomerGroup[]): ID[] {
-        // 自定义逻辑：根据客户分组获取允许的 facetValueIds
-        // 例如："VIP" 分组可以看到 "premium" facetValue 的商品
-        return [];
+    private async getAllowedFacetValueIdsForGroups(
+        ctx: RequestContext, 
+        groups: CustomerGroup[]
+    ): Promise<ID[]> {
+        // 【必须二次开发】从 CustomerGroup customFields 中获取配置的可见 facetValue codes
+        const facetValueCodes = groups.flatMap(g => 
+            (g.customFields as any).visibleFacetValueCodes as string[] || []
+        );
+        
+        if (facetValueCodes.length === 0) return [];
+        
+        // 【已有实现调用】通过 FacetValueService 查询 facetValueIds
+        const facetValues = await this.facetValueService.findByCode(ctx, facetValueCodes);
+        return facetValues.map(fv => fv.id);
     }
 }
 ```
@@ -921,6 +995,7 @@ extend input SearchInput {
 | **【已有实现调用】** | 在扩展代码中调用已有实现 | `this.customerService.findOneByUserId(ctx, userId)` |
 | **【仓库契约】** | 必须遵守的接口约定 | `InjectableStrategy.init(injector)`, `SearchStrategy` 接口 |
 | **【可选扩展】** | 需要开发者自行实现的扩展代码 | 自定义 SearchStrategy、自定义 Resolver |
+| **【必须二次开发】** | 不属于现有能力，必须额外配置或编码 | 添加 customFields 配置、编写过滤逻辑 |
 | **【SearchResult 真实字段】** | `SearchResult` 类型实际包含的字段 | `item.productId`, `item.facetValueIds`, `item.collectionIds` |
 
 ### 5.9 完整调用链路（已有实现）
@@ -932,14 +1007,68 @@ ShopFulltextSearchResolver.search(ctx, input)  ← ctx 中只有 activeUserId，
     ↓
 FulltextSearchService.search(ctx, input, enabledOnly)
     ↓
-SearchStrategy.getSearchResults(ctx, input, enabledOnly)  ← 可注入 CustomerService 查询客户信息
+SearchStrategy.getSearchResults(ctx, input, enabledOnly)  ← 可通过 init(injector) 获取 CustomerService
     ↓
 PostgresSearchStrategy.applyTermAndFilters(...)  ← 无客户分组过滤
     ↓
 数据库查询 SearchIndexItem
+    ↓
+返回 SearchResult[]  ← 包含 productId，可用于二次查询
 ```
 
 **关键点**：各层均只能访问 `RequestContext`，客户分组信息需要通过 `CustomerService` 主动查询获取。
+
+### 5.10 实现边界说明（可直接落地）
+
+#### 现有能力（开箱即用，无需二次开发）
+
+| 能力 | 说明 | 代码位置 |
+|------|------|----------|
+| 获取当前用户ID | `ctx.activeUserId` | `request-context.ts:384-386` |
+| 根据用户ID查询客户 | `CustomerService.findOneByUserId(ctx, userId)` | `customer.service.ts:141-153` |
+| 获取客户分组信息 | `CustomerService.getCustomerGroups(ctx, customerId)` | `customer.service.ts:179-196` |
+| 客户分组变更事件 | `CustomerGroupChangeEvent` | `customer-group.service.ts:168, 194` |
+| 按产品ID查询产品 | `ProductService.findOne(ctx, productId, relations)` | `product.service.ts:127-148` |
+| 访问产品自定义字段 | `product.customFields`（自动加载，无需指定 relations） | `product.entity.ts:75-76` |
+| 按编码查询 facetValue | `FacetValueService.findByCode(ctx, codes)` | 已有服务方法 |
+| SearchStrategy 依赖注入 | `init(injector)` 方法获取服务 | `search-strategy.ts:35` |
+| Shop API SearchResult 字段 | `productId`, `facetValueIds`, `collectionIds` 等 | `generated-shop-types.ts:3215-3235` |
+| Admin API SearchResult 字段 | 额外包含 `channelIds`, `enabled` | `generated-types.ts:6178-6201` |
+
+#### 必须二次开发（不属于现有能力，需要额外编码/配置）
+
+| 需求 | 实现方式 | 说明 |
+|------|----------|------|
+| 产品级客户分组白名单 | 【配置】添加 `Product.customFields.allowedCustomerGroupIds` | 需在 `VendureConfig.customFields.Product` 中定义 |
+| 变体价格客户分组区分 | 【配置】添加 `ProductVariantPrice.customFields.customerGroupId` | 需在 `VendureConfig.customFields.ProductVariantPrice` 中定义 |
+| 客户分组可见 facetValue 配置 | 【配置】添加 `CustomerGroup.customFields.visibleFacetValueCodes` | 需在 `VendureConfig.customFields.CustomerGroup` 中定义 |
+| 搜索结果客户分组过滤 | 【编码】自定义 `SearchStrategy` | 继承 `PostgresSearchStrategy`，重写 `getSearchResults` |
+| 差异化价格选择 | 【编码】自定义 `ProductVariantPriceSelectionStrategy` | 实现 `init(injector)` 和 `selectPrice` 方法 |
+| 客户分组变更触发重索引 | 【编码】订阅 `CustomerGroupChangeEvent` | 在自定义插件中订阅并调用 `searchIndexService.updateVariants` |
+| 搜索参数支持 customerGroupId | 【编码】扩展 GraphQL schema + 自定义 SearchStrategy | 需要 `extend input SearchInput` + 处理逻辑 |
+
+#### 推荐实现路径（按侵入性从低到高）
+
+**路径1：基于 facetValue 的轻量级过滤（侵入性最低）**
+1. 【必须二次开发】配置 `CustomerGroup.customFields.visibleFacetValueCodes`
+2. 【可选扩展】自定义 `SearchStrategy`，在 `getSearchResults` 中：
+   - 【已有实现调用】通过 `ctx.activeUserId` → `findOneByUserId` → `getCustomerGroups` 获取分组
+   - 【已有实现调用】通过 `facetValueService.findByCode` 获取对应的 facetValueIds
+   - 【SearchResult 真实字段】过滤 `item.facetValueIds`
+
+**路径2：基于 Product customFields 的白名单过滤（侵入性中等）**
+1. 【必须二次开发】配置 `Product.customFields.allowedCustomerGroupIds`
+2. 【可选扩展】自定义 `SearchStrategy`，在 `getSearchResults` 中：
+   - 【已有实现调用】获取客户分组
+   - 【已有实现调用】通过 `productService.findOne` 查询产品的 `customFields`
+   - 过滤结果
+
+**路径3：完整的客户分组价格+可见性体系（侵入性最高）**
+1. 【必须二次开发】配置 `Product.customFields`、`ProductVariantPrice.customFields`、`CustomerGroup.customFields`
+2. 【可选扩展】自定义 `ProductVariantPriceSelectionStrategy`
+3. 【可选扩展】自定义 `SearchStrategy`
+4. 【可选扩展】订阅 `CustomerGroupChangeEvent` 触发重索引
+5. 【可选扩展】扩展 `SearchInput` 添加 `customerGroupId` 参数
 
 ---
 
@@ -1150,21 +1279,22 @@ async init(injector: Injector) {
 
 #### SearchResult 真实字段（已有实现）：
 
-`SearchResult` 类型（`generated-types.ts:6178-6201`）包含以下字段，**没有** `item.product` 或 `item.product.customFields`：
+`SearchResult` 在 Shop API 和 Admin API 中有不同的字段定义，两侧都**没有** `item.product` 或 `item.product.customFields`：
 
+**Admin API**（`generated-types.ts:6178-6201`）：
 ```typescript
 type SearchResult = {
-    channelIds: ID[];
+    channelIds: ID[];              // ✅ 仅Admin端
     collectionIds: ID[];
     currencyCode: CurrencyCode;
     description: string;
-    enabled: boolean;
+    enabled: boolean;              // ✅ 仅Admin端
     facetIds: ID[];
     facetValueIds: ID[];
     price: SearchResultPrice;
     priceWithTax: SearchResultPrice;
     productAsset?: SearchResultAsset;
-    productId: ID;           // ✅ 可用于二次查询 Product
+    productId: ID;                 // ✅ 可用于二次查询 Product
     productName: string;
     productVariantAsset?: SearchResultAsset;
     productVariantId: ID;
@@ -1172,6 +1302,29 @@ type SearchResult = {
     score: number;
     sku: string;
     slug: string;
+}
+```
+
+**Shop API**（`generated-shop-types.ts:3215-3235`）：
+```typescript
+type SearchResult = {
+    collectionIds: ID[];
+    currencyCode: CurrencyCode;
+    description: string;
+    facetIds: ID[];
+    facetValueIds: ID[];
+    price: SearchResultPrice;
+    priceWithTax: SearchResultPrice;
+    productAsset?: SearchResultAsset;
+    productId: ID;                 // ✅ 可用于二次查询 Product
+    productName: string;
+    productVariantAsset?: SearchResultAsset;
+    productVariantId: ID;
+    productVariantName: string;
+    score: number;
+    sku: string;
+    slug: string;
+    // ❌ 没有 channelIds 和 enabled 字段
 }
 ```
 
