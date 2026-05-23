@@ -501,9 +501,99 @@ private applyTermAndFilters(ctx: RequestContext, qb: SelectQueryBuilder<SearchIn
 
 ### 5.1 核心发现
 
-**索引层不直接支持客户分组可见性**。`SearchIndexItem` 实体中没有 `customerGroupId` 字段，客户分组通过价格策略间接影响。
+**索引层不直接支持客户分组可见性**。`SearchIndexItem` 实体中没有 `customerGroupId` 字段，客户分组需要在查询阶段通过扩展实现。
 
-### 5.2 价格选择策略
+### 5.2 RequestContext 实际可用字段（已有实现）
+
+`RequestContext` 类（`request-context.ts:179-484`）中与客户相关的可用字段：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `ctx.activeUserId` | `ID \| undefined` | **已有实现**。返回 `session?.user?.id`，是获取当前用户的唯一入口 |
+| `ctx.session` | `CachedSession \| undefined` | **已有实现**。会话对象，包含用户信息 |
+| `ctx.session?.user` | `CachedSessionUser \| undefined` | **已有实现**。只包含 `id`, `identifier`, `verified`, `channelPermissions` |
+| `ctx.activeCustomer` | - | **不存在！** 之前的理解有误，RequestContext 中没有此字段 |
+
+**正确获取客户分组的链路（已有实现）**：
+```
+ctx.activeUserId → userId
+    ↓
+customerService.findOneByUserId(ctx, userId) → Customer
+    ↓
+customerService.getCustomerGroups(ctx, customerId) → CustomerGroup[]
+```
+
+### 5.3 已有服务方法（仓库现有实现）
+
+#### 5.3.1 CustomerService.findOneByUserId
+
+**已有实现**（`customer.service.ts:141-153`）：
+
+```typescript
+/**
+ * Returns the Customer entity associated with the given userId, if one exists.
+ * Setting `filterOnChannel` to `true` will limit the results to Customers which are assigned
+ * to the current active Channel only.
+ */
+findOneByUserId(
+    ctx: RequestContext, 
+    userId: ID, 
+    filterOnChannel = true
+): Promise<Customer | undefined> {
+    let query = this.connection
+        .getRepository(ctx, Customer)
+        .createQueryBuilder('customer')
+        .leftJoin('customer.channels', 'channel')
+        .leftJoinAndSelect('customer.user', 'user')
+        .where('user.id = :userId', { userId })
+        .andWhere('customer.deletedAt is null');
+    if (filterOnChannel) {
+        query = query.andWhere('channel.id = :channelId', { channelId: ctx.channelId });
+    }
+    return query.getOne().then(result => result ?? undefined);
+}
+```
+
+#### 5.3.2 CustomerService.getCustomerGroups
+
+**已有实现**（`customer.service.ts:179-196`）：
+
+```typescript
+/**
+ * Returns a list of all {@link CustomerGroup} entities.
+ */
+async getCustomerGroups(ctx: RequestContext, customerId: ID): Promise<CustomerGroup[]> {
+    const customerWithGroups = await this.connection.findOneInChannel(
+        ctx,
+        Customer,
+        customerId,
+        ctx?.channelId,
+        {
+            relations: ['groups'],
+            where: { deletedAt: IsNull() },
+        },
+    );
+    if (customerWithGroups) {
+        return customerWithGroups.groups;
+    } else {
+        return [];
+    }
+}
+```
+
+#### 5.3.3 CustomerGroupChangeEvent
+
+**已有实现**（`customer-group.service.ts:168, 194`）：
+
+```typescript
+// 客户添加到分组时触发
+this.eventBus.publish(new CustomerGroupChangeEvent(ctx, customers, group, 'assigned'));
+
+// 客户移出分组时触发
+this.eventBus.publish(new CustomerGroupChangeEvent(ctx, customers, group, 'removed'));
+```
+
+### 5.4 价格选择策略（已有实现）
 
 默认价格选择策略只考虑频道和货币（`default-product-variant-price-selection-strategy.ts:17-22`）：
 
@@ -517,7 +607,7 @@ export class DefaultProductVariantPriceSelectionStrategy implements ProductVaria
 }
 ```
 
-### 5.3 索引构建时的价格计算
+### 5.5 索引构建时的价格计算（已有实现）
 
 在 `saveVariants` 中应用价格（`indexer.controller.ts:446`）：
 
@@ -553,101 +643,240 @@ async applyChannelPriceAndTax(variant: ProductVariant, ctx: RequestContext, orde
 }
 ```
 
-### 5.4 能力边界
+### 5.6 能力边界
 
 **索引层限制**：
 - `SearchIndexItem` 无 `customerGroupId` 字段
 - `ProductVariantPrice` 实体也没有 `customerGroupId` 字段
 - 索引中只会存储一个价格（基于索引构建时的上下文）
 - 无法为每个客户分组存储不同价格
-- 无客户分组变更事件触发索引更新
+- 无客户分组变更事件触发索引更新（`CustomerGroupChangeEvent` 存在但未被搜索插件订阅）
 
 **查询层限制**：
 - `SearchInput` 无客户分组过滤参数
 - 搜索策略不支持按客户分组过滤
 
-### 5.5 查询阶段的可扩展策略
+### 5.7 查询阶段的可扩展策略（均为扩展示例）
 
-#### 扩展点 1：自定义 SearchStrategy
+#### 扩展点 1：自定义 SearchStrategy（可选扩展）
 
-通过自定义 `SearchStrategy` 在查询时添加客户分组逻辑（`types.ts:53-133`）：
+通过自定义 `SearchStrategy` 在查询时添加客户分组逻辑。需要注入 `CustomerService`：
 
 ```typescript
+// 【可选扩展】自定义搜索策略
+@Injectable()
 export class CustomerGroupSearchStrategy extends PostgresSearchStrategy {
+    constructor(private customerService: CustomerService) {
+        super();
+    }
+
     async getSearchResults(ctx: RequestContext, input: SearchInput, enabledOnly: boolean) {
         const results = await super.getSearchResults(ctx, input, enabledOnly);
         
         // 查询后过滤：根据当前用户的客户分组过滤结果
-        const customerGroup = ctx.activeCustomer?.groups;
-        if (customerGroup) {
+        const customerGroups = await this.getCurrentCustomerGroups(ctx);
+        if (customerGroups.length > 0) {
             // 应用客户分组级别的可见性规则
-            return this.applyCustomerGroupVisibility(results, customerGroup);
+            return this.applyCustomerGroupVisibility(results, customerGroups);
         }
         
         return results;
     }
+
+    // 【已有实现调用】获取当前客户的分组
+    private async getCurrentCustomerGroups(ctx: RequestContext): Promise<CustomerGroup[]> {
+        const userId = ctx.activeUserId;
+        if (!userId) return [];
+        
+        const customer = await this.customerService.findOneByUserId(ctx, userId);
+        if (!customer) return [];
+        
+        return this.customerService.getCustomerGroups(ctx, customer.id);
+    }
+
+    private applyCustomerGroupVisibility(
+        results: SearchResult[], 
+        customerGroups: CustomerGroup[]
+    ): SearchResult[] {
+        // 自定义可见性逻辑
+        return results.filter(item => 
+            this.isVisibleToGroups(item, customerGroups)
+        );
+    }
+
+    private isVisibleToGroups(item: SearchResult, groups: CustomerGroup[]): boolean {
+        // 示例：检查商品 customFields 中的客户分组白名单
+        const allowedGroupIds = item.product?.customFields?.allowedCustomerGroupIds || [];
+        if (allowedGroupIds.length === 0) return true;
+        return groups.some(g => allowedGroupIds.includes(g.id.toString()));
+    }
 }
 ```
 
-#### 扩展点 2：自定义 ProductVariantPriceSelectionStrategy
+#### 扩展点 2：自定义 ProductVariantPriceSelectionStrategy（可选扩展）
 
-通过价格选择策略实现客户分组差异化定价（但索引只存一个价格）：
+通过价格选择策略实现客户分组差异化定价。需要注入 `CustomerService`：
 
 ```typescript
+// 【可选扩展】自定义价格选择策略
+@Injectable()
 export class CustomerGroupPriceSelectionStrategy implements ProductVariantPriceSelectionStrategy {
-    selectPrice(ctx: RequestContext, prices: ProductVariantPrice[]) {
+    constructor(private customerService: CustomerService) {}
+
+    async selectPrice(ctx: RequestContext, prices: ProductVariantPrice[]) {
         const pricesInChannel = prices.filter(p => idsAreEqual(p.channelId, ctx.channelId));
         const priceInCurrency = pricesInChannel.find(p => p.currencyCode === ctx.currencyCode);
         
-        // 可在此处根据 ctx.activeCustomer?.groups 选择不同价格
-        const customerGroup = ctx.activeCustomer?.groups?.[0];
-        if (customerGroup) {
+        // 【已有实现调用】获取当前客户的分组
+        const customerGroups = await this.getCurrentCustomerGroups(ctx);
+        if (customerGroups.length > 0) {
             // 从 customFields 或其他来源获取客户分组特定价格
-            const customerGroupPrice = this.getCustomerGroupPrice(pricesInChannel, customerGroup);
+            const customerGroupPrice = this.getCustomerGroupPrice(
+                pricesInChannel, 
+                customerGroups[0]
+            );
             return customerGroupPrice ?? priceInCurrency;
         }
         
         return priceInCurrency;
     }
-}
-```
 
-#### 扩展点 3：Resolver 层后处理
-
-在 GraphQL Resolver 层对搜索结果进行客户分组过滤：
-
-```typescript
-@Resolver('SearchResponse')
-export class CustomShopSearchResolver extends ShopFulltextSearchResolver {
-    @Query()
-    async search(@Ctx() ctx: RequestContext, @Args() args: QuerySearchArgs) {
-        const result = await super.search(ctx, args);
+    private async getCurrentCustomerGroups(ctx: RequestContext): Promise<CustomerGroup[]> {
+        const userId = ctx.activeUserId;
+        if (!userId) return [];
         
-        // 应用客户分组可见性过滤
-        const customerGroup = ctx.activeCustomer?.groups;
-        if (customerGroup) {
-            result.items = result.items.filter(item => 
-                this.isVisibleToCustomerGroup(item, customerGroup)
-            );
-            result.totalItems = result.items.length;
-        }
+        const customer = await this.customerService.findOneByUserId(ctx, userId);
+        if (!customer) return [];
         
-        return result;
+        return this.customerService.getCustomerGroups(ctx, customer.id);
+    }
+
+    private getCustomerGroupPrice(
+        prices: ProductVariantPrice[], 
+        group: CustomerGroup
+    ): ProductVariantPrice | undefined {
+        // 示例：从 customFields 中查找客户分组特定价格
+        return prices.find(p => 
+            p.customFields?.customerGroupId === group.id.toString()
+        );
     }
 }
 ```
 
-#### 扩展点 4：扩展 SearchInput
+#### 扩展点 3：Resolver 层后处理（可选扩展）
+
+在 GraphQL Resolver 层对搜索结果进行客户分组过滤。需要注入 `CustomerService`：
+
+```typescript
+// 【可选扩展】自定义解析器
+@Resolver('SearchResponse')
+export class CustomShopSearchResolver {
+    constructor(
+        private fulltextSearchService: FulltextSearchService,
+        private customerService: CustomerService
+    ) {}
+
+    @Query()
+    @Allow(Permission.Public)
+    async search(
+        @Ctx() ctx: RequestContext,
+        @Args() args: QuerySearchArgs,
+    ): Promise<Omit<SearchResponse, 'facetValues' | 'collections'>> {
+        const result = await this.fulltextSearchService.search(ctx, args.input, true);
+        
+        // 【已有实现调用】获取当前客户的分组
+        const customerGroups = await this.getCurrentCustomerGroups(ctx);
+        if (customerGroups.length > 0) {
+            // 应用客户分组可见性过滤
+            result.items = result.items.filter(item => 
+                this.isVisibleToCustomerGroup(item, customerGroups)
+            );
+            result.totalItems = result.items.length;
+        }
+        
+        (result as any).input = args.input;
+        return result;
+    }
+
+    private async getCurrentCustomerGroups(ctx: RequestContext): Promise<CustomerGroup[]> {
+        const userId = ctx.activeUserId;
+        if (!userId) return [];
+        
+        const customer = await this.customerService.findOneByUserId(ctx, userId);
+        if (!customer) return [];
+        
+        return this.customerService.getCustomerGroups(ctx, customer.id);
+    }
+
+    private isVisibleToCustomerGroup(
+        item: SearchResult, 
+        groups: CustomerGroup[]
+    ): boolean {
+        // 自定义可见性逻辑
+        return true;
+    }
+}
+```
+
+#### 扩展点 4：订阅 CustomerGroupChangeEvent（可选扩展）
+
+如果客户分组变更需要触发重新索引，可以在插件中订阅该事件：
+
+```typescript
+// 【可选扩展】在自定义插件中订阅客户分组变更事件
+export class MySearchPlugin {
+    constructor(
+        private eventBus: EventBus,
+        private searchIndexService: SearchIndexService,
+        private customerService: CustomerService
+    ) {}
+
+    onModuleInit() {
+        // 订阅客户分组变更事件
+        this.eventBus.ofType(CustomerGroupChangeEvent).subscribe(async event => {
+            // 获取受影响的客户
+            const customerIds = event.customers.map(c => c.id);
+            
+            // 查询这些客户可能影响的商品（需要额外逻辑）
+            // ...
+            
+            // 触发索引更新
+            // await this.searchIndexService.updateVariants(ctx, affectedVariants);
+        });
+    }
+}
+```
+
+#### 扩展点 5：扩展 SearchInput（可选扩展）
 
 通过插件扩展 GraphQL schema，添加客户分组过滤参数：
 
 ```graphql
+# 【可选扩展】GraphQL schema 扩展
 extend input SearchInput {
     customerGroupId: ID
 }
 ```
 
 然后在自定义 SearchStrategy 中处理该参数。
+
+### 5.8 完整调用链路（已有实现）
+
+搜索请求的完整解析链路：
+
+```
+ShopFulltextSearchResolver.search(ctx, input)  ← ctx 中只有 activeUserId，无客户信息
+    ↓
+FulltextSearchService.search(ctx, input, enabledOnly)
+    ↓
+SearchStrategy.getSearchResults(ctx, input, enabledOnly)  ← 可注入 CustomerService 查询客户信息
+    ↓
+PostgresSearchStrategy.applyTermAndFilters(...)  ← 无客户分组过滤
+    ↓
+数据库查询 SearchIndexItem
+```
+
+**关键点**：各层均只能访问 `RequestContext`，客户分组信息需要通过 `CustomerService` 主动查询获取。
 
 ---
 
@@ -754,7 +983,7 @@ Shop API 调用时 `enabledOnly = true`，Admin API 调用时 `enabledOnly = fal
 | 维度 | 索引层处理 | 事件驱动 | 搜索过滤 | 缓冲更新 | 备注 |
 |------|-----------|----------|----------|----------|------|
 | **频道** | ✅ 主键隔离，多频道索引 | ✅ `ProductChannelEvent`<br>`ProductVariantChannelEvent` | ✅ 强制过滤 `channelId` | ❌ 不缓冲 | 完全在索引层处理，语言联动 |
-| **客户分组** | ❌ 无直接支持 | ❌ 无相关事件 | ❌ 无索引过滤 | ❌ 不涉及 | 通过价格策略间接影响，需应用层处理 |
+| **客户分组** | ❌ 无直接支持 | ⚠️ `CustomerGroupChangeEvent`<br>存在但未被搜索插件订阅 | ❌ 无索引过滤 | ❌ 不涉及 | 需通过 `CustomerService` 查询客户信息，在查询阶段扩展实现 |
 | **库存状态** | ✅ 可选索引 `inStock`<br>`productInStock` | ✅ `StockMovementEvent` | ✅ 可选过滤 `input.inStock` | ✅ 可缓冲 | 需显式配置启用 |
 | **Enabled** | ✅ 索引存储 `enabled` 字段 | ✅ `ProductEvent`<br>`ProductVariantEvent` | ✅ `enabledOnly` 参数 | ✅ 可缓冲 | 商品优先级 > 变体优先级 |
 
@@ -817,7 +1046,48 @@ private async saveSyntheticVariant(ctx: RequestContext, product: Product) {
 2. 系统默认语言
 3. 第一个可用翻译
 
-### 9.5 缓冲刷新顺序
+### 9.5 客户分组相关已有方法
+
+#### 获取客户分组信息的标准链路（已有实现）：
+
+```
+ctx.activeUserId → userId
+    ↓
+customerService.findOneByUserId(ctx, userId) → Customer
+    ↓
+customerService.getCustomerGroups(ctx, customerId) → CustomerGroup[]
+```
+
+**关键方法**（已有实现）：
+- `CustomerService.findOneByUserId(ctx, userId, filterOnChannel?)` - `customer.service.ts:141-153`
+- `CustomerService.getCustomerGroups(ctx, customerId)` - `customer.service.ts:179-196`
+- `CustomerGroupChangeEvent` - 客户分组变更事件 - `customer-group.service.ts:168, 194`
+
+#### RequestContext 可用字段（已有实现）：
+
+| 字段 | 可用性 |
+|------|--------|
+| `ctx.activeUserId` | ✅ 已有 |
+| `ctx.session?.user` | ✅ 已有（只有 `id`, `identifier`, `verified`, `channelPermissions`） |
+| `ctx.activeCustomer` | ❌ 不存在 |
+
+#### 完整搜索调用链路（已有实现）：
+
+```
+ShopFulltextSearchResolver.search(ctx, input)
+    ↓
+FulltextSearchService.search(ctx, input, enabledOnly)
+    ↓
+SearchStrategy.getSearchResults(ctx, input, enabledOnly)
+    ↓
+PostgresSearchStrategy.applyTermAndFilters(...)
+    ↓
+数据库查询 SearchIndexItem
+```
+
+**关键点**：各层只能访问 `RequestContext`，客户分组信息需要通过 `CustomerService` 主动查询获取。
+
+### 9.6 缓冲刷新顺序
 
 `search-job-buffer.service.ts:45-67`：
 1. 刷新 CollectionJobBuffer（应用集合过滤器）
