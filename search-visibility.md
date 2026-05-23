@@ -12,9 +12,12 @@
 | `SearchIndexItem` | 索引数据存储实体 | `search-index-item.entity.ts` |
 | `FulltextSearchService` | 搜索服务入口，调度具体策略 | `fulltext-search.service.ts` |
 | `SearchStrategy` | 数据库特定的搜索实现 | `postgres-search-strategy.ts` 等 |
+| `SearchJobBufferService` | 缓冲更新服务管理 | `search-job-buffer.service.ts` |
+| `SearchIndexJobBuffer` | 索引更新任务缓冲逻辑 | `search-index-job-buffer.ts` |
 
 ### 1.2 数据流向
 
+**无缓冲模式**：
 ```
 实体变更 → 事件总线 → DefaultSearchPlugin → SearchIndexService → JobQueue
                                                          ↓
@@ -23,6 +26,21 @@
                                                   SearchIndexItem
                                                          ↓
                                               搜索查询 → SearchStrategy
+```
+
+**有缓冲模式**：
+```
+实体变更 → 事件总线 → DefaultSearchPlugin → SearchIndexService → JobBufferService
+                                                                         ↓
+                                                               JobBufferStorage
+                                                                         ↓
+                                                    runPendingSearchIndexUpdates mutation
+                                                                         ↓
+                                                                  flush() → reduce()
+                                                                         ↓
+                                                                      JobQueue
+                                                                         ↓
+                                                                IndexerController
 ```
 
 ---
@@ -64,9 +82,192 @@ export class SearchIndexItem {
 
 ---
 
-## 3. 频道可见性的协作模式
+## 3. 缓冲更新时序与可见性一致性
 
-### 3.1 索引构建阶段
+### 3.1 启用条件
+
+缓冲更新通过插件配置启用（`default-search-plugin.ts:79-80`）：
+
+```typescript
+DefaultSearchPlugin.init({
+  bufferUpdates: true,
+})
+```
+
+启动时注册缓冲区（`search-job-buffer.service.ts:25-30`）：
+
+```typescript
+onApplicationBootstrap(): any {
+    if (this.bufferUpdates === true) {
+        this.jobQueueService.addBuffer(this.searchIndexJobBuffer);
+        this.jobQueueService.addBuffer(this.collectionJobBuffer);
+    }
+}
+```
+
+### 3.2 事件触发阶段
+
+**可缓冲的任务类型**（`search-index-job-buffer.ts:16-21`）：
+
+```typescript
+collect(job: Job<UpdateIndexQueueJobData>): boolean | Promise<boolean> {
+    return (
+        job.queueName === 'update-search-index' &&
+        ['update-product', 'update-variants', 'update-variants-by-id'].includes(job.data.type)
+    );
+}
+```
+
+**不可缓冲的任务类型**（直接执行）：
+- `reindex` - 全量重建
+- `delete-product` / `delete-variant` - 删除操作
+- `update-asset` / `delete-asset` - 资产变更
+- `assign-product-to-channel` / `remove-product-from-channel` - 频道分配
+- `assign-variant-to-channel` / `remove-variant-from-channel` - 频道分配
+
+**触发流程**（`job-queue.ts:90-109`）：
+
+```typescript
+async add(data: Data, options?: JobOptions<Data>): Promise<SubscribableJob<Data>> {
+    const job = new Job<any>({ data, queueName: this.options.name, ... });
+
+    // 检查是否有缓冲区收集此任务
+    const isBuffered = await this.jobBufferService.add(job);
+    if (!isBuffered) {
+        // 无缓冲：直接加入队列执行
+        const addedJob = await this.jobQueueStrategy.add(job, options);
+        return new SubscribableJob(addedJob, this.jobQueueStrategy);
+    } else {
+        // 有缓冲：返回虚拟 job，实际执行延迟到 flush
+        const bufferedJob = new Job({ ...job, id: 'buffered' });
+        return new SubscribableJob(bufferedJob, this.jobQueueStrategy);
+    }
+}
+```
+
+### 3.3 缓存队列阶段
+
+**收集逻辑**（`job-buffer.service.ts:39-49`）：
+
+```typescript
+async add(job: Job): Promise<boolean> {
+    let collected = false;
+    for (const buffer of this.buffers) {
+        const shouldCollect = await buffer.collect(job);
+        if (shouldCollect) {
+            collected = true;
+            await this.storageStrategy.add(buffer.id, job);  // 存储到缓冲存储
+        }
+    }
+    return collected;
+}
+```
+
+**存储策略**：
+- 默认 `InMemoryJobBufferStorageStrategy` - 内存存储
+- 可配置持久化存储策略
+
+### 3.4 刷新执行阶段
+
+**手动触发**（`fulltext-search.resolver.ts:104-110`）：
+
+```typescript
+@Mutation()
+@Allow(Permission.UpdateCatalog, Permission.UpdateProduct)
+async runPendingSearchIndexUpdates(...args: any[]): Promise<any> {
+    void this.searchJobBufferService.runPendingSearchUpdates();
+    return { success: true };
+}
+```
+
+**Dashboard 提醒**（`search-index-buffer-alert.ts:21-41`）：
+- 每分钟轮询 `pendingSearchIndexUpdates` 查询
+- 挂起数 > 0 时显示警告
+- 提供 "Run pending updates" 操作按钮
+
+**执行顺序**（`search-job-buffer.service.ts:45-67`）：
+
+```typescript
+async runPendingSearchUpdates(): Promise<void> {
+    // 1. 先刷新 collection buffer（确保集合过滤器先应用）
+    const collectionFilterJobs = await this.jobQueueService.flush(this.collectionJobBuffer);
+    
+    // 2. 等待 collection jobs 完成（最长 15 分钟）
+    if (collectionFilterJobs.length && isInspectableJobQueueStrategy(jobQueueStrategy)) {
+        await forkJoin(...subscribableCollectionJobs.map(sj => 
+            sj.updates({ pollInterval: 500, timeoutMs: 15 * 60 * 1000 })
+        )).toPromise();
+    }
+    
+    // 3. 再刷新 search index buffer
+    await this.jobQueueService.flush(this.searchIndexJobBuffer);
+}
+```
+
+**合并优化**（`search-index-job-buffer.ts:23-67`）：
+
+```typescript
+reduce(collectedJobs: Array<Job<UpdateIndexQueueJobData>>): Array<Job<any>> {
+    // 1. 分离 variants jobs 和 products jobs
+    const variantsJobs = this.removeBy(collectedJobs, 
+        item => item.data.type === 'update-variants-by-id' || item.data.type === 'update-variants');
+    const productsJobs = this.removeBy(collectedJobs, 
+        item => item.data.type === 'update-product');
+    
+    const jobsToAdd = [...collectedJobs];
+    
+    // 2. 合并所有 variants jobs 为一个 update-variants-by-id job
+    if (variantsJobs.length) {
+        const variantIdsToUpdate: ID[] = [];
+        for (const job of variantsJobs) {
+            const ids = job.data.type === 'update-variants-by-id' ? job.data.ids : job.data.variantIds;
+            variantIdsToUpdate.push(...ids);
+        }
+        // 去重后创建合并任务
+        const batchedVariantJob = new Job<UpdateVariantsByIdJobData>({
+            ...referenceJob,
+            data: {
+                type: 'update-variants-by-id',
+                ids: unique(variantIdsToUpdate),  // 关键优化：去重
+                ctx: referenceJob.data.ctx,
+            },
+        });
+        jobsToAdd.push(batchedVariantJob as Job);
+    }
+    
+    // 3. 合并 products jobs（按 productId 去重）
+    if (productsJobs.length) {
+        const seenIds = new Set<ID>();
+        const uniqueProductJobs: Array<Job<UpdateProductJobData>> = [];
+        for (const job of productsJobs) {
+            if (!seenIds.has(job.data.productId)) {
+                uniqueProductJobs.push(job);
+                seenIds.add(job.data.productId);
+            }
+        }
+        jobsToAdd.push(...(uniqueProductJobs as Job[]));
+    }
+    
+    return jobsToAdd;
+}
+```
+
+### 3.5 对可见性一致性的影响
+
+| 影响维度 | 说明 |
+|---------|------|
+| **最终一致性** | 缓冲期间索引与实际数据不一致，用户搜索可能看到过期信息 |
+| **延迟窗口** | 延迟取决于何时调用 `runPendingSearchIndexUpdates`，可能是分钟级到小时级 |
+| **删除操作例外** | 删除操作不缓冲，立即执行，避免已删除商品出现在搜索结果中 |
+| **频道分配例外** | 频道分配变更不缓冲，立即执行，确保多渠道可见性及时更新 |
+| **批量优化代价** | 合并优化减少了任务数量，但可能导致单个任务执行时间变长 |
+| **脏读风险** | 缓冲期间多次更新同一实体，最后一次 flush 时只执行一次最新的索引更新 |
+
+---
+
+## 4. 频道可见性的协作模式
+
+### 4.1 索引构建阶段
 
 **查询过滤**（`indexer.controller.ts:342-381`）：
 
@@ -103,7 +304,152 @@ private async saveVariants(ctx: MutableRequestContext, variants: ProductVariant[
 }
 ```
 
-### 3.2 事件驱动更新
+### 4.2 频道分配时的语言联动
+
+**触发场景**：商品/变体分配到新频道时
+
+**语言联动逻辑**（`indexer.controller.ts:252-291`）：
+
+```typescript
+private async updateProductInChannel(
+    ctx: MutableRequestContext,
+    productId: ID,
+    channelId: ID,
+): Promise<boolean> {
+    const channel = await this.loadChannel(ctx, channelId);
+    ctx.setChannel(channel);
+    const product = await this.getProductInChannelQueryBuilder(ctx, productId, channel);
+
+    if (product) {
+        // 关键：查询支持该商品翻译语言的所有频道
+        const affectedChannels = await this.getAllChannels(ctx, {
+            where: {
+                availableLanguageCodes: In(product.translations.map(t => t.languageCode)),
+            },
+        });
+        
+        // 为所有相关频道更新索引
+        const { variants: updatedVariants } = await this.getSearchIndexQueryBuilder(ctx, {
+            channels: unique(affectedChannels.concat(channel)),
+            productId,
+        });
+        
+        // 无变体兜底路径
+        if (updatedVariants.length === 0) {
+            const clone = new Product({ id: product.id });
+            await this.entityHydrator.hydrate(ctx, clone, { relations: ['translations' as never] });
+            product.translations = clone.translations;
+            await this.saveSyntheticVariant(ctx, product);
+        }
+        // ...
+    }
+}
+```
+
+**语言降级策略**（`indexer.controller.ts:568-575`）：
+
+```typescript
+private getTranslation<T extends Translatable>(
+    translatable: T,
+    languageCode: LanguageCode,
+): Translation<T> {
+    return (translatable.translations.find(t => t.languageCode === languageCode) ||
+        translatable.translations.find(t => t.languageCode === this.configService.defaultLanguageCode) ||
+        translatable.translations[0]) as unknown as Translation<T>;
+}
+```
+
+**channelIds 字段的联动**（`indexer.controller.ts:425-435`）：
+
+```typescript
+// 收集该变体在所有支持当前语言的频道中的 ID
+let channelIds = variant.channels.map(x => x.id);
+const clone = new ProductVariant({ id: variant.id });
+await this.entityHydrator.hydrate(ctx, clone, {
+    relations: ['channels', 'channels.defaultTaxZone'],
+});
+channelIds.push(
+    ...clone.channels
+        .filter(x => x.availableLanguageCodes.includes(languageCode))
+        .map(x => x.id),
+);
+channelIds = unique(channelIds);
+```
+
+### 4.3 无变体兜底路径
+
+**触发条件**（`indexer.controller.ts:271-275`）：
+
+```typescript
+if (updatedVariants.length === 0) {
+    // 商品已分配到频道，但还没有任何变体
+    const clone = new Product({ id: product.id });
+    await this.entityHydrator.hydrate(ctx, clone, { relations: ['translations' as never] });
+    product.translations = clone.translations;
+    await this.saveSyntheticVariant(ctx, product);
+}
+```
+
+**合成变体特征**（`indexer.controller.ts:521-550`）：
+
+```typescript
+private async saveSyntheticVariant(ctx: RequestContext, product: Product) {
+    const productTranslation = this.getTranslation(product, ctx.languageCode);
+    const item = new SearchIndexItem({
+        channelId: ctx.channelId,
+        currencyCode: ctx.currencyCode,
+        languageCode: ctx.languageCode,
+        productVariantId: 0,  // 特殊标识：productVariantId = 0
+        price: 0,
+        priceWithTax: 0,
+        sku: '',
+        enabled: false,       // 关键：合成变体默认不启用
+        slug: productTranslation.slug,
+        productId: product.id,
+        productName: productTranslation.name,
+        description: this.constrainDescription(productTranslation.description),
+        productVariantName: productTranslation.name,
+        // ...
+    });
+    await this.queue.push(() => this.connection.getRepository(ctx, SearchIndexItem).save(item));
+}
+```
+
+**合成变体清理**（`indexer.controller.ts:404, 555-566`）：
+
+```typescript
+// 保存真实变体前先清理合成变体
+private async saveVariants(ctx: MutableRequestContext, variants: ProductVariant[]) {
+    const items: SearchIndexItem[] = [];
+    await this.removeSyntheticVariants(ctx, variants);
+    // ...
+}
+
+private async removeSyntheticVariants(ctx: RequestContext, variants: ProductVariant[]) {
+    const prodIds = unique(variants.map(v => v.productId));
+    for (const productId of prodIds) {
+        await this.queue.push(() =>
+            this.connection.getRepository(ctx, SearchIndexItem).delete({
+                productId,
+                sku: '',    // 通过 sku = '' 和 price = 0 识别合成变体
+                price: 0,
+            }),
+        );
+    }
+}
+```
+
+**兜底路径完整生命周期**：
+```
+1. 商品分配到频道 → updateProductInChannel
+2. 检查是否有变体 → updatedVariants.length === 0
+3. 创建合成变体 → productVariantId = 0, enabled = false
+4. 后续添加变体 → updateVariants
+5. saveVariants 执行前 → removeSyntheticVariants
+6. 删除合成变体，保存真实变体
+```
+
+### 4.4 事件驱动更新
 
 `DefaultSearchPlugin` 在启动时订阅频道变更事件（`default-search-plugin.ts:142-171`）：
 
@@ -135,7 +481,9 @@ this.eventBus.ofType(ProductVariantChannelEvent).subscribe(event => {
 });
 ```
 
-### 3.3 搜索查询过滤
+**重要**：频道分配变更**不经过缓冲区**，立即执行。
+
+### 4.5 搜索查询过滤
 
 所有搜索策略在查询时强制应用频道过滤（`postgres-search-strategy.ts:301`）：
 
@@ -149,13 +497,13 @@ private applyTermAndFilters(ctx: RequestContext, qb: SelectQueryBuilder<SearchIn
 
 ---
 
-## 4. 客户分组可见性的协作模式
+## 5. 客户分组可见性的协作模式
 
-### 4.1 核心发现
+### 5.1 核心发现
 
 **索引层不直接支持客户分组可见性**。`SearchIndexItem` 实体中没有 `customerGroupId` 字段，客户分组通过价格策略间接影响。
 
-### 4.2 价格选择策略
+### 5.2 价格选择策略
 
 默认价格选择策略只考虑频道和货币（`default-product-variant-price-selection-strategy.ts:17-22`）：
 
@@ -169,7 +517,7 @@ export class DefaultProductVariantPriceSelectionStrategy implements ProductVaria
 }
 ```
 
-### 4.3 索引构建时的价格计算
+### 5.3 索引构建时的价格计算
 
 在 `saveVariants` 中应用价格（`indexer.controller.ts:446`）：
 
@@ -182,21 +530,130 @@ const item = new SearchIndexItem({
 });
 ```
 
-### 4.4 扩展点与限制
+`applyChannelPriceAndTax` 内部调用价格选择策略（`product-price-applicator.ts:58-108`）：
 
-**可扩展**：通过自定义 `ProductVariantPriceSelectionStrategy` 可以根据客户分组选择不同价格。
+```typescript
+async applyChannelPriceAndTax(variant: ProductVariant, ctx: RequestContext, order?: Order) {
+    const { productVariantPriceSelectionStrategy, productVariantPriceCalculationStrategy } =
+        this.configService.catalogOptions;
+    
+    // 调用价格选择策略
+    const channelPrice = await productVariantPriceSelectionStrategy.selectPrice(
+        ctx,
+        variant.productVariantPrices,
+    );
+    
+    // ... 计算税额
+    
+    variant.listPrice = price;
+    variant.listPriceIncludesTax = priceIncludesTax;
+    variant.taxRateApplied = applicableTaxRate;
+    variant.currencyCode = channelPrice?.currencyCode ?? ctx.currencyCode;
+    return variant;
+}
+```
 
-**限制**：
+### 5.4 能力边界
+
+**索引层限制**：
+- `SearchIndexItem` 无 `customerGroupId` 字段
+- `ProductVariantPrice` 实体也没有 `customerGroupId` 字段
 - 索引中只会存储一个价格（基于索引构建时的上下文）
 - 无法为每个客户分组存储不同价格
-- 客户分组级别的可见性需要在应用层（查询后）处理，而不是在索引层
-- `ProductVariantPrice` 实体本身也没有 `customerGroupId` 字段
+- 无客户分组变更事件触发索引更新
+
+**查询层限制**：
+- `SearchInput` 无客户分组过滤参数
+- 搜索策略不支持按客户分组过滤
+
+### 5.5 查询阶段的可扩展策略
+
+#### 扩展点 1：自定义 SearchStrategy
+
+通过自定义 `SearchStrategy` 在查询时添加客户分组逻辑（`types.ts:53-133`）：
+
+```typescript
+export class CustomerGroupSearchStrategy extends PostgresSearchStrategy {
+    async getSearchResults(ctx: RequestContext, input: SearchInput, enabledOnly: boolean) {
+        const results = await super.getSearchResults(ctx, input, enabledOnly);
+        
+        // 查询后过滤：根据当前用户的客户分组过滤结果
+        const customerGroup = ctx.activeCustomer?.groups;
+        if (customerGroup) {
+            // 应用客户分组级别的可见性规则
+            return this.applyCustomerGroupVisibility(results, customerGroup);
+        }
+        
+        return results;
+    }
+}
+```
+
+#### 扩展点 2：自定义 ProductVariantPriceSelectionStrategy
+
+通过价格选择策略实现客户分组差异化定价（但索引只存一个价格）：
+
+```typescript
+export class CustomerGroupPriceSelectionStrategy implements ProductVariantPriceSelectionStrategy {
+    selectPrice(ctx: RequestContext, prices: ProductVariantPrice[]) {
+        const pricesInChannel = prices.filter(p => idsAreEqual(p.channelId, ctx.channelId));
+        const priceInCurrency = pricesInChannel.find(p => p.currencyCode === ctx.currencyCode);
+        
+        // 可在此处根据 ctx.activeCustomer?.groups 选择不同价格
+        const customerGroup = ctx.activeCustomer?.groups?.[0];
+        if (customerGroup) {
+            // 从 customFields 或其他来源获取客户分组特定价格
+            const customerGroupPrice = this.getCustomerGroupPrice(pricesInChannel, customerGroup);
+            return customerGroupPrice ?? priceInCurrency;
+        }
+        
+        return priceInCurrency;
+    }
+}
+```
+
+#### 扩展点 3：Resolver 层后处理
+
+在 GraphQL Resolver 层对搜索结果进行客户分组过滤：
+
+```typescript
+@Resolver('SearchResponse')
+export class CustomShopSearchResolver extends ShopFulltextSearchResolver {
+    @Query()
+    async search(@Ctx() ctx: RequestContext, @Args() args: QuerySearchArgs) {
+        const result = await super.search(ctx, args);
+        
+        // 应用客户分组可见性过滤
+        const customerGroup = ctx.activeCustomer?.groups;
+        if (customerGroup) {
+            result.items = result.items.filter(item => 
+                this.isVisibleToCustomerGroup(item, customerGroup)
+            );
+            result.totalItems = result.items.length;
+        }
+        
+        return result;
+    }
+}
+```
+
+#### 扩展点 4：扩展 SearchInput
+
+通过插件扩展 GraphQL schema，添加客户分组过滤参数：
+
+```graphql
+extend input SearchInput {
+    customerGroupId: ID
+}
+```
+
+然后在自定义 SearchStrategy 中处理该参数。
 
 ---
 
-## 5. 库存状态可见性的协作模式
+## 6. 库存状态可见性的协作模式
 
-### 5.1 可选配置启用
+### 6.1 可选配置启用
 
 库存状态索引是可选的，通过插件配置启用（`default-search-plugin.ts:107-116`）：
 
@@ -210,7 +667,7 @@ static init(options: DefaultSearchPluginInitOptions): Type<DefaultSearchPlugin> 
 }
 ```
 
-### 5.2 索引构建阶段
+### 6.2 索引构建阶段
 
 **变体库存**（`indexer.controller.ts:478-480`）：
 
@@ -236,7 +693,7 @@ const productInStock = await this.requestContextCache.get(
 item.productInStock = productInStock;
 ```
 
-### 5.3 事件驱动更新
+### 6.3 事件驱动更新
 
 库存变动时触发重新索引（`default-search-plugin.ts:173-178`）：
 
@@ -249,7 +706,7 @@ this.eventBus.ofType(StockMovementEvent).subscribe(event => {
 });
 ```
 
-### 5.4 搜索查询过滤
+### 6.4 搜索查询过滤
 
 用户可通过 `inStock` 参数过滤（`postgres-search-strategy.ts:208-214`）：
 
@@ -265,9 +722,9 @@ if (input.inStock != null) {
 
 ---
 
-## 6. Enabled 状态的协作模式
+## 7. Enabled 状态的协作模式
 
-### 6.1 索引构建阶段
+### 7.1 索引构建阶段
 
 商品的 `enabled` 优先级高于变体的 `enabled`（`indexer.controller.ts:455`）：
 
@@ -278,7 +735,7 @@ const item = new SearchIndexItem({
 });
 ```
 
-### 6.2 搜索查询过滤
+### 7.2 搜索查询过滤
 
 通过 `enabledOnly` 参数控制（`postgres-search-strategy.ts:118-120`）：
 
@@ -292,20 +749,20 @@ Shop API 调用时 `enabledOnly = true`，Admin API 调用时 `enabledOnly = fal
 
 ---
 
-## 7. 协作模式总结
+## 8. 协作模式总结
 
-| 维度 | 索引层处理 | 事件驱动 | 搜索过滤 | 备注 |
-|------|-----------|----------|----------|------|
-| **频道** | ✅ 主键隔离，多频道索引 | ✅ `ProductChannelEvent`<br>`ProductVariantChannelEvent` | ✅ 强制过滤 `channelId` | 完全在索引层处理 |
-| **客户分组** | ❌ 无直接支持 | ❌ 无相关事件 | ❌ 无索引过滤 | 通过价格策略间接影响，需应用层处理 |
-| **库存状态** | ✅ 可选索引 `inStock`<br>`productInStock` | ✅ `StockMovementEvent` | ✅ 可选过滤 `input.inStock` | 需显式配置启用 |
-| **Enabled** | ✅ 索引存储 `enabled` 字段 | ✅ `ProductEvent`<br>`ProductVariantEvent` | ✅ `enabledOnly` 参数 | 商品优先级 > 变体优先级 |
+| 维度 | 索引层处理 | 事件驱动 | 搜索过滤 | 缓冲更新 | 备注 |
+|------|-----------|----------|----------|----------|------|
+| **频道** | ✅ 主键隔离，多频道索引 | ✅ `ProductChannelEvent`<br>`ProductVariantChannelEvent` | ✅ 强制过滤 `channelId` | ❌ 不缓冲 | 完全在索引层处理，语言联动 |
+| **客户分组** | ❌ 无直接支持 | ❌ 无相关事件 | ❌ 无索引过滤 | ❌ 不涉及 | 通过价格策略间接影响，需应用层处理 |
+| **库存状态** | ✅ 可选索引 `inStock`<br>`productInStock` | ✅ `StockMovementEvent` | ✅ 可选过滤 `input.inStock` | ✅ 可缓冲 | 需显式配置启用 |
+| **Enabled** | ✅ 索引存储 `enabled` 字段 | ✅ `ProductEvent`<br>`ProductVariantEvent` | ✅ `enabledOnly` 参数 | ✅ 可缓冲 | 商品优先级 > 变体优先级 |
 
 ---
 
-## 8. 关键代码参考
+## 9. 关键代码参考
 
-### 8.1 索引更新队列任务类型
+### 9.1 索引更新队列任务类型
 
 `search-index.service.ts:35-66` 定义了所有索引更新任务类型：
 
@@ -319,7 +776,21 @@ Shop API 调用时 `enabledOnly = true`，Admin API 调用时 `enabledOnly = fal
 - `assign-product-to-channel` / `remove-product-from-channel` - 商品频道变更
 - `assign-variant-to-channel` / `remove-variant-from-channel` - 变体频道变更
 
-### 8.2 合成变体处理
+### 9.2 可缓冲 vs 不可缓冲任务
+
+**可缓冲**（经过 `SearchIndexJobBuffer`）：
+- `update-product`
+- `update-variants`
+- `update-variants-by-id`
+
+**不可缓冲**（立即执行）：
+- `reindex`
+- `delete-product` / `delete-variant`
+- `update-asset` / `delete-asset`
+- `assign-product-to-channel` / `remove-product-from-channel`
+- `assign-variant-to-channel` / `remove-variant-from-channel`
+
+### 9.3 合成变体处理
 
 当商品没有变体时，创建合成变体以确保商品可被搜索（`indexer.controller.ts:521-550`）：
 
@@ -333,3 +804,22 @@ private async saveSyntheticVariant(ctx: RequestContext, product: Product) {
     });
 }
 ```
+
+**识别合成变体的条件**：
+- `productVariantId = 0`
+- `sku = ''`
+- `price = 0`
+
+### 9.4 语言降级策略
+
+翻译查找优先级（`indexer.controller.ts:568-575`）：
+1. 指定语言
+2. 系统默认语言
+3. 第一个可用翻译
+
+### 9.5 缓冲刷新顺序
+
+`search-job-buffer.service.ts:45-67`：
+1. 刷新 CollectionJobBuffer（应用集合过滤器）
+2. 等待集合任务完成
+3. 刷新 SearchIndexJobBuffer（更新搜索索引）
