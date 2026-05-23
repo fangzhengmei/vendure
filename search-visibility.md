@@ -656,28 +656,41 @@ async applyChannelPriceAndTax(variant: ProductVariant, ctx: RequestContext, orde
 - `SearchInput` 无客户分组过滤参数
 - 搜索策略不支持按客户分组过滤
 
-### 5.7 查询阶段的可扩展策略（均为扩展示例）
+### 5.7 查询阶段的可扩展策略（均为可选扩展示例）
 
 #### 扩展点 1：自定义 SearchStrategy（可选扩展）
 
-通过自定义 `SearchStrategy` 在查询时添加客户分组逻辑。需要注入 `CustomerService`：
+**【仓库契约】** `SearchStrategy` 继承自 `InjectableStrategy`，必须通过 `init(injector)` 方法获取依赖，不能使用构造函数注入（参考 `PostgresSearchStrategy` 已有实现）。
+
+**【SearchResult 真实字段说明】** `SearchResult` 只有以下字段：`channelIds`, `collectionIds`, `currencyCode`, `description`, `enabled`, `facetIds`, `facetValueIds`, `price`, `priceWithTax`, `productAsset`, `productId`, `productName`, `productVariantAsset`, `productVariantId`, `productVariantName`, `score`, `sku`, `slug`。**没有** `item.product` 或 `item.product.customFields`。
 
 ```typescript
 // 【可选扩展】自定义搜索策略
-@Injectable()
+// 参考【已有实现】PostgresSearchStrategy.init(injector) 方式获取依赖
+import { Injector } from '@vendure/core';
+import { CustomerService, ProductService } from '@vendure/core';
+
 export class CustomerGroupSearchStrategy extends PostgresSearchStrategy {
-    constructor(private customerService: CustomerService) {
-        super();
+    // 依赖通过 init 方法获取，不使用构造函数注入
+    private customerService: CustomerService;
+    private productService: ProductService;
+
+    // 【仓库契约】InjectableStrategy.init(injector) 方法
+    async init(injector: Injector) {
+        // 【已有实现调用】通过 injector 获取核心服务
+        await super.init(injector);
+        this.customerService = injector.get(CustomerService);
+        this.productService = injector.get(ProductService);
     }
 
     async getSearchResults(ctx: RequestContext, input: SearchInput, enabledOnly: boolean) {
         const results = await super.getSearchResults(ctx, input, enabledOnly);
         
-        // 查询后过滤：根据当前用户的客户分组过滤结果
+        // 【已有实现调用】获取当前客户的分组
         const customerGroups = await this.getCurrentCustomerGroups(ctx);
         if (customerGroups.length > 0) {
             // 应用客户分组级别的可见性规则
-            return this.applyCustomerGroupVisibility(results, customerGroups);
+            return this.applyCustomerGroupVisibility(ctx, results, customerGroups);
         }
         
         return results;
@@ -685,43 +698,60 @@ export class CustomerGroupSearchStrategy extends PostgresSearchStrategy {
 
     // 【已有实现调用】获取当前客户的分组
     private async getCurrentCustomerGroups(ctx: RequestContext): Promise<CustomerGroup[]> {
-        const userId = ctx.activeUserId;
+        const userId = ctx.activeUserId;  // 【已有实现】RequestContext.activeUserId
         if (!userId) return [];
         
+        // 【已有实现调用】CustomerService.findOneByUserId
         const customer = await this.customerService.findOneByUserId(ctx, userId);
         if (!customer) return [];
         
+        // 【已有实现调用】CustomerService.getCustomerGroups
         return this.customerService.getCustomerGroups(ctx, customer.id);
     }
 
-    private applyCustomerGroupVisibility(
+    private async applyCustomerGroupVisibility(
+        ctx: RequestContext,
         results: SearchResult[], 
         customerGroups: CustomerGroup[]
-    ): SearchResult[] {
-        // 自定义可见性逻辑
-        return results.filter(item => 
-            this.isVisibleToGroups(item, customerGroups)
+    ): Promise<SearchResult[]> {
+        // 基于 SearchResult 真实字段进行过滤
+        // 方案A：通过 productId 查询 Product 实体获取 customFields
+        const productIds = unique(results.map(r => r.productId));
+        const products = await Promise.all(
+            productIds.map(id => this.productService.findOne(ctx, id, ['customFields' as never]))
         );
-    }
-
-    private isVisibleToGroups(item: SearchResult, groups: CustomerGroup[]): boolean {
-        // 示例：检查商品 customFields 中的客户分组白名单
-        const allowedGroupIds = item.product?.customFields?.allowedCustomerGroupIds || [];
-        if (allowedGroupIds.length === 0) return true;
-        return groups.some(g => allowedGroupIds.includes(g.id.toString()));
+        const productMap = new Map(products.filter(Boolean).map(p => [p!.id, p!]));
+        
+        return results.filter(item => {
+            const product = productMap.get(item.productId);
+            // 检查商品 customFields 中的客户分组白名单
+            const allowedGroupIds = product?.customFields?.allowedCustomerGroupIds || [];
+            if (allowedGroupIds.length === 0) return true;
+            return customerGroups.some(g => 
+                allowedGroupIds.includes(g.id.toString())
+            );
+        });
     }
 }
 ```
 
 #### 扩展点 2：自定义 ProductVariantPriceSelectionStrategy（可选扩展）
 
-通过价格选择策略实现客户分组差异化定价。需要注入 `CustomerService`：
+**【仓库契约】** `ProductVariantPriceSelectionStrategy` 同样继承自 `InjectableStrategy`，需通过 `init(injector)` 获取依赖。
 
 ```typescript
 // 【可选扩展】自定义价格选择策略
-@Injectable()
+import { Injector } from '@vendure/core';
+import { CustomerService } from '@vendure/core';
+
 export class CustomerGroupPriceSelectionStrategy implements ProductVariantPriceSelectionStrategy {
-    constructor(private customerService: CustomerService) {}
+    private customerService: CustomerService;
+
+    // 【仓库契约】InjectableStrategy.init(injector) 方法
+    async init(injector: Injector) {
+        // 【已有实现调用】通过 injector 获取核心服务
+        this.customerService = injector.get(CustomerService);
+    }
 
     async selectPrice(ctx: RequestContext, prices: ProductVariantPrice[]) {
         const pricesInChannel = prices.filter(p => idsAreEqual(p.channelId, ctx.channelId));
@@ -741,13 +771,16 @@ export class CustomerGroupPriceSelectionStrategy implements ProductVariantPriceS
         return priceInCurrency;
     }
 
+    // 【已有实现调用】获取当前客户的分组
     private async getCurrentCustomerGroups(ctx: RequestContext): Promise<CustomerGroup[]> {
-        const userId = ctx.activeUserId;
+        const userId = ctx.activeUserId;  // 【已有实现】RequestContext.activeUserId
         if (!userId) return [];
         
+        // 【已有实现调用】CustomerService.findOneByUserId
         const customer = await this.customerService.findOneByUserId(ctx, userId);
         if (!customer) return [];
         
+        // 【已有实现调用】CustomerService.getCustomerGroups
         return this.customerService.getCustomerGroups(ctx, customer.id);
     }
 
@@ -765,15 +798,17 @@ export class CustomerGroupPriceSelectionStrategy implements ProductVariantPriceS
 
 #### 扩展点 3：Resolver 层后处理（可选扩展）
 
-在 GraphQL Resolver 层对搜索结果进行客户分组过滤。需要注入 `CustomerService`：
+在 GraphQL Resolver 层对搜索结果进行客户分组过滤。Resolver 可以使用常规构造函数注入。
 
 ```typescript
 // 【可选扩展】自定义解析器
+// Resolver 可以使用构造函数注入，符合 NestJS 常规模式
 @Resolver('SearchResponse')
 export class CustomShopSearchResolver {
     constructor(
         private fulltextSearchService: FulltextSearchService,
-        private customerService: CustomerService
+        private customerService: CustomerService,  // 构造函数注入在 Resolver 中是允许的
+        private productService: ProductService,
     ) {}
 
     @Query()
@@ -787,10 +822,8 @@ export class CustomShopSearchResolver {
         // 【已有实现调用】获取当前客户的分组
         const customerGroups = await this.getCurrentCustomerGroups(ctx);
         if (customerGroups.length > 0) {
-            // 应用客户分组可见性过滤
-            result.items = result.items.filter(item => 
-                this.isVisibleToCustomerGroup(item, customerGroups)
-            );
+            // 基于 SearchResult 真实字段进行过滤
+            result.items = await this.filterByCustomerGroup(ctx, result.items, customerGroups);
             result.totalItems = result.items.length;
         }
         
@@ -798,32 +831,52 @@ export class CustomShopSearchResolver {
         return result;
     }
 
+    // 【已有实现调用】获取当前客户的分组
     private async getCurrentCustomerGroups(ctx: RequestContext): Promise<CustomerGroup[]> {
-        const userId = ctx.activeUserId;
+        const userId = ctx.activeUserId;  // 【已有实现】RequestContext.activeUserId
         if (!userId) return [];
         
+        // 【已有实现调用】CustomerService.findOneByUserId
         const customer = await this.customerService.findOneByUserId(ctx, userId);
         if (!customer) return [];
         
+        // 【已有实现调用】CustomerService.getCustomerGroups
         return this.customerService.getCustomerGroups(ctx, customer.id);
     }
 
-    private isVisibleToCustomerGroup(
-        item: SearchResult, 
+    private async filterByCustomerGroup(
+        ctx: RequestContext,
+        items: SearchResult[], 
         groups: CustomerGroup[]
-    ): boolean {
-        // 自定义可见性逻辑
-        return true;
+    ): Promise<SearchResult[]> {
+        // 基于 SearchResult 真实字段进行过滤
+        // 方案B：通过 facetValueIds 或 collectionIds 进行过滤（不需要额外查询）
+        const allowedFacetValueIds = this.getAllowedFacetValueIdsForGroups(groups);
+        
+        return items.filter(item => {
+            // 示例：如果商品有特定 facetValue，则对该客户分组可见
+            if (allowedFacetValueIds.length === 0) return true;
+            return item.facetValueIds.some(fid => 
+                allowedFacetValueIds.includes(fid.toString())
+            );
+        });
+    }
+
+    private getAllowedFacetValueIdsForGroups(groups: CustomerGroup[]): ID[] {
+        // 自定义逻辑：根据客户分组获取允许的 facetValueIds
+        // 例如："VIP" 分组可以看到 "premium" facetValue 的商品
+        return [];
     }
 }
 ```
 
 #### 扩展点 4：订阅 CustomerGroupChangeEvent（可选扩展）
 
-如果客户分组变更需要触发重新索引，可以在插件中订阅该事件：
+如果客户分组变更需要触发重新索引，可以在插件中订阅该事件。
 
 ```typescript
 // 【可选扩展】在自定义插件中订阅客户分组变更事件
+// 【已有实现】CustomerGroupChangeEvent 在 customer-group.service.ts:168, 194 发布
 export class MySearchPlugin {
     constructor(
         private eventBus: EventBus,
@@ -860,7 +913,17 @@ extend input SearchInput {
 
 然后在自定义 SearchStrategy 中处理该参数。
 
-### 5.8 完整调用链路（已有实现）
+### 5.8 关键代码区分说明
+
+| 标注类型 | 含义 | 示例 |
+|---------|------|------|
+| **【已有实现】** | 仓库中已存在的代码，可直接使用 | `RequestContext.activeUserId`, `CustomerService.findOneByUserId`, `PostgresSearchStrategy.init(injector)` |
+| **【已有实现调用】** | 在扩展代码中调用已有实现 | `this.customerService.findOneByUserId(ctx, userId)` |
+| **【仓库契约】** | 必须遵守的接口约定 | `InjectableStrategy.init(injector)`, `SearchStrategy` 接口 |
+| **【可选扩展】** | 需要开发者自行实现的扩展代码 | 自定义 SearchStrategy、自定义 Resolver |
+| **【SearchResult 真实字段】** | `SearchResult` 类型实际包含的字段 | `item.productId`, `item.facetValueIds`, `item.collectionIds` |
+
+### 5.9 完整调用链路（已有实现）
 
 搜索请求的完整解析链路：
 
@@ -1071,6 +1134,47 @@ customerService.getCustomerGroups(ctx, customerId) → CustomerGroup[]
 | `ctx.session?.user` | ✅ 已有（只有 `id`, `identifier`, `verified`, `channelPermissions`） |
 | `ctx.activeCustomer` | ❌ 不存在 |
 
+#### SearchStrategy 依赖注入契约（已有实现）：
+
+`SearchStrategy` 继承自 `InjectableStrategy`，必须通过 `init(injector)` 方法获取依赖（参考 `PostgresSearchStrategy.init` - `postgres-search-strategy.ts:33-36`）：
+
+```typescript
+// 【已有实现】InjectableStrategy.init(injector) 方法
+async init(injector: Injector) {
+    this.connection = injector.get(TransactionalConnection);
+    this.options = injector.get(PLUGIN_INIT_OPTIONS);
+}
+```
+
+**注意**：不能使用构造函数注入，必须使用 `init(injector)` 方法。
+
+#### SearchResult 真实字段（已有实现）：
+
+`SearchResult` 类型（`generated-types.ts:6178-6201`）包含以下字段，**没有** `item.product` 或 `item.product.customFields`：
+
+```typescript
+type SearchResult = {
+    channelIds: ID[];
+    collectionIds: ID[];
+    currencyCode: CurrencyCode;
+    description: string;
+    enabled: boolean;
+    facetIds: ID[];
+    facetValueIds: ID[];
+    price: SearchResultPrice;
+    priceWithTax: SearchResultPrice;
+    productAsset?: SearchResultAsset;
+    productId: ID;           // ✅ 可用于二次查询 Product
+    productName: string;
+    productVariantAsset?: SearchResultAsset;
+    productVariantId: ID;
+    productVariantName: string;
+    score: number;
+    sku: string;
+    slug: string;
+}
+```
+
 #### 完整搜索调用链路（已有实现）：
 
 ```
@@ -1078,14 +1182,16 @@ ShopFulltextSearchResolver.search(ctx, input)
     ↓
 FulltextSearchService.search(ctx, input, enabledOnly)
     ↓
-SearchStrategy.getSearchResults(ctx, input, enabledOnly)
+SearchStrategy.getSearchResults(ctx, input, enabledOnly)  ← 可通过 init(injector) 获取 CustomerService
     ↓
-PostgresSearchStrategy.applyTermAndFilters(...)
+PostgresSearchStrategy.applyTermAndFilters(...)  ← 无客户分组过滤
     ↓
 数据库查询 SearchIndexItem
+    ↓
+返回 SearchResult[]  ← 包含 productId，可用于二次查询
 ```
 
-**关键点**：各层只能访问 `RequestContext`，客户分组信息需要通过 `CustomerService` 主动查询获取。
+**关键点**：各层只能访问 `RequestContext`，客户分组信息需要通过 `CustomerService` 主动查询获取；`SearchResult` 包含 `productId` 但不包含 `product.customFields`。
 
 ### 9.6 缓冲刷新顺序
 
