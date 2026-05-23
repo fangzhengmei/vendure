@@ -594,15 +594,83 @@ orderService.modifyOrder 返回后
 - 虽然 `ORDER_CANCELLATION`、`ORDER_COUPON_APPLIED`、`ORDER_COUPON_REMOVED` 在 `dryRun` 判断**之前**就写入了数据库，但由于整个操作在同一数据库事务中，`dryRun=true` 时的事务回滚会**全部撤销**这些写入。
 - 因此 `dryRun` 模式不会产生任何残留的历史记录，审计一致性得以保证。
 
-#### 6.5.4 事件发布的例外
+#### 6.5.4 事件发布与事务的真实关系（EventBus 双轨制）
 
-**注意**：`eventBus.publish()` 发布的事件**不会**随事务回滚而撤销：
-- `OrderLineEvent`（`created`/`updated`/`cancelled`）
-- `HistoryEntryEvent`（历史记录创建事件）
-- `OrderEvent`（`updated`）
-- `RefundStateTransitionEvent`
+##### 核心机制 (`event-bus.ts:116-347`)
 
-这些是内存中的事件发布，不会影响数据库审计的一致性，但如果有插件监听这些事件并执行外部操作（如发送邮件、调用外部 API），则 `dryRun` 模式可能导致这些外部操作被触发。
+EventBus 采用**双轨制**设计，不同类型的事件处理器在事务回滚时表现完全不同：
+
+```typescript
+async publish<T extends VendureEvent>(event: T): Promise<void> {
+    this.eventStream.next(event);                           // 1. 同步推送到 RxJS Subject
+    await this.executeBlockingEventHandlers(event);          // 2. 同步执行阻塞处理器
+}
+```
+
+##### 两种事件处理器的行为差异
+
+| 处理器类型 | 注册方式 | 执行时机 | 事务上下文 | 回滚时可见性 |
+|------------|----------|----------|------------|--------------|
+| **阻塞事件处理器** | `registerBlockingEventHandler()` | `publish()` 时**同步执行** | ✅ 同一事务内 | ⚠️ 会被调用（数据库操作回滚，外部副作用不回滚） |
+| **RxJS 订阅者** | `eventBus.ofType(...).subscribe()` | 事务**提交后**异步执行 | ❌ 事务已结束 | ❌ **完全不可见**（事件被过滤） |
+
+##### `awaitActiveTransactions` 事务等待机制 (`event-bus.ts:311-347`)
+
+所有通过 `ofType()` 订阅的事件都会经过此机制：
+```typescript
+try {
+    await this.transactionSubscriber.awaitCommit(queryRunner);
+    // ✅ 事务提交成功：返回事件给订阅者
+    return event;
+} catch (e: any) {
+    if (e instanceof TransactionSubscriberError) {
+        // ❌ 事务回滚：返回 undefined，被 filter 过滤
+        return;  // 订阅者完全看不到事件
+    }
+    throw e;
+}
+```
+
+##### 回滚场景下的事件可见性（dryRun / 错误）
+
+对于订单修改流程中发布的事件：
+
+| 事件类型 | 是否含 ctx | 阻塞处理器可见性 | ofType 订阅者可见性 |
+|----------|-----------|------------------|---------------------|
+| `OrderLineEvent` | ✅ 是 | ⚠️ 回滚前已调用 | ❌ 不可见 |
+| `HistoryEntryEvent` | ✅ 是 | ⚠️ 回滚前已调用 | ❌ 不可见 |
+| `OrderEvent`('updated') | ✅ 是 | ⚠️ 回滚前已调用 | ❌ 不可见 |
+| `RefundStateTransitionEvent` | ✅ 是 | ⚠️ 回滚前已调用（仅非 dryRun） | ❌ 不可见 |
+
+**⚠️ 关键更正**：
+- ❌ **之前的错误理解**："事件发布不会随事务回滚，插件可能误触发外部操作"
+- ✅ **正确理解**：
+  - 对于**绝大多数插件使用的 `ofType()` 订阅方式**，回滚场景下**完全不会收到事件**，不会触发外部操作
+  - 只有**阻塞事件处理器**（2.2.0 新增的高级 API，使用极少）才会在回滚前被调用
+  - 阻塞处理器内的**数据库操作**在同一事务内 → 会被回滚
+  - 阻塞处理器内的**外部副作用**（发送邮件、调用外部 API）→ 不会回滚
+
+##### 订单修改流程中的事件发布时机
+
+1. `cancelOrderByOrderLines` 中 → `OrderLineEvent`('cancelled') → dryRun 判断前
+2. `createHistoryEntryForOrder` 中 → `HistoryEntryEvent` → dryRun 判断前
+3. `modifyOrder` 最后 → `OrderEvent`('updated') → dryRun 判断前
+4. 退款创建中 → `RefundStateTransitionEvent` → dryRun 判断后（非 dryRun 才执行）
+5. `order.service` modifyOrder 后 → `HistoryEntryEvent`(ORDER_MODIFIED) → dryRun 判断后
+
+**无论发布时机如何，只要事务回滚，`ofType()` 订阅者都看不到这些事件。**
+
+##### 插件侧可观察边界
+
+| 插件实现方式 | dryRun 场景 | 错误回滚场景 | 事务提交场景 |
+|--------------|-------------|--------------|--------------|
+| `eventBus.ofType(X).subscribe(...)` | ❌ 无事件 | ❌ 无事件 | ✅ 正常接收 |
+| `registerBlockingEventHandler(...)` | ⚠️ 收到事件（DB 已回滚） | ⚠️ 收到事件（DB 已回滚） | ✅ 正常接收 |
+
+**插件开发最佳实践**：
+- 优先使用 `ofType()` 订阅 → 天然保证事务一致性
+- 如需使用阻塞处理器，**不要在其中执行不可回滚的外部操作**
+- 如需执行外部操作，应在 `ofType()` 订阅中执行（事务已提交）
 
 ### 6.6 前置校验对历史写入的阻断机制
 
@@ -733,7 +801,7 @@ if (delta < 0) {
     │   │      ↓
     │   │      Resolver 层 rollBackTransaction
     │   │      → 所有 DB 写入撤销（包括历史记录）
-    │   │      → 事件已发布但不回滚（内存操作）
+    │   │      → 阻塞事件处理器已调用（但 ofType 订阅者看不到）
     │   │
     │   └─ false → 继续
     ├─ 计算 delta = newTotal - initialTotal
@@ -770,6 +838,9 @@ modifyOrder(dryRun=true)
 │  ├─ ORDER_COUPON_APPLIED 写入           │
 │  ├─ ORDER_COUPON_REMOVED 写入           │
 │  ├─ Surcharge、OrderLine 等写入         │
+│  ├─ eventBus.publish() 同步调用        │
+│  │  ├─ RxJS Subject.next()              │
+│  │  └─ 执行阻塞事件处理器             │
 │  └─ 返回预览结果                        │
 └─────────────────────────────────────────┘
     ↓
@@ -777,27 +848,48 @@ Resolver 检测到 dryRun=true
     ↓
 rollBackTransaction() → 所有 DB 写入回滚
     ↓
-最终效果：无任何持久化变更，无任何历史记录残留
+TransactionSubscriber 监听到 rollback 事件
+    ↓
+ofType() 订阅者的 awaitActiveTransactions 捕获回滚
+    ↓
+返回 undefined → 被 filter(notNullOrUndefined) 过滤
+    ↓
+最终效果：
+  ✅ 无任何持久化变更
+  ✅ ofType 订阅者完全看不到事件
+  ⚠️ 阻塞处理器已执行（但 DB 操作已回滚）
 ```
 
 ### 7.3 错误回滚数据流
 
 ```
-modifyOrder 执行中发生错误
+modifyOrder 执行中发生错误（如退款创建失败）
     ↓
 ┌─────────────────────────────────────────┐
 │  已执行的操作（同一事务内）             │
 │  ├─ 部分 OrderLine 更新                 │
 │  ├─ 部分 Surcharge 创建                 │
 │  ├─ 部分历史记录写入                    │
+│  ├─ 多个 eventBus.publish() 调用        │
+│  │  ├─ RxJS Subject.next()              │
+│  │  └─ 执行阻塞事件处理器             │
 │  └─ ...                                 │
 └─────────────────────────────────────────┘
     ↓
 Resolver 检测到 ErrorResult
     ↓
-rollBackTransaction() → 全部撤销
+rollBackTransaction() → 全部 DB 写入撤销
     ↓
-最终效果：无任何持久化变更，审计一致性保持
+TransactionSubscriber 监听到 rollback 事件
+    ↓
+ofType() 订阅者的 awaitActiveTransactions 捕获回滚
+    ↓
+返回 undefined → 被 filter 过滤
+    ↓
+最终效果：
+  ✅ 无任何持久化变更，审计一致性保持
+  ✅ ofType 订阅者完全看不到事件
+  ⚠️ 阻塞处理器已执行（但 DB 操作已回滚）
 ```
 
 ---
@@ -846,7 +938,10 @@ rollBackTransaction() → 全部撤销
 ### 9.5 dryRun 模式的审计一致性保证
 - 通过数据库事务回滚机制实现"预览但不提交"
 - 即使部分历史记录在 dryRun 判断前已写入数据库，事务回滚会全部撤销
-- **例外**：`eventBus.publish()` 的内存事件不会回滚，插件需注意
+- **事件层面的一致性**：通过 `EventBus.awaitActiveTransactions` 机制双重保证
+  - `ofType()` 订阅者（绝大多数插件）在事务回滚时**完全看不到事件**
+  - 只有阻塞事件处理器会被调用，但其 DB 操作也在同一事务内会被回滚
+- **唯一风险点**：阻塞事件处理器内的外部副作用（发送邮件、调用外部 API）不会回滚，但阻塞处理器使用极少
 
 ### 9.6 refund 与 refunds 优先级
 - `refunds`（新 API）优先级高于 `refund`（旧 API，v2.2.0 弃用）
