@@ -326,6 +326,73 @@ async createRefund(ctx, input, order, selectedPayment) {
 }
 ```
 
+### 5.3 refund 与 refunds 归并与优先规则
+
+#### 5.3.1 输入归并逻辑 (`order-modifier.ts:399-403`)
+
+```typescript
+const refundInputArray = Array.isArray(input.refunds)
+    ? input.refunds
+    : input.refund
+      ? [input.refund]
+      : [];
+```
+
+**归并优先级**：
+1. **`refunds` 优先**：如果 `input.refunds` 存在且是数组，**完全忽略 `refund` 字段**
+2. **降级到 `refund`**：如果 `input.refunds` 不存在，使用 `input.refund` 并包装为单元素数组
+3. **都不存在**：空数组（此时若 `delta < 0` 会触发 `RefundPaymentIdMissingError`
+
+> **注意**：当 `refund` 和 `refunds` 同时存在时，`refund` 会被完全忽略，只有 `refunds` 生效。这是因为 `Array.isArray(input.refunds)` 的判断逻辑决定的。
+
+#### 5.3.2 退款输入初始化 (`order-modifier.ts:404-411`)
+
+```typescript
+const refundInputs: RefundOrderInput[] = refundInputArray.map(refund => ({
+    lines: [],
+    adjustment: 0,
+    shipping: 0,
+    paymentId: refund.paymentId,
+    amount: refund.amount,
+    reason: refund.reason || input.note,
+}));
+```
+
+**字段处理**：
+- `lines` 初始化为空数组，后续在 `adjustOrderLines` 数量减少时自动填充
+- `adjustment` 初始化为 0，后续在负 `surcharge` 时累加
+- `shipping` 初始化为 0，后续在运费差额为负时累加到 `primaryRefund`
+- `reason` 优先级：`refund.reason` > `input.note`
+
+#### 5.3.3 Primary Refund 选择规则 (`order-modifier.ts:658-660`)
+
+```typescript
+const primaryRefund = refundInputs.slice().sort((a, b) => (b.amount || 0) - (a.amount || 0))[0];
+```
+
+**选择逻辑**：
+- 按 `amount` 字段**降序排序**
+- 选择**金额最大**的退款作为 `primaryRefund`
+- 只有 `primaryRefund` 会被关联到 `OrderModification.refund` 字段
+
+#### 5.3.4 Primary Refund 专属特权 (`order-modifier.ts:662-670`)
+
+```typescript
+// 仅 primaryRefund 会被追加以下内容：
+const shippingDelta = order.shippingWithTax - initialShippingWithTax;
+if (shippingDelta < 0) {
+    primaryRefund.shipping = shippingDelta * -1;  // 运费差额只加给 primaryRefund
+}
+if (primaryRefund.adjustment != null) {
+    primaryRefund.adjustment += await this.calculateRefundAdjustment(ctx, delta, primaryRefund);  // 调整额只加给 primaryRefund
+}
+```
+
+**⚠️ 重要限制**：
+- 运费差额（`shippingDelta < 0`）**仅**追加到 `primaryRefund.shipping`
+- 退款调整额（促销等其他因素导致的差额）**仅**追加到 `primaryRefund.adjustment`
+- 其他退款只包含 `lines` 和 `surcharge` 带来的调整
+
 ---
 
 ## 六、变更审计（History）写入与校验
@@ -454,9 +521,174 @@ export class OrderModification extends VendureEntity {
 - 记录每个商品行的变更数量（可正可负）
 - 关联 `OrderModification` 和 `OrderLine`
 
+### 6.5 dryRun 回滚时的审计一致性
+
+#### 6.5.1 事务边界与回滚机制 (`order.resolver.ts:197-211`)
+
+```typescript
+@Transaction('manual')
+@Mutation()
+async modifyOrder(@Ctx() ctx: RequestContext, @Args() args: MutationModifyOrderArgs) {
+    await this.connection.startTransaction(ctx);
+    const result = await this.orderService.modifyOrder(ctx, args.input);
+
+    if (args.input.dryRun || isGraphQlErrorResult(result)) {
+        await this.connection.rollBackTransaction(ctx);  // ← dryRun 时回滚
+    } else {
+        await this.connection.commitOpenTransaction(ctx);
+    }
+    return result;
+}
+```
+
+**关键机制**：
+- 使用手动事务管理（`@Transaction('manual')`）
+- `dryRun === true` 或发生错误时，**整个数据库事务回滚**
+- 所有数据库写入（包括历史记录）都会被撤销
+
+#### 6.5.2 历史记录写入时序分析
+
+`modifyOrder` 方法内的写入顺序与 dryRun 判断位置（`order-modifier.ts:647`）：
+
+```
+modifyOrder 执行流：
+├─ 前置校验（无写入）
+├─ addItems
+│  └─ 创建 OrderLine、OrderModificationLine、Allocation（DB 写入，非历史）
+├─ adjustOrderLines
+│  └─ 数量减少时 → cancelOrderByOrderLines
+│     └─ 写入 ORDER_CANCELLATION 历史 ← 在 dryRun 判断之前！
+├─ surcharges（DB 写入，非历史）
+├─ 地址更新（DB 写入，非历史）
+├─ 优惠券变更
+│  ├─ 写入 ORDER_COUPON_APPLIED 历史 ← 在 dryRun 判断之前！
+│  └─ 写入 ORDER_COUPON_REMOVED 历史 ← 在 dryRun 判断之前！
+├─ shippingMethod 更新（DB 写入，非历史）
+├─ 价格重算（无写入）
+├─ dryRun 判断 (line 647)
+│  ├─ true → return { order, modification }
+│  │      → 事务回滚 → 所有历史记录被撤销
+│  └─ false → 继续
+├─ delta < 0 → 创建 Refund
+│  └─ paymentService.createRefund
+│     └─ refundStateMachine.transition
+│        └─ onTransitionEnd → 写入 ORDER_REFUND_TRANSITION 历史
+├─ 保存 OrderModification（DB 写入，非历史）
+└─ return 结果
+    ↓
+orderService.modifyOrder 返回后
+└─ 写入 ORDER_MODIFIED 历史 ← 仅在非 dryRun 时执行
+```
+
+#### 6.5.3 dryRun 回滚时会被撤销的历史记录
+
+| 历史类型 | 写入位置 | 是否在 dryRun 前写入 | 回滚后是否保留 |
+|----------|----------|----------------------|----------------|
+| `ORDER_CANCELLATION` | `cancelOrderByOrderLines` 行 362-371 | ✅ 是 | ❌ 撤销 |
+| `ORDER_COUPON_APPLIED` | `order-modifier.ts` 行 588-593 | ✅ 是 | ❌ 撤销 |
+| `ORDER_COUPON_REMOVED` | `order-modifier.ts` 行 599-604 | ✅ 是 | ❌ 撤销 |
+| `ORDER_REFUND_TRANSITION` | `default-refund-process.ts` 行 41-51 | ❌ 否（在 dryRun 后） | ❌ 撤销 |
+| `ORDER_MODIFIED` | `order.service.ts` 行 1399-1406 | ❌ 否（仅非 dryRun） | ❌ 撤销 |
+
+**⚠️ 注意**：
+- 虽然 `ORDER_CANCELLATION`、`ORDER_COUPON_APPLIED`、`ORDER_COUPON_REMOVED` 在 `dryRun` 判断**之前**就写入了数据库，但由于整个操作在同一数据库事务中，`dryRun=true` 时的事务回滚会**全部撤销**这些写入。
+- 因此 `dryRun` 模式不会产生任何残留的历史记录，审计一致性得以保证。
+
+#### 6.5.4 事件发布的例外
+
+**注意**：`eventBus.publish()` 发布的事件**不会**随事务回滚而撤销：
+- `OrderLineEvent`（`created`/`updated`/`cancelled`）
+- `HistoryEntryEvent`（历史记录创建事件）
+- `OrderEvent`（`updated`）
+- `RefundStateTransitionEvent`
+
+这些是内存中的事件发布，不会影响数据库审计的一致性，但如果有插件监听这些事件并执行外部操作（如发送邮件、调用外部 API），则 `dryRun` 模式可能导致这些外部操作被触发。
+
+### 6.6 前置校验对历史写入的阻断机制
+
+#### 6.6.1 阻断历史写入的前置校验（按执行顺序）
+
+所有以下校验都在**任何数据库写入之前**执行，失败时直接返回错误，不会产生任何历史记录：
+
+| 校验点 | 位置 | 错误类型 | 发生时机 |
+|--------|------|----------|----------|
+| 订单状态必须为 `Modifying` | `order-modifier.ts:390-392` | `OrderModificationStateError` | 最优先 |
+| 必须指定至少一项变更 | `order-modifier.ts:393-395` | `NoChangesSpecifiedError` | 优先 |
+| addItems 数量不能为负 | `order-modifier.ts:415-416` | `NegativeQuantityError` | addItems 循环内 |
+| addItems 超出数量限制 | `order-modifier.ts:426-427` | `OrderLimitError` | addItems 循环内 |
+| addItems 库存不足 | `order-modifier.ts:431-432` | `InsufficientStockError` | addItems 循环内 |
+| adjustOrderLines 数量不能为负 | `order-modifier.ts:446-447` | `NegativeQuantityError` | adjustOrderLines 循环内 |
+| adjustOrderLines 数量超限 | `order-modifier.ts:464-465` | `OrderLimitError` | adjustOrderLines 循环内 |
+| adjustOrderLines 库存不足 | `order-modifier.ts:469-470` | `InsufficientStockError` | adjustOrderLines 循环内 |
+| 优惠券无效/过期/超限 | `order-modifier.ts:580-585` | `CouponCodeInvalidError` 等 | 优惠券处理循环内 |
+| 配送方式不合格 | `order-modifier.ts:613-617` | `IneligibleShippingMethodError` | 配送方式更新时 |
+
+**校验流程**：
+```
+开始 modifyOrder
+    ↓
+1. 状态校验（无写入）→ 失败 → return 错误（无历史）
+    ↓
+2. noChanges 校验（无写入）→ 失败 → return 错误（无历史）
+    ↓
+3. addItems 循环
+   ├─ 数量负校验 → 失败 → return 错误（无历史）
+   ├─ 数量限制校验 → 失败 → return 错误（无历史）
+   └─ 库存校验 → 失败 → return 错误（无历史）
+    ↓
+4. adjustOrderLines 循环
+   ├─ 数量负校验 → 失败 → return 错误（无历史）
+   ├─ 数量限制校验 → 失败 → return 错误（无历史）
+   └─ 库存校验 → 失败 → return 错误（无历史）
+    ↓
+5. surcharges 处理（开始有 DB 写入，但非历史）
+    ↓
+6. 优惠券校验 → 失败 → return 错误（无历史）
+    ↓
+7. 配送方式校验 → 失败 → return 错误（无历史）
+    ↓
+... 后续处理 ...
+```
+
+#### 6.6.2 部分写入后失败的回滚
+
+如果在**已有部分数据库写入后**发生错误（如退款创建失败）：
+
+```typescript
+for (const refundInput of refundInputs) {
+    const refund = await this.paymentService.createRefund(ctx, refundInput, order, payment);
+    if (!isGraphQlErrorResult(refund)) {
+        // ...
+    } else {
+        throw new InternalServerError(refund.message);  // ← 抛出异常
+    }
+}
+```
+
+- Resolver 层捕获到错误结果后会调用 `rollBackTransaction`
+- 所有已写入的数据库记录（包括历史记录）都会被回滚
+- 保证审计一致性：要么全部成功，要么全部撤销
+
+#### 6.6.3 delta < 0 时的退款校验
+
+在 `dryRun` 判断**之后**、实际创建退款**之前**还有一次校验：
+
+```typescript
+if (delta < 0) {
+    if (refundInputs.length === 0) {
+        return new RefundPaymentIdMissingError();  // ← 此时已有部分 DB 写入
+    }
+    // ... 创建退款
+}
+```
+
+**注意**：此时 `surcharges`、`OrderModificationLine` 等已经写入数据库，但由于还在同一事务中，返回错误会触发回滚，所有写入都会被撤销。
+
 ---
 
 ## 七、完整修改流程时序
+
+### 7.1 标准修改流程
 
 ```
 管理员操作
@@ -465,68 +697,134 @@ export class OrderModification extends VendureEntity {
     → 写入 ORDER_STATE_TRANSITION 历史
     ↓
 2. modifyOrder(input)
-    ├─ 前置校验（状态、变更内容）
+    ├─ 【前置校验1】状态必须为 Modifying
+    │      → 失败：return 错误（无任何写入）
+    ├─ 【前置校验2】必须有变更内容
+    │      → 失败：return 错误（无任何写入）
     ├─ 处理 addItems
+    │   ├─ 【校验】数量≥0 → 失败：return 错误（无任何写入）
+    │   ├─ 【校验】库存足够 → 失败：return 错误（无任何写入）
+    │   ├─ 【校验】数量限制 → 失败：return 错误（无任何写入）
     │   ├─ getOrCreateOrderLine
-    │   ├─ constrainQuantityToSaleable（库存校验）
     │   ├─ updateOrderLineQuantity（库存分配）
     │   └─ 创建 OrderModificationLine
     ├─ 处理 adjustOrderLines
-    │   ├─ 数量增加：库存分配
+    │   ├─ 【校验】数量≥0 → 失败：return 错误（无任何写入）
+    │   ├─ 【校验】库存足够 → 失败：return 错误（无任何写入）
+    │   ├─ 【校验】数量限制 → 失败：return 错误（无任何写入）
+    │   ├─ 数量增加：updateOrderLineQuantity（库存分配）
     │   ├─ 数量减少：cancelOrderByOrderLines
     │   │   ├─ 取消库存分配
-    │   │   └─ 写入 ORDER_CANCELLATION 历史
+    │   │   └─ 写入 ORDER_CANCELLATION 历史 ← dryRun 前已写入
     │   └─ 创建 OrderModificationLine + 自动加入 refund.lines
     ├─ 处理 surcharges
     │   ├─ 创建 Surcharge 实体
     │   └─ 负 surcharge 自动计入 refund.adjustment
     ├─ 处理地址更新 → 记录到 modification
-    ├─ 处理优惠券 → 写入 COUPON_APPLIED/REMOVED 历史
+    ├─ 处理优惠券
+    │   ├─ 【校验】优惠券有效性 → 失败：return 错误（无历史）
+    │   ├─ 新增 → 写入 ORDER_COUPON_APPLIED 历史 ← dryRun 前已写入
+    │   └─ 移除 → 写入 ORDER_COUPON_REMOVED 历史 ← dryRun 前已写入
+    ├─ 处理 shippingMethodIds
+    │   └─ 【校验】配送方式资格 → 失败：return 错误（无历史）
     ├─ 重新计算价格（applyPriceAdjustments）
-    ├─ dryRun 判断
-    │   ├─ true → 回滚事务，返回预览
+    ├─ dryRun 判断 (line 647)
+    │   ├─ true → return { order, modification }
+    │   │      ↓
+    │   │      Resolver 层 rollBackTransaction
+    │   │      → 所有 DB 写入撤销（包括历史记录）
+    │   │      → 事件已发布但不回滚（内存操作）
+    │   │
     │   └─ false → 继续
     ├─ 计算 delta = newTotal - initialTotal
-    │   ├─ delta < 0 → 创建 Refund
-    │   │   └─ paymentService.createRefund
-    │   └─ delta > 0 → 需要后续 addManualPaymentToOrder
+    │   ├─ delta < 0
+    │   │   ├─ 【校验】refundInputs 非空 → 失败：return 错误（回滚）
+    │   │   ├─ 选择 primaryRefund（按 amount 降序）
+    │   │   ├─ 运费差额追加到 primaryRefund.shipping
+    │   │   ├─ 调整额追加到 primaryRefund.adjustment
+    │   │   └─ 遍历创建 Refund
+    │   │       └─ paymentService.createRefund
+    │   │           └─ refundStateMachine.transition
+    │   │               └─ onTransitionEnd → 写入 ORDER_REFUND_TRANSITION 历史
+    │   └─ delta > 0 → 后续需 addManualPaymentToOrder
     ├─ 保存 OrderModification
     └─ 发布 OrderEvent('updated')
     ↓
-3. 写入 ORDER_MODIFIED 历史（order.service）
+3. 写入 ORDER_MODIFIED 历史（order.service）← 仅非 dryRun 执行
     ↓
-4. 事务提交
+4. 事务 commit
     ↓
 5. transitionOrderToState(目标状态)
-    → onTransitionStart 校验 isSettled
+    → onTransitionStart 校验所有 Modification.isSettled
     → 写入 ORDER_STATE_TRANSITION 历史
+```
+
+### 7.2 dryRun 模式数据流
+
+```
+modifyOrder(dryRun=true)
+    ↓
+┌─────────────────────────────────────────┐
+│  数据库事务内执行                       │
+│  ├─ ORDER_CANCELLATION 写入（adjust减）│
+│  ├─ ORDER_COUPON_APPLIED 写入           │
+│  ├─ ORDER_COUPON_REMOVED 写入           │
+│  ├─ Surcharge、OrderLine 等写入         │
+│  └─ 返回预览结果                        │
+└─────────────────────────────────────────┘
+    ↓
+Resolver 检测到 dryRun=true
+    ↓
+rollBackTransaction() → 所有 DB 写入回滚
+    ↓
+最终效果：无任何持久化变更，无任何历史记录残留
+```
+
+### 7.3 错误回滚数据流
+
+```
+modifyOrder 执行中发生错误
+    ↓
+┌─────────────────────────────────────────┐
+│  已执行的操作（同一事务内）             │
+│  ├─ 部分 OrderLine 更新                 │
+│  ├─ 部分 Surcharge 创建                 │
+│  ├─ 部分历史记录写入                    │
+│  └─ ...                                 │
+└─────────────────────────────────────────┘
+    ↓
+Resolver 检测到 ErrorResult
+    ↓
+rollBackTransaction() → 全部撤销
+    ↓
+最终效果：无任何持久化变更，审计一致性保持
 ```
 
 ---
 
 ## 八、关键校验点汇总
 
-| 校验阶段 | 校验内容 | 错误类型 |
-|----------|----------|----------|
-| 入口 | 订单状态必须为 `Modifying` | `OrderModificationStateError` |
-| 入口 | 必须指定至少一项变更 | `NoChangesSpecifiedError` |
-| 商品行 | 数量不能为负 | `NegativeQuantityError` |
-| 商品行 | 库存不足 | `InsufficientStockError` |
-| 商品行 | 超出订单商品数量限制 | `OrderLimitError` |
-| 金额减少 | 必须指定退款 paymentId | `RefundPaymentIdMissingError` |
-| 退款 | 退款金额不能超过可退金额 | `RefundAmountError` |
-| 优惠券 | 优惠券有效性校验 | `CouponCodeInvalidError` 等 |
-| 配送方式 | 配送方式资格校验 | `IneligibleShippingMethodError` |
-| 状态退出 | Modification 必须已结算 | 状态机守卫阻止 |
+| 校验阶段 | 校验内容 | 错误类型 | 是否阻断历史写入 |
+|----------|----------|----------|------------------|
+| 入口 | 订单状态必须为 `Modifying` | `OrderModificationStateError` | ✅ 是（无任何写入） |
+| 入口 | 必须指定至少一项变更 | `NoChangesSpecifiedError` | ✅ 是（无任何写入） |
+| 商品行 | 数量不能为负 | `NegativeQuantityError` | ✅ 是（无任何写入） |
+| 商品行 | 库存不足 | `InsufficientStockError` | ✅ 是（无任何写入） |
+| 商品行 | 超出订单商品数量限制 | `OrderLimitError` | ✅ 是（无任何写入） |
+| 优惠券 | 优惠券有效性校验 | `CouponCodeInvalidError` 等 | ✅ 是（无历史写入） |
+| 配送方式 | 配送方式资格校验 | `IneligibleShippingMethodError` | ✅ 是（无历史写入） |
+| 金额减少 | 必须指定退款 paymentId | `RefundPaymentIdMissingError` | ⚠️ 部分（已有 DB 写入但无历史） |
+| 退款 | 退款金额不能超过可退金额 | `RefundAmountError` | ❌ 否（事务回滚撤销） |
+| 状态退出 | Modification 必须已结算 | 状态机守卫阻止 | ✅ 是（独立流程） |
 
 ---
 
 ## 九、设计特点与注意事项
 
 ### 9.1 幂等性与事务
-- 整个修改操作在事务中执行
-- `dryRun` 模式用于预览，不实际修改数据
-- 所有错误都会导致事务回滚
+- 整个修改操作在手动事务中执行
+- `dryRun` 模式用于预览，通过事务回滚保证不遗留数据
+- 所有错误都会导致事务回滚，保证数据一致性
 
 ### 9.2 库存处理
 - 非活跃订单（已结账）修改时，库存变动通过 `Allocation`/`Cancellation`/`Release` 记录追踪
@@ -543,9 +841,22 @@ export class OrderModification extends VendureEntity {
 - `OrderModification` 实体记录修改的完整快照
 - `OrderModificationLine` 记录每个商品行的变更数量
 - 自动关联操作管理员
+- **事务保障**：所有历史记录写入在同一事务中，要么全部成功，要么全部撤销
 
-### 9.5 扩展性
+### 9.5 dryRun 模式的审计一致性保证
+- 通过数据库事务回滚机制实现"预览但不提交"
+- 即使部分历史记录在 dryRun 判断前已写入数据库，事务回滚会全部撤销
+- **例外**：`eventBus.publish()` 的内存事件不会回滚，插件需注意
+
+### 9.6 refund 与 refunds 优先级
+- `refunds`（新 API）优先级高于 `refund`（旧 API，v2.2.0 弃用）
+- 两者同时存在时，`refund` 被完全忽略
+- 多退款场景下按 `amount` 降序选择 `primaryRefund`
+- 运费差额和调整额仅追加到 `primaryRefund`
+
+### 9.7 扩展性
 - 可通过 `OrderProcess` 扩展状态流转守卫
 - 可通过 `orderItemPriceCalculationStrategy` 自定义价格计算
 - 可通过 `shippingLineAssignmentStrategy` 自定义配送分配
 - 可扩展自定义 `HistoryEntryType` 记录自定义业务事件
+- 可通过 `RefundProcess` 扩展退款状态流转逻辑
