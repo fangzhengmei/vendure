@@ -574,7 +574,7 @@ modifyOrder 执行流：
 ├─ delta < 0 → 创建 Refund
 │  └─ paymentService.createRefund
 │     └─ refundStateMachine.transition
-│        └─ onTransitionEnd → 写入 ORDER_REFUND_TRANSITION 历史 ← ❌ dryRun 判断之后
+│        └─ onTransitionEnd → 写入 ORDER_REFUND_TRANSITION 历史 ← ❌ dryRun 判断之后（与 HistoryEntryEvent 同时）
 ├─ 保存 OrderModification（DB 写入，非历史）
 └─ return 结果
     ↓
@@ -640,94 +640,105 @@ try {
 
 按事件发布时机与 dryRun 判断（`order-modifier.ts:647`）的关系：
 
-| 事件类型 | 发布位置 | 与 dryRun 判断 | dryRun 场景是否发布 | 阻塞处理器可见性 | ofType 订阅者可见性 |
-|----------|----------|---------------|---------------------|------------------|---------------------|
-| `OrderLineEvent`('created') | `order-modifier.ts:204 | ✅ **之前**（addItems） | ✅ 是 | ⚠️ 回滚前已调用 | ❌ 不可见 |
-| `OrderLineEvent`('updated') | `order-modifier.ts:247 | ✅ **之前**（addItems/adjust） | ✅ 是 | ⚠️ 回滚前已调用 | ❌ 不可见 |
-| `OrderLineEvent`('cancelled') | `order-modifier.ts:339 | ✅ **之前**（adjust减少） | ✅ 是 | ⚠️ 回滚前已调用 | ❌ 不可见 |
-| `HistoryEntryEvent`(ORDER_CANCELLATION) | `order-modifier.ts:362 | ✅ **之前** | ✅ 是 | ⚠️ 回滚前已调用 | ❌ 不可见 |
-| `HistoryEntryEvent`(ORDER_COUPON_APPLIED) | `order-modifier.ts:588 | ✅ **之前** | ✅ 是 | ⚠️ 回滚前已调用 | ❌ 不可见 |
-| `HistoryEntryEvent`(ORDER_COUPON_REMOVED) | `order-modifier.ts:599 | ✅ **之前** | ✅ 是 | ⚠️ 回滚前已调用 | ❌ 不可见 |
-| **dryRun 判断 (line 647) | --- | --- | --- | --- | --- |
-| `RefundStateTransitionEvent | `createRefund` 内 | ❌ **之后** | ❌ 否（仅非 dryRun） | ❌ 不调用 | ❌ 不可见 |
-| `OrderEvent`('updated') | `order-modifier.ts:695 | ❌ **之后** | ❌ 否（仅非 dryRun） | ❌ 不调用 | ❌ 不可见 |
-| **dryRun 判断 (order.service.ts:1395) | --- | --- | --- | --- | --- |
-| `HistoryEntryEvent`(ORDER_MODIFIED) | `order.service.ts:1399 | ❌ **之后** | ❌ 否（仅非 dryRun） | ❌ 不调用 | ❌ 不可见 |
+| 事件类型 | 发布位置 | 与 dryRun 判断关系 | dryRun 场景是否发布 | 阻塞处理器可见性 | ofType 订阅者可见性 |
+|----------|----------|-------------------|---------------------|------------------|---------------------|
+| `OrderLineEvent`('created') | `order-modifier.ts:204` | ✅ **之前**（addItems 新增） | ✅ 是 | ⚠️ 回滚前已调用 | ❌ 不可见 |
+| `OrderLineEvent`('updated') | `order-modifier.ts:247` | ✅ **之前**（addItems/adjust 更新） | ✅ 是 | ⚠️ 回滚前已调用 | ❌ 不可见 |
+| `OrderLineEvent`('cancelled') | `order-modifier.ts:339` | ✅ **之前**（adjust 数量减少） | ✅ 是 | ⚠️ 回滚前已调用 | ❌ 不可见 |
+| `HistoryEntryEvent`(ORDER_CANCELLATION) | `order-modifier.ts:362` | ✅ **之前** | ✅ 是 | ⚠️ 回滚前已调用 | ❌ 不可见 |
+| `HistoryEntryEvent`(ORDER_COUPON_APPLIED) | `order-modifier.ts:588` | ✅ **之前** | ✅ 是 | ⚠️ 回滚前已调用 | ❌ 不可见 |
+| `HistoryEntryEvent`(ORDER_COUPON_REMOVED) | `order-modifier.ts:599` | ✅ **之前** | ✅ 是 | ⚠️ 回滚前已调用 | ❌ 不可见 |
+| **dryRun 判断（order-modifier.ts:647）** | --- | --- | --- | --- | --- |
+| `HistoryEntryEvent`(ORDER_REFUND_TRANSITION) | `default-refund-process.ts:41` | ❌ **之后**（仅 non-dryRun + delta<0） | ❌ 否 | ❌ 不调用 | ❌ 不可见 |
+| `RefundStateTransitionEvent` | `payment.service.ts:453` | ❌ **之后**（仅 non-dryRun + delta<0） | ❌ 否 | ❌ 不调用 | ❌ 不可见 |
+| `OrderEvent`('updated') | `order-modifier.ts:695` | ❌ **之后**（仅 non-dryRun） | ❌ 否 | ❌ 不调用 | ❌ 不可见 |
+| **dryRun 判断（order.service.ts:1395）** | --- | --- | --- | --- | --- |
+| `HistoryEntryEvent`(ORDER_MODIFIED) | `order.service.ts:1399` | ❌ **之后**（仅 non-dryRun） | ❌ 否 | ❌ 不调用 | ❌ 不可见 |
 
 **⚠️ 关键更正**：
-- ❌ **之前的错误理解**："`OrderEvent`('updated') 在 dryRun 判断前发布，dryRun 场景也会发布
+- ❌ **之前的错误理解**："`OrderEvent`('updated') 在 dryRun 判断前发布，dryRun 场景也会发布"
 - ✅ **正确理解**：
-  - `OrderEvent`('updated') 在 **line 695**，dryRun 判断在 **line 647**
-  - `OrderEvent`('updated')、`RefundStateTransitionEvent`、`HistoryEntryEvent`(ORDER_MODIFIED) 均在 dryRun 判断**之后**
-  - **dryRun 场景下这 3 个事件**完全不会发布**
-  - 对于**绝大多数插件使用的 `ofType()` 订阅方式，回滚场景下**完全不会收到任何事件**
-  - 只有**阻塞事件处理器**（2.2.0 新增的高级 API，使用极少）才会在回滚前被调用（但仅能看到 dryRun 判断前发布的事件
+  - `OrderEvent`('updated') 发布于 **line 695**，dryRun 判断在 **line 647**，晚 48 行
+  - `HistoryEntryEvent`(ORDER_REFUND_TRANSITION)、`RefundStateTransitionEvent`、`OrderEvent`('updated')、`HistoryEntryEvent`(ORDER_MODIFIED) 均在 dryRun 判断**之后**
+  - **dryRun 场景下这 4 个事件完全不会发布**，连阻塞处理器也不会收到
+  - 对于**绝大多数插件使用的 `ofType()` 订阅方式**，回滚场景下**完全不会收到任何事件**
+  - 只有**阻塞事件处理器**（2.2.0 新增的高级 API，使用极少）才会在回滚前被调用，但仅能看到 dryRun 判断前发布的 6 种事件
   - 阻塞处理器内的**数据库操作**在同一事务内 → 会被回滚
   - 阻塞处理器内的**外部副作用**（发送邮件、调用外部 API）→ 不会回滚
 
-##### 订单修改流程中的事件发布时序（完整清单
+##### 订单修改流程中的事件发布时序（完整清单）
 
 ```
 modifyOrder 执行流：
 ├─ addItems 循环
-│  ├─ getOrCreateOrderLine → OrderLineEvent('created') → ✅ dryRun 前
-│  └─ updateOrderLineQuantity → OrderLineEvent('updated') → ✅ dryRun 前
+│  ├─ getOrCreateOrderLine
+│  │   └─ publish OrderLineEvent('created') → ✅ dryRun 判断前
+│  └─ updateOrderLineQuantity
+│      └─ publish OrderLineEvent('updated') → ✅ dryRun 判断前
 ├─ adjustOrderLines 循环
-│  ├─ 数量增加 → updateOrderLineQuantity → OrderLineEvent('updated') → ✅ dryRun 前
+│  ├─ 数量增加 → updateOrderLineQuantity
+│  │   └─ publish OrderLineEvent('updated') → ✅ dryRun 判断前
 │  └─ 数量减少 → cancelOrderByOrderLines
-│     ├─ OrderLineEvent('cancelled') → ✅ dryRun 前
-│     └─ HistoryEntryEvent(ORDER_CANCELLATION) → ✅ dryRun 前
-├─ surcharges 处理（无事件）
-├─ 地址更新（无事件）
+│      ├─ publish OrderLineEvent('cancelled') → ✅ dryRun 判断前
+│      └─ historyService.createHistoryEntryForOrder
+│          └─ publish HistoryEntryEvent(ORDER_CANCELLATION) → ✅ dryRun 判断前
+├─ surcharges 处理（无事件发布）
+├─ 地址更新（无事件发布）
 ├─ 优惠券变更
-│  ├─ 新增 → HistoryEntryEvent(ORDER_COUPON_APPLIED) → ✅ dryRun 前
-│  └─ 移除 → HistoryEntryEvent(ORDER_COUPON_REMOVED) → ✅ dryRun 前
-├─ 配送方式更新（无事件）
-├─ 价格重算（无事件）
-├─ 👇 dryRun 判断 (line 647)
-│  ├─ dryRun=true → return 「**以下事件均不发布
-│  └─ dryRun=false → 继续
+│  ├─ 新增优惠券 → historyService.createHistoryEntryForOrder
+│  │   └─ publish HistoryEntryEvent(ORDER_COUPON_APPLIED) → ✅ dryRun 判断前
+│  └─ 移除优惠券 → historyService.createHistoryEntryForOrder
+│      └─ publish HistoryEntryEvent(ORDER_COUPON_REMOVED) → ✅ dryRun 判断前
+├─ 配送方式更新（无事件发布）
+├─ 价格重算（无事件发布）
+├─ 👇 dryRun 判断（order-modifier.ts:647）
+│  ├─ dryRun === true → return { order, modification }
+│  │      ⚠️ 以下事件均不会发布
+│  └─ dryRun === false → 继续执行
 ├─ delta < 0 → 创建 Refund
 │  └─ paymentService.createRefund
-│     └─ refundStateMachine.transition
-│        └─ RefundStateTransitionEvent → ❌ dryRun 后
-├─ 保存 OrderModification（无事件）
-└─ OrderEvent('updated') → ❌ dryRun 后
+│      ├─ refundStateMachine.transition
+│      │   └─ onTransitionEnd → historyService.createHistoryEntryForOrder
+│      │       └─ publish HistoryEntryEvent(ORDER_REFUND_TRANSITION) → ❌ dryRun 判断后
+│      └─ publish RefundStateTransitionEvent → ❌ dryRun 判断后
+├─ 保存 OrderModification（无事件发布）
+└─ publish OrderEvent('updated') → ❌ dryRun 判断后
 ↓
 orderService.modifyOrder 返回
-└─ 👇 dryRun 判断 (order.service.ts:1395)
-   ├─ dryRun=true → return
-   └─ dryRun=false → HistoryEntryEvent(ORDER_MODIFIED) → ❌ dryRun 后
+└─ 👇 dryRun 判断（order.service.ts:1395）
+   ├─ dryRun === true → return result.order
+   └─ dryRun === false → historyService.createHistoryEntryForOrder
+       └─ publish HistoryEntryEvent(ORDER_MODIFIED) → ❌ dryRun 判断后
 ```
 
-##### 插件侧可观察边界（修正版）
+##### 插件侧可观察边界（修正版，与上表逐条对应）
 
 **dryRun 场景（事务回滚）：**
 
+| 插件实现方式 | 可见事件（与上表逐条对应） | 不可见事件（与上表逐条对应） | 说明 |
+|--------------|------------------------|--------------------------|------|
+| `ofType(...).subscribe()` | ❌ 无任何事件 | 全部 10 种事件 | 所有事件均被 `awaitActiveTransactions` 过滤，事务回滚后订阅者完全看不到 |
+| `registerBlockingEventHandler(...)` | `OrderLineEvent`('created')<br/>`OrderLineEvent`('updated')<br/>`OrderLineEvent`('cancelled')<br/>`HistoryEntryEvent`(ORDER_CANCELLATION)<br/>`HistoryEntryEvent`(ORDER_COUPON_APPLIED)<br/>`HistoryEntryEvent`(ORDER_COUPON_REMOVED) | `HistoryEntryEvent`(ORDER_REFUND_TRANSITION)<br/>`RefundStateTransitionEvent`<br/>`OrderEvent`('updated')<br/>`HistoryEntryEvent`(ORDER_MODIFIED) | 仅能看到 dryRun 判断**之前**发布的事件，共 6 种；dryRun 判断后 4 种完全不会发布 |
+
+**错误回滚场景（如退款创建失败，仅发生在 dryRun=false 时）：**
+
 | 插件实现方式 | 可见事件 | 不可见事件 | 说明 |
 |--------------|----------|------------|------|
-| `ofType(...).subscribe() | ❌ 无任何事件 | 全部 | 所有事件均被 `awaitActiveTransactions` 过滤 |
-| `registerBlockingEventHandler(...) | `OrderLineEvent`(3 种）、`HistoryEntryEvent`(3 种） | `OrderEvent`('updated')、`RefundStateTransitionEvent`、`HistoryEntryEvent`(ORDER_MODIFIED) | 仅能看到 dryRun 判断**之前发布的事件，共 6 种 |
+| `ofType(...).subscribe()` | ❌ 无任何事件 | 全部 10 种事件 | 所有事件均被 `awaitActiveTransactions` 过滤，事务回滚后订阅者完全看不到 |
+| `registerBlockingEventHandler(...)` | `OrderLineEvent` × 3 种<br/>`HistoryEntryEvent`(ORDER_CANCELLATION)<br/>`HistoryEntryEvent`(ORDER_COUPON_APPLIED)<br/>`HistoryEntryEvent`(ORDER_COUPON_REMOVED)<br/>（取决于错误发生位置，可能额外看到 `HistoryEntryEvent`(ORDER_REFUND_TRANSITION) 和 `RefundStateTransitionEvent`） | `OrderEvent`('updated')<br/>`HistoryEntryEvent`(ORDER_MODIFIED) | 看到错误发生前已发布的事件；`OrderEvent`('updated') 在退款之后，退款失败时永远不会发布 |
 
-**错误回滚场景（如退款创建失败）：**
-
-| 插件实现方式 | 可见事件 | 不可见事件 | 说明 |
-|--------------|----------|------------|------|
-| `ofType(...).subscribe() | ❌ 无任何事件 | 全部 | 所有事件均被过滤 |
-| `registerBlockingEventHandler(...) | `OrderLineEvent`(3 种)、`HistoryEntryEvent`(3 种) | 取决于错误发生位置（delta<0 且错误发生前可能看到 `RefundStateTransitionEvent`，但 `OrderEvent`('updated') 和 `ORDER_MODIFIED` 不可见 | 看到错误发生前已发布的事件 |
-
-**事务提交场景（成功修改：**
+**事务提交场景（成功修改）：**
 
 | 插件实现方式 | 可见事件 | 说明 |
 |--------------|----------|------|
-| `ofType(...).subscribe() | ✅ 全部 9 种事件 | 事务提交后正常接收 |
-| `registerBlockingEventHandler(...) | ✅ 全部 9 种事件 | 发布时同步接收 |
+| `ofType(...).subscribe()` | ✅ 全部 10 种事件 | 事务提交后通过 `awaitActiveTransactions`，正常传递给订阅者 |
+| `registerBlockingEventHandler(...)` | ✅ 全部 10 种事件 | 发布时同步执行，无需等待事务提交 |
 
 **插件开发最佳实践**：
-- 优先使用 `ofType()` 订阅 → 天然保证事务一致性
-- 如需使用阻塞处理器，**不要在其中执行不可回滚的外部操作**
-- 如需执行外部操作，应在 `ofType()` 订阅中执行（事务已提交）
-- 如确实需要在阻塞处理器中执行操作，请区分 dryRun 判断前发布的事件
+1. 优先使用 `ofType()` 订阅 → 天然保证事务一致性，回滚场景完全不会触发
+2. 如需使用阻塞处理器，**不要在其中执行不可回滚的外部操作**（如发送邮件、调用外部 API）
+3. 如需执行外部操作，应在 `ofType()` 订阅中执行（事务已提交，数据已持久化）
+4. 如确实需要在阻塞处理器中执行操作，请通过 `input.dryRun` 参数判断，仅在 `dryRun === false` 时执行外部操作
 
 ### 6.6 前置校验对历史写入的阻断机制
 
@@ -859,6 +870,7 @@ if (delta < 0) {
     │   │      Resolver 层 rollBackTransaction
     │   │      → 所有 DB 写入撤销（包括历史记录）
     │   │      → 仅 dryRun 判断前的 6 种事件触发了阻塞处理器
+    │   │      → dryRun 判断后的 4 种事件完全不会发布
     │   │      → ofType 订阅者完全看不到任何事件
     │   │
     │   └─ false → 继续
@@ -903,10 +915,11 @@ modifyOrder(dryRun=true)
 │  │  ├─ 写入 ORDER_COUPON_APPLIED/REMOVED 历史   │
 │  │  └─ publish HistoryEntryEvent × 2            │
 │  ├─ 👇 dryRun 判断 (line 647) → return 预览     │
-│  │    ⚠️ 以下事件**全部不发布**：                 │
-│  │    - RefundStateTransitionEvent              │
-│  │    - OrderEvent('updated')                   │
-│  │    - HistoryEntryEvent(ORDER_MODIFIED)       │
+│  │    ⚠️ 以下 4 种事件**全部不发布**：           │
+│  │      - HistoryEntryEvent(ORDER_REFUND_TRANSITION) │
+│  │      - RefundStateTransitionEvent              │
+│  │      - OrderEvent('updated')                   │
+│  │      - HistoryEntryEvent(ORDER_MODIFIED)       │
 │  └─ 返回预览结果                                │
 └─────────────────────────────────────────────────┘
     ↓
@@ -927,21 +940,21 @@ ofType() 订阅者的 awaitActiveTransactions 捕获回滚
      （但 DB 操作已回滚）
 ```
 
-### 7.2.1 dryRun 场景事件分类汇总
-
-| 事件组 | 是否发布 | 阻塞处理器是否可见 | ofType 订阅者是否可见 |
-|--------|----------|------------------|---------------------|
-| **dryRun 判断前发布（6 种） | ✅ 是 | ✅ 是 | ❌ 否 |
-| OrderLineEvent('created') | ✅ 是 | ✅ 是 | ❌ 否 |
-| OrderLineEvent('updated') | ✅ 是 | ✅ 是 | ❌ 否 |
-| OrderLineEvent('cancelled') | ✅ 是 | ✅ 是 | ❌ 否 |
-| HistoryEntryEvent(ORDER_CANCELLATION) | ✅ 是 | ✅ 是 | ❌ 否 |
-| HistoryEntryEvent(ORDER_COUPON_APPLIED) | ✅ 是 | ✅ 是 | ❌ 否 |
-| HistoryEntryEvent(ORDER_COUPON_REMOVED) | ✅ 是 | ✅ 是 | ❌ 否 |
-| **dryRun 判断后发布（3 种） | ❌ 否 | ❌ 否 | ❌ 否 |
-| RefundStateTransitionEvent | ❌ 否 | ❌ 否 | ❌ 否 |
-| OrderEvent('updated') | ❌ 否 | ❌ 否 | ❌ 否 |
-| HistoryEntryEvent(ORDER_MODIFIED) | ❌ 否 | ❌ 否 | ❌ 否 |
+### 7.2.1 dryRun 场景事件分类汇总（与 6.5.4 节逐条对应）
+| 事件组及事件 | 发布位置 | 是否发布 | 阻塞处理器是否可见 | ofType 订阅者是否可见 |
+|--------------|----------|----------|------------------|---------------------|
+| **dryRun 判断前发布（6 种事件）** | --- | ✅ 是 | ✅ 是 | ❌ 否 |
+| `OrderLineEvent`('created') | `order-modifier.ts:204` | ✅ 是 | ✅ 是 | ❌ 否 |
+| `OrderLineEvent`('updated') | `order-modifier.ts:247` | ✅ 是 | ✅ 是 | ❌ 否 |
+| `OrderLineEvent`('cancelled') | `order-modifier.ts:339` | ✅ 是 | ✅ 是 | ❌ 否 |
+| `HistoryEntryEvent`(ORDER_CANCELLATION) | `order-modifier.ts:362` | ✅ 是 | ✅ 是 | ❌ 否 |
+| `HistoryEntryEvent`(ORDER_COUPON_APPLIED) | `order-modifier.ts:588` | ✅ 是 | ✅ 是 | ❌ 否 |
+| `HistoryEntryEvent`(ORDER_COUPON_REMOVED) | `order-modifier.ts:599` | ✅ 是 | ✅ 是 | ❌ 否 |
+| **dryRun 判断后发布（4 种事件）** | --- | ❌ 否 | ❌ 否 | ❌ 否 |
+| `HistoryEntryEvent`(ORDER_REFUND_TRANSITION) | `default-refund-process.ts:41` | ❌ 否 | ❌ 否 | ❌ 否 |
+| `RefundStateTransitionEvent` | `payment.service.ts:453` | ❌ 否 | ❌ 否 | ❌ 否 |
+| `OrderEvent`('updated') | `order-modifier.ts:695` | ❌ 否 | ❌ 否 | ❌ 否 |
+| `HistoryEntryEvent`(ORDER_MODIFIED) | `order.service.ts:1399` | ❌ 否 | ❌ 否 | ❌ 否 |
 
 ### 7.3 错误回滚数据流
 
@@ -957,6 +970,8 @@ modifyOrder 执行中发生错误（如退款创建失败）
 │  │  └─ publish 6 种事件 → 阻塞处理器已调用      │
 │  ├─ dryRun 判断后（dryRun=false 才执行到）：     │
 │  │  ├─ 可能已创建 Refund                        │
+│  │  ├─ 可能已写入 ORDER_REFUND_TRANSITION 历史  │
+│  │  ├─ 可能已 publish HistoryEntryEvent(ORDER_REFUND_TRANSITION) │
 │  │  ├─ 可能已 publish RefundStateTransitionEvent│
 │  │  └─ 但还没到 OrderEvent('updated')           │
 │  └─ 抛出错误                                    │
@@ -979,27 +994,45 @@ ofType() 订阅者的 awaitActiveTransactions 捕获回滚
      （DB 操作已回滚，外部副作用不回滚）
 ```
 
-### 7.3.1 错误回滚场景事件分类汇总
+### 7.3.1 错误回滚场景事件分类汇总（与 6.5.4 节逐条对应）
 
 按错误发生位置分两种情况：
 
 **情况 1：错误发生在 dryRun 判断前**
 （如 addItems 库存不足、优惠券无效等前置校验失败）
 
-| 事件组 | 是否发布 | 阻塞处理器可见性 | ofType 订阅者可见性 |
-|--------|----------|------------------|---------------------|
-| dryRun 判断前（6 种） | ⚠️ 取决于错误发生时机 | ⚠️ 部分可见 | ❌ 否 |
-| dryRun 判断后（3 种） | ❌ 否 | ❌ 否 | ❌ 否 |
+| 事件组及事件 | 发布位置 | 是否发布 | 阻塞处理器可见性 | ofType 订阅者可见性 |
+|--------------|----------|----------|------------------|---------------------|
+| **dryRun 判断前（6 种）** | --- | ⚠️ 取决于错误发生时机 | ⚠️ 部分可见 | ❌ 否 |
+| `OrderLineEvent`('created') | `order-modifier.ts:204` | ⚠️ 取决于错误时机 | ⚠️ 可能可见 | ❌ 否 |
+| `OrderLineEvent`('updated') | `order-modifier.ts:247` | ⚠️ 取决于错误时机 | ⚠️ 可能可见 | ❌ 否 |
+| `OrderLineEvent`('cancelled') | `order-modifier.ts:339` | ⚠️ 取决于错误时机 | ⚠️ 可能可见 | ❌ 否 |
+| `HistoryEntryEvent`(ORDER_CANCELLATION) | `order-modifier.ts:362` | ⚠️ 取决于错误时机 | ⚠️ 可能可见 | ❌ 否 |
+| `HistoryEntryEvent`(ORDER_COUPON_APPLIED) | `order-modifier.ts:588` | ⚠️ 取决于错误时机 | ⚠️ 可能可见 | ❌ 否 |
+| `HistoryEntryEvent`(ORDER_COUPON_REMOVED) | `order-modifier.ts:599` | ⚠️ 取决于错误时机 | ⚠️ 可能可见 | ❌ 否 |
+| **dryRun 判断后（4 种）** | --- | ❌ 否 | ❌ 否 | ❌ 否 |
+| `HistoryEntryEvent`(ORDER_REFUND_TRANSITION) | `default-refund-process.ts:41` | ❌ 否 | ❌ 否 | ❌ 否 |
+| `RefundStateTransitionEvent` | `payment.service.ts:453` | ❌ 否 | ❌ 否 | ❌ 否 |
+| `OrderEvent`('updated') | `order-modifier.ts:695` | ❌ 否 | ❌ 否 | ❌ 否 |
+| `HistoryEntryEvent`(ORDER_MODIFIED) | `order.service.ts:1399` | ❌ 否 | ❌ 否 | ❌ 否 |
 
-**情况 2：错误发生在 dryRun 判断后（dryRun=false 场景）**
+**情况 2：错误发生在 dryRun 判断后（仅 dryRun=false 场景）**
 （如退款创建失败、退款金额超限等）
 
-| 事件组 | 是否发布 | 阻塞处理器可见性 | ofType 订阅者可见性 |
-|--------|----------|------------------|---------------------|
-| dryRun 判断前（6 种） | ✅ 是 | ✅ 是 | ❌ 否 |
-| RefundStateTransitionEvent | ⚠️ 取决于错误位置 | ⚠️ 可能可见 | ❌ 否 |
-| OrderEvent('updated') | ❌ 否（在退款之后） | ❌ 否 | ❌ 否 |
-| HistoryEntryEvent(ORDER_MODIFIED) | ❌ 否 | ❌ 否 | ❌ 否 |
+| 事件组及事件 | 发布位置 | 是否发布 | 阻塞处理器可见性 | ofType 订阅者可见性 |
+|--------------|----------|----------|------------------|---------------------|
+| **dryRun 判断前（6 种）** | --- | ✅ 是 | ✅ 是 | ❌ 否 |
+| `OrderLineEvent`('created') | `order-modifier.ts:204` | ✅ 是 | ✅ 是 | ❌ 否 |
+| `OrderLineEvent`('updated') | `order-modifier.ts:247` | ✅ 是 | ✅ 是 | ❌ 否 |
+| `OrderLineEvent`('cancelled') | `order-modifier.ts:339` | ✅ 是 | ✅ 是 | ❌ 否 |
+| `HistoryEntryEvent`(ORDER_CANCELLATION) | `order-modifier.ts:362` | ✅ 是 | ✅ 是 | ❌ 否 |
+| `HistoryEntryEvent`(ORDER_COUPON_APPLIED) | `order-modifier.ts:588` | ✅ 是 | ✅ 是 | ❌ 否 |
+| `HistoryEntryEvent`(ORDER_COUPON_REMOVED) | `order-modifier.ts:599` | ✅ 是 | ✅ 是 | ❌ 否 |
+| **dryRun 判断后（4 种）** | --- | ⚠️ 取决于错误位置 | ⚠️ 部分可见 | ❌ 否 |
+| `HistoryEntryEvent`(ORDER_REFUND_TRANSITION) | `default-refund-process.ts:41` | ⚠️ 取决于错误位置 | ⚠️ 可能可见 | ❌ 否 |
+| `RefundStateTransitionEvent` | `payment.service.ts:453` | ⚠️ 取决于错误位置 | ⚠️ 可能可见 | ❌ 否 |
+| `OrderEvent`('updated') | `order-modifier.ts:695` | ❌ 否（在退款之后） | ❌ 否 | ❌ 否 |
+| `HistoryEntryEvent`(ORDER_MODIFIED) | `order.service.ts:1399` | ❌ 否 | ❌ 否 | ❌ 否 |
 
 ---
 
@@ -1049,23 +1082,27 @@ ofType() 订阅者的 awaitActiveTransactions 捕获回滚
 - 即使部分历史记录在 dryRun 判断前已写入数据库，事务回滚会全部撤销
 - **事件发布时序的严格边界**（按 `order-modifier.ts:647` dryRun 判断划分）：
   - **dryRun 判断前**：发布 6 种事件（`OrderLineEvent` × 3、`HistoryEntryEvent` × 3）
-  - **dryRun 判断后**：发布 3 种事件（`RefundStateTransitionEvent`、`OrderEvent`('updated')、`HistoryEntryEvent`(ORDER_MODIFIED)）
-  - **dryRun=true 时**：判断后 3 种事件**完全不会发布**
+  - **dryRun 判断后**：发布 4 种事件（`HistoryEntryEvent`(ORDER_REFUND_TRANSITION)、`RefundStateTransitionEvent`、`OrderEvent`('updated')、`HistoryEntryEvent`(ORDER_MODIFIED)）
+  - **dryRun=true 时**：判断后 4 种事件**完全不会发布**，连阻塞处理器也不会收到
 - **事件层面的一致性**：通过 `EventBus.awaitActiveTransactions` 机制双重保证
   - `ofType()` 订阅者（绝大多数插件）在事务回滚时**完全看不到任何事件**
   - 只有阻塞事件处理器会被调用，但仅能看到 dryRun 判断前的 6 种事件
   - 阻塞处理器内的 DB 操作也在同一事务内 → 会被回滚
 - **唯一风险点**：阻塞事件处理器内的外部副作用（发送邮件、调用外部 API）不会回滚，但阻塞处理器使用极少
 
-### 9.6 refund 与 refunds 优先级
-- `refunds`（新 API）优先级高于 `refund`（旧 API，v2.2.0 弃用）
-- 两者同时存在时，`refund` 被完全忽略
-- 多退款场景下按 `amount` 降序选择 `primaryRefund`
-- 运费差额和调整额仅追加到 `primaryRefund`
+### 9.8 事件-历史记录-数据库写入对应关系（完整清单）
 
-### 9.7 扩展性
-- 可通过 `OrderProcess` 扩展状态流转守卫
-- 可通过 `orderItemPriceCalculationStrategy` 自定义价格计算
-- 可通过 `shippingLineAssignmentStrategy` 自定义配送分配
-- 可扩展自定义 `HistoryEntryType` 记录自定义业务事件
-- 可通过 `RefundProcess` 扩展退款状态流转逻辑
+| 序号 | 事件类型 | 历史记录类型 | 数据库写入位置 | dryRun 前后 |
+|------|----------|--------------|----------------|-------------|
+| 1 | `OrderLineEvent`('created') | --- | `order-modifier.ts:195`（OrderLine 保存） | ✅ 之前 |
+| 2 | `OrderLineEvent`('updated') | --- | `order-modifier.ts:246`（OrderLine 保存） | ✅ 之前 |
+| 3 | `OrderLineEvent`('cancelled') | --- | `order-modifier.ts:334`（OrderLine 保存） | ✅ 之前 |
+| 4 | `HistoryEntryEvent` | `ORDER_CANCELLATION` | `order-modifier.ts:362`（历史记录保存） | ✅ 之前 |
+| 5 | `HistoryEntryEvent` | `ORDER_COUPON_APPLIED` | `order-modifier.ts:588`（历史记录保存） | ✅ 之前 |
+| 6 | `HistoryEntryEvent` | `ORDER_COUPON_REMOVED` | `order-modifier.ts:599`（历史记录保存） | ✅ 之前 |
+| 7 | `HistoryEntryEvent` | `ORDER_REFUND_TRANSITION` | `default-refund-process.ts:41`（历史记录保存） | ❌ 之后 |
+| 8 | `RefundStateTransitionEvent` | --- | `payment.service.ts:450`（Refund 保存） | ❌ 之后 |
+| 9 | `OrderEvent`('updated') | --- | `order-modifier.ts:693`（Order 保存） | ❌ 之后 |
+| 10 | `HistoryEntryEvent` | `ORDER_MODIFIED` | `order.service.ts:1399`（历史记录保存） | ❌ 之后 |
+
+> **说明**：`OrderLineEvent` 和 `OrderEvent`、`RefundStateTransitionEvent` 本身不直接对应历史记录，它们是领域事件，用于通知外部系统订单状态变更；`HistoryEntryEvent` 对应 `OrderHistoryEntry` 实体的增删改，是审计记录的直接载体。
