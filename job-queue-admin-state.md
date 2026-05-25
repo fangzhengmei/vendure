@@ -770,40 +770,277 @@ const hasSettledJob =
 2. **30 秒超时保护**：`MAX_POLLING_TIMEOUT_MS = 30000`，超时强制停止
 3. **按队列过滤**：只查询特定队列，减少无关任务干扰
 
+#### 业务页轮询已返回 totalItems 时如何用于规避 take 限制导致的完成误判
+
+**GraphQL 查询已包含 totalItems**：`use-job-queue-polling.ts:17-28`
+
+```graphql
+query JobListForPolling($options: JobListOptions) {
+    jobs(options: $options) {
+        items {
+            id
+            createdAt
+            state
+        }
+        totalItems  # ✅ 已查询，但当前完全未使用
+    }
+}
+```
+
+**当前完成判断逻辑（有缺陷）**：`use-job-queue-polling.ts:111-129`
+
+```typescript
+const relevantJobs = jobsData?.jobs.items.filter(j => j.createdAt >= startTime) ?? [];
+const hasSettledJob =
+    relevantJobs.length > 0 &&
+    relevantJobs.every(j => 
+        j.state !== 'PENDING' && j.state !== 'RUNNING' && j.state !== 'RETRYING'
+    );
+
+if (hasSettledJob) {
+    // 认为全部完成，触发 onComplete
+}
+```
+
+**问题**：只检查了当前返回的 `items` 中的任务，如果时间窗口内的任务总数超过 `take: 10`，会漏掉更早的任务。
+
+---
+
+#### totalItems 的三种正确使用方式
+
+**方案 1：检查时间窗口内的任务总数是否超过 take**
+
+利用 `totalItems` 配合额外查询，判断是否还有更多未结束的任务在时间窗口内。
+
+```typescript
+const relevantJobs = jobsData?.jobs.items.filter(j => j.createdAt >= startTime) ?? [];
+const totalItems = jobsData?.jobs.totalItems ?? 0;
+
+// 1. 首先检查当前返回的 items 中是否有未结束的
+const hasUnfinishedInBatch = relevantJobs.some(j => 
+    j.state === 'PENDING' || j.state === 'RUNNING' || j.state === 'RETRYING'
+);
+
+if (hasUnfinishedInBatch) {
+    // 当前批次有未结束的，继续轮询
+    return;
+}
+
+// 2. 检查是否还有更多任务可能在时间窗口内
+// 如果 totalItems > take，说明还有更多任务没取到
+// 再检查当前返回的 items 中最早的 createdAt
+const earliestInBatch = relevantJobs.length > 0 
+    ? Math.min(...relevantJobs.map(j => +new Date(j.createdAt)))
+    : Infinity;
+
+const startTimeMs = +new Date(startTime);
+const mightHaveMore = totalItems > 10 && earliestInBatch > startTimeMs;
+
+if (mightHaveMore) {
+    // 可能还有更早的任务在时间窗口内，需要继续轮询或增大 take
+    // 可以选择将 take 改为 totalItems，查询全部
+    return;
+}
+
+// 3. 现在可以安全地认为全部完成
+if (relevantJobs.length > 0) {
+    onComplete();
+}
+```
+
+**方案 2：动态调整 take 为 totalItems**
+
+如果 `totalItems` 不太大（如 < 100），直接查询全部，避免分页问题。
+
+```typescript
+const take = Math.min(totalItems || 10, 100);  // 最多取 100 条
+return api.query(jobListForPollingDocument, {
+    options: {
+        filter: { queueName: { eq: queueName } },
+        sort: { createdAt: 'DESC' as const },
+        take: take,  // 动态调整
+    },
+});
+```
+
+**方案 3：增加未结束任务数查询**
+
+在后端增加一个查询，专门统计时间窗口内未结束的任务数量，前端只需判断这个数字是否为 0。
+
+```graphql
+query UnfinishedJobCount($queueName: String!, $since: DateTime!) {
+    unfinishedJobCount(queueName: $queueName, since: $since)
+}
+```
+
+```typescript
+const unfinishedCount = data?.unfinishedJobCount ?? 0;
+if (unfinishedCount === 0) {
+    onComplete();  // 所有任务都结束了
+}
+```
+
+---
+
 #### 改进建议
 
 1. **增加查询数量**：将 `take: 10` 改为 `take: 50` 或更大
-2. **服务端辅助判断**：添加 `totalItems` 检查，如果 `totalItems > take` 则继续轮询
-3. **添加状态校验**：完成后再额外多轮询 1-2 次确认
+2. **利用 totalItems 检查**：如果 `totalItems > take` 且最早的 `createdAt > startTime`，继续轮询或增大 take
+3. **动态调整 take**：将 `take` 设为 `Math.min(totalItems, 100)`，避免分页问题
+4. **添加状态校验**：完成后再额外多轮询 1-2 次确认
 
 ---
 
 ### 盲点 2：RETRYING 状态在管理端为何缺少取消入口及其与后端能力的差异
 
-#### 前端限制
+#### 前端限制：单条操作与批量操作的状态入口差异
 
-**代码位置**：`packages/dashboard/src/app/routes/_authenticated/_system/job-queue.tsx:217-235`
+**单条操作（行内操作菜单）**
+
+**代码位置**：`packages/dashboard/src/app/routes/_authenticated/_system/job-queue.tsx:267-277`
 
 ```typescript
-{row.original.state === 'RUNNING' && (
-    <DropdownMenu>
-        <DropdownMenuTrigger render={<Button variant="ghost" size="icon-xs" />}>
-            <MoreVertical />
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end">
-            <DropdownMenuItem
-                onClick={() => cancelJobMutation.mutate(row.original.id)}
-                className="text-destructive focus:text-destructive"
-            >
-                <Ban />
-                <Trans>Cancel Job</Trans>
-            </DropdownMenuItem>
-        </DropdownMenuContent>
-    </DropdownMenu>
-)}
+state: {
+    cell: ({ row, table }) => {
+        const cancelJobMutation = useMutation({...});
+        const state = STATES.find(s => s.value === row.original.state);
+        return (
+            <div className="flex items-center gap-2">
+                <Badge variant={getJobStateBadgeVariant(row.original.state)}>
+                    {state && <state.icon />}
+                    {row.original.state}
+                </Badge>
+                {row.original.state === 'RUNNING' && (
+                    <DropdownMenu>
+                        <DropdownMenuTrigger render={<Button variant="ghost" size="icon-xs" />}>
+                            <MoreVertical />
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                            <DropdownMenuItem
+                                onClick={() => cancelJobMutation.mutate(row.original.id)}
+                                className="text-destructive"
+                            >
+                                <Ban />
+                                <Trans>Cancel Job</Trans>
+                            </DropdownMenuItem>
+                        </DropdownMenuContent>
+                    </DropdownMenu>
+                )}
+            </div>
+        );
+    },
+},
 ```
 
-**前端判断**：只有 `state === 'RUNNING'` 时才显示取消按钮，PENDING 和 RETRYING 状态不显示。
+**单条操作判断条件**：`row.original.state === 'RUNNING'`
+- ✅ RUNNING：显示取消按钮
+- ❌ PENDING：不显示
+- ❌ RETRYING：不显示
+
+**批量操作（选中多行后的下拉菜单）**
+
+**代码位置**：`packages/dashboard/src/app/routes/_authenticated/_system/components/cancel-jobs-bulk-action.tsx:16-17`
+
+```typescript
+const cancellableJobs = selection.filter(job => 
+    job.state === 'RUNNING' || job.state === 'PENDING'
+);
+const cancellableCount = cancellableJobs.length;
+```
+
+**批量操作判断条件**：`job.state === 'RUNNING' || job.state === 'PENDING'`
+- ✅ RUNNING：可取消
+- ✅ PENDING：可取消
+- ❌ RETRYING：不可取消
+- `cancellableCount === 0` 时组件返回 null，不显示批量取消入口
+
+**单条与批量操作入口差异对比**
+
+| 状态 | 单条操作入口 | 批量操作入口 | 后端实际支持 |
+|------|-------------|-------------|-------------|
+| PENDING | ❌ 不显示 | ✅ 支持 | ✅ 支持 |
+| RUNNING | ✅ 支持 | ✅ 支持 | ✅ 支持 |
+| RETRYING | ❌ 不显示 | ❌ 不显示 | ✅ 支持 |
+| COMPLETED | ❌ 不显示 | ❌ 不显示 | ❌ 无效（静默失败） |
+| FAILED | ❌ 不显示 | ❌ 不显示 | ❌ 无效（静默失败） |
+| CANCELLED | ❌ 不显示 | ❌ 不显示 | ❌ 无效（静默失败） |
+
+**纠正之前的错误结论**：
+- 之前说"前端只给 RUNNING 状态显示取消按钮"——不完全准确，**批量操作也支持 PENDING 状态**
+- 单条操作和批量操作的入口条件不一致，批量操作比单条操作多支持 PENDING 状态
+- 但两者都漏掉了 RETRYING 状态，而后端完全支持取消 RETRYING 状态的任务
+
+---
+
+#### cancelJob 对已终态记录的更新条件与静默无效场景
+
+**后端取消实现**：`packages/core/src/job-queue/polling-job-queue-strategy.ts:318-325`
+
+```typescript
+async cancelJob(jobId: ID): Promise<Job | undefined> {
+    const job = await this.findOne(jobId);
+    if (job) {
+        job.cancel();  // 设置 state = CANCELLED, settledAt = now
+        await this.update(job);
+        return job;
+    }
+}
+```
+
+**关键的 update 过滤条件**：`packages/core/src/plugin/default-job-queue-plugin/sql-job-queue-strategy.ts:163-175`
+
+```typescript
+async update(job: Job<any>): Promise<void> {
+    await this.rawConnection
+        .getRepository(JobRecord)
+        .createQueryBuilder('job')
+        .update()
+        .set(this.toRecord(job))
+        .where('id = :id', { id: job.id })
+        .andWhere('settledAt IS NULL')  // ⚠️ 关键条件：只更新未结束的任务
+        .execute();
+}
+```
+
+**Job.isSettled 定义**：`packages/core/src/job-queue/job.ts:78-85`
+
+```typescript
+get isSettled(): boolean {
+    return (
+        !!this._settledAt &&
+        (this._state === JobState.COMPLETED ||
+            this._state === JobState.FAILED ||
+            this._state === JobState.CANCELLED)
+    );
+}
+```
+
+**终态设置 settledAt 的场景**：
+- `job.complete()` → 设置 `_settledAt = new Date()`，`_state = COMPLETED`
+- `job.fail()`（重试用尽）→ 设置 `_settledAt = new Date()`，`_state = FAILED`
+- `job.cancel()` → 设置 `_settledAt = new Date()`，`_state = CANCELLED`
+
+**静默无效场景**：
+当调用 `cancelJob()` 取消一个**已经是终态**（COMPLETED/FAILED/CANCELLED）的任务时：
+1. `findOne()` 成功找到 Job 对象，`job.settledAt` 有值
+2. `job.cancel()` 再次设置 `settledAt = now`，`state = CANCELLED`
+3. 调用 `update(job)` 时，`.andWhere('settledAt IS NULL')` 条件不匹配
+4. SQL UPDATE 语句影响行数为 0，**数据库记录保持不变**
+5. 方法仍然返回 Job 对象（内存中已修改，但数据库未更新）
+6. **没有任何错误提示**，调用方无法感知操作实际无效
+
+**静默无效的验证方式**：
+```typescript
+const job = await cancelJob(alreadyCompletedJobId);
+console.log(job.state);  // 内存中显示 CANCELLED
+const actualJob = await findOne(alreadyCompletedJobId);
+console.log(actualJob.state);  // 数据库中仍然是 COMPLETED
+```
+
+**为什么要有 settledAt IS NULL 条件**：
+- 防止并发操作覆盖已结束的任务
+- 保证终态记录不可变（immutable）
+- 但 API 层面没有暴露这个约束，导致调用方可能产生错觉
 
 #### 后端能力
 
@@ -873,9 +1110,10 @@ const cancellationSub = interval(this.pollInterval * 5)
 
 #### 改进建议
 
-前端应该为 PENDING 和 RETRYING 状态也显示取消按钮，因为后端完全支持：
+**单条操作修正**：为 PENDING 和 RETRYING 状态也显示取消按钮，与批量操作对齐：
+
 ```typescript
-// 修改前
+// 修改前（job-queue.tsx）
 {row.original.state === 'RUNNING' && (...)}
 
 // 修改后
@@ -883,6 +1121,42 @@ const cancellationSub = interval(this.pollInterval * 5)
   row.original.state === 'PENDING' || 
   row.original.state === 'RETRYING') && (...)}
 ```
+
+**批量操作修正**：增加 RETRYING 状态的支持，与后端能力对齐：
+
+```typescript
+// 修改前（cancel-jobs-bulk-action.tsx）
+const cancellableJobs = selection.filter(job => 
+    job.state === 'RUNNING' || job.state === 'PENDING'
+);
+
+// 修改后
+const cancellableJobs = selection.filter(job => 
+    job.state === 'RUNNING' || 
+    job.state === 'PENDING' || 
+    job.state === 'RETRYING'
+);
+```
+
+**API 层改进**：`cancelJob()` 应该检查 `job.isSettled` 并返回明确的成功/失败信息，而不是静默失败：
+
+```typescript
+async cancelJob(jobId: ID): Promise<Job | undefined> {
+    const job = await this.findOne(jobId);
+    if (job) {
+        if (job.isSettled) {
+            // 已终态，直接返回，不执行无效更新
+            // 或抛出明确错误：throw new Error('Cannot cancel a settled job');
+            return job;
+        }
+        job.cancel();
+        await this.update(job);
+        return job;
+    }
+}
+```
+
+**或者**，在 GraphQL 解析层增加状态检查并返回 null 或错误提示，让调用方知道操作是否真正生效。
 
 ---
 
