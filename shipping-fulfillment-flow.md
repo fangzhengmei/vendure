@@ -10,6 +10,9 @@
 > 3. ❌ ~~状态联动触发时机不明确~~ → ✅ **只有履约状态变为 Shipped/Delivered 时才触发订单状态联动**，Created→Pending 不触发
 > 4. ❌ ~~多配送方式下 handler 选择逻辑清晰~~ → ✅ **多配送方式下默认 handler 受首个配送行影响**，硬编码 `shippingLines[0]`
 > 5. ❌ ~~shipping line 删除逻辑合理~~ → ✅ **删除索引逻辑存在缺陷**，可能导致预期外的 shipping line 被删除
+> 6. ❌ ~~modifyOrder 中 ErrorResult 会导致事务提交~~ → ✅ **modifyOrder 使用手动事务**，`dryRun` 和 `ErrorResult` 都会**显式回滚**
+> 7. ❌ ~~两条路径 ErrorResult 处理一致~~ → ✅ **自动事务路径 ErrorResult 提交**，**手动事务路径 ErrorResult 回滚**
+> 8. ❌ ~~dryRun 模式下修改会被保留~~ → ✅ **modifyOrder 中 dryRun 会显式回滚**，无状态偏差风险
 
 ---
 
@@ -23,11 +26,28 @@
     │  ├─ ShippingEligibilityChecker.check()  资格检查
     │  └─ ShippingCalculator.calculate()     运费计算
     ▼
-[2] 设置订单配送方式 (OrderModifier.setShippingMethods)
+[2] 设置订单配送方式 (两条路径)
+    │
+    ├─ 路径 A: setOrderShippingMethod (商城端)
+    │  ├─ 前置状态: AddingItems || Draft
+    │  ├─ @Transaction() 自动事务 ⚠️
     │  ├─ 再次验证配送方式资格
     │  ├─ 创建/更新 ShippingLine (按索引 i 匹配，而非 ID)
     │  ├─ 删除多余 ShippingLine (splice(n-1)，可能索引错位) ⚠️
-    │  └─ 重新分配 ShippingLine 到 OrderLine (先全设为 NULL，再分配)
+    │  ├─ 重新分配 ShippingLine 到 OrderLine (先全设为 NULL，再分配)
+    │  └─ ⚠️ 返回 ErrorResult 时事务提交！
+    │
+    └─ 路径 B: modifyOrder (管理端)
+       ├─ 前置状态: Modifying
+       ├─ @Transaction('manual') 手动事务 ✅
+       ├─ 手动 startTransaction()
+       ├─ 其他修改 (商品、地址等) 可能先执行
+       ├─ 调用 setShippingMethods (同路径 A 内部逻辑)
+       ├─ 显式事务决策:
+       │  ├─ dryRun=true → rollback ✅
+       │  ├─ isGraphQlErrorResult → rollback ✅
+       │  └─ 成功 → commit
+       └─ 创建 OrderModification 记录 (非 dryRun)
     │
     │  ╔══════════════════════════════════════════════════════════╗
     │  ║  关键连接: ShippingMethod.fulfillmentHandlerCode        ║
@@ -36,6 +56,11 @@
     │  ║                                                          ║
     │  ║  ⚠️  多配送方式问题:                                     ║
     │  ║  前端硬编码 shippingLines[0]，只使用首个配送行的 handler ║
+    │  ║                                                          ║
+    │  ║  ⚠️  事务关键提醒:                                       ║
+    │  ║  • 路径 A (自动事务): 返回 ErrorResult → 事务提交！   ║
+    │  ║  • 路径 B (手动事务): 返回 ErrorResult → 事务回滚！   ║
+    │  ║  • 两条路径: 抛出异常 → 事务回滚                        ║
     │  ╚══════════════════════════════════════════════════════════╝
     ▼
 [3] 订单状态推进 (OrderStateMachine)
@@ -853,6 +878,26 @@ if (options.checkFulfillmentStates !== false) {
   - 中途失败：重新分配过程中出错会导致数据不一致
 - **注意**: 已有履约后仍可修改配送方式，`Fulfillment.handlerCode` 已固化不会受影响
 
+### 衔接点 8: 事务边界 → 回滚 vs 提交决策
+- **位置**: `transaction-wrapper.ts:46-70` + `@Transaction()` 装饰器
+- **核心机制 - 两种事务模式**:
+  - **自动事务** (`@Transaction()`):
+    - 抛出异常 → 事务**回滚**
+    - 返回 ErrorResult → 事务**提交** ⚠️
+  - **手动事务** (`@Transaction('manual')`):
+    - 抛出异常 → 事务**回滚**（装饰器兜底）
+    - 返回 ErrorResult → 事务**回滚**（resolver 显式调用）✅
+    - dryRun=true → 事务**回滚**（resolver 显式调用）✅
+- **两条路径的状态前置条件**:
+  - `setOrderShippingMethod`: `order.state === 'AddingItems' || 'Draft'`
+  - `modifyOrder`: `order.state === 'Modifying'`
+- **关键区分**:
+  - `setOrderShippingMethod` 中资格检查失败返回 ErrorResult → 之前的修改**保留** ⚠️
+  - `modifyOrder` 中资格检查失败返回 ErrorResult → 所有修改**回滚** ✅
+- **风险**:
+  - 自动事务模式下，业务校验失败返回 ErrorResult，之前的 DB 修改会被提交
+  - 自定义策略返回非标准错误对象（非 GraphQLErrorResult），错误未被识别
+
 ---
 
 ## 四、关键数据模型
@@ -1147,15 +1192,339 @@ for (const shippingLine of order.shippingLines) {
 
 ---
 
-### 5.4 状态与履约偏差的风险点总结
+### 5.4 事务边界与状态前置条件深度分析
 
-| 风险点 | 位置 | 后果 | 规避建议 |
-|--------|------|------|----------|
-| 删除索引错位 | `order-modifier.ts:735` | 预期外的 shipping line 被删除或保留 | 按 ID 匹配而非按索引 |
-| 首个配送行决定默认 handler | `fulfill-order-dialog.component.ts:55` | 多配送方式下 handler 选择错误 | 按 OrderLine.shippingLine 分组选择 handler |
-| 删除后重新分配中途失败 | `order-modifier.ts:739-758` | OrderLine.shippingLineId 保持 NULL | 事务包裹、失败回滚 |
-| 已有履约后修改配送方式 | `order-modifier.ts:699` | 历史数据不一致 | 可选：添加警告或限制 |
-| 后端不校验 handler 匹配性 | `fulfillment.service.ts:56` | handler 与配送方式不匹配 | 可选：添加校验或警告 |
+#### 核心事务机制
+
+`@Transaction()` 装饰器工作原理 (`transaction-wrapper.ts:26-79`):
+```typescript
+try {
+    const result = await work(ctx);  // 执行业务逻辑
+    if (queryRunner.isTransactionActive) {
+        await queryRunner.commitTransaction();  // 成功则提交
+    }
+    return result;
+} catch (error) {
+    if (queryRunner.isTransactionActive) {
+        await queryRunner.rollbackTransaction();  // 异常则回滚
+    }
+    throw error;
+}
+```
+
+**关键区分 - 两种事务模式**：
+
+| 事务模式 | 错误类型 | 事务行为 | 应用路径 |
+|----------|----------|----------|----------|
+| **自动模式** `@Transaction()` | 抛出异常 | ❌ **回滚** | `setOrderShippingMethod` |
+| **自动模式** `@Transaction()` | 返回 ErrorResult | ✅ **提交** | `setOrderShippingMethod` |
+| **手动模式** `@Transaction('manual')` | 抛出异常 | ❌ **回滚**（装饰器兜底） | `modifyOrder` |
+| **手动模式** `@Transaction('manual')` | 返回 ErrorResult | ❌ **回滚**（显式调用） | `modifyOrder` |
+| **手动模式** `@Transaction('manual')` | dryRun=true | ❌ **回滚**（显式调用） | `modifyOrder` |
+
+> **重要修正**：之前的分析混淆了两种事务模式。`modifyOrder` 使用**手动事务**，在 resolver 中会**显式检查并回滚** ErrorResult 和 dryRun 分支。
+
+---
+
+#### 路径一：`setOrderShippingMethod`（商城端用户修改配送方式）
+
+##### 调用链路
+```
+shop-order.resolver.ts:259
+  @Transaction()  ← 事务起点，包裹整个方法
+  async setOrderShippingMethod(...)
+    ↓
+order.service.ts:1260
+  async setShippingMethod(ctx, orderId, shippingMethodIds)
+    ├─ 前置条件检查: assertAddingItemsState(order)
+    │  (order.state 必须是 'AddingItems' 或 'Draft')
+    ├─ 调用 orderModifier.setShippingMethods(ctx, order, shippingMethodIds)
+    │  ├─ 更新/创建 ShippingLine
+    │  ├─ 删除多余 ShippingLine
+    │  ├─ 清空 OrderLine.shippingLineId
+    │  └─ 重新分配 ShippingLine
+    ├─ applyPriceAdjustments(ctx, updatedOrder)
+    └─ save(updatedOrder)
+```
+
+##### 事务边界与状态前置条件
+
+| 阶段 | 代码位置 | 状态前置条件 | 失败时行为 |
+|------|----------|--------------|------------|
+| 事务起点 | `shop-order.resolver.ts:259` | - | - |
+| 状态校验 | `order.service.ts:1266-1269` | `order.state === 'AddingItems' \|\| 'Draft'` | 返回 `OrderModificationError`，**事务提交** |
+| 资格检查 | `order-modifier.ts:701-708` | 配送方式对当前订单有效 | 返回 `IneligibleShippingMethodError`，**事务提交** |
+| 更新 ShippingLine | `order-modifier.ts:709-732` | - | 抛异常则**回滚** |
+| 删除 ShippingLine | `order-modifier.ts:734-737` | - | 抛异常则**回滚** |
+| 清空 shippingLineId | `order-modifier.ts:739-744` | - | 抛异常则**回滚** |
+| 重新分配 | `order-modifier.ts:745-758` | - | 抛异常则**回滚** |
+| 价格调整 | `order.service.ts:1275` | - | 抛异常则**回滚** |
+| 保存 Order | `order.service.ts:1276` | - | 抛异常则**回滚** |
+
+##### 状态偏差风险点
+
+**风险场景 1：资格检查失败导致部分修改提交**
+```
+初始状态: order.shippingLines = [SL0, SL1, SL2]
+传入: [id0, id_new]
+
+执行:
+  i=0: SL0 更新成功 ✓
+  i=1: 资格检查失败 → return IneligibleShippingMethodError()
+
+结果:
+  ❌ SL0 已更新，SL1、SL2 未变化
+  ❌ 事务提交，状态不一致
+  ❌ shippingLineId 未重新分配
+```
+
+**风险场景 2：重新分配中途失败（异常）**
+```
+步骤:
+  1. 更新 SL0、SL1 ✓
+  2. 删除 SL2 ✓
+  3. 清空所有 OrderLine.shippingLineId ✓
+  4. 分配 SL0 成功 ✓
+  5. 分配 SL1 时，shippingLineAssignmentStrategy 抛异常 ❌
+
+结果:
+  ❌ 事务回滚，所有修改撤销 ✓
+  ✅ 无状态偏差
+```
+
+**风险场景 3：重新分配中途失败（返回错误对象）**
+```
+如果自定义策略不抛异常，而是返回错误对象:
+  步骤 1-3 同上 ✓
+  步骤 5: 返回 { error: '分配失败' }
+
+结果:
+  ❌ 事务提交
+  ❌ 所有 OrderLine.shippingLineId = NULL
+  ❌ SL0 已分配的也被清空
+  ❌ 订单状态异常
+```
+
+---
+
+#### 路径二：`modifyOrder`（管理端修改已支付订单）
+
+##### 调用链路
+```
+admin/order.resolver.ts:197
+  @Transaction('manual')  ← ⚠️ 手动事务模式！事务起点
+  async modifyOrder(...)
+    ├─ await this.connection.startTransaction(ctx);  ← 手动开启事务
+    ├─ const result = await this.orderService.modifyOrder(ctx, args.input);
+    │
+    │  order.service.ts:1384
+    │    async modifyOrder(ctx, input)
+    │      ├─ 调用 orderModifier.modifyOrder(ctx, input, order)
+    │      │  ├─ 前置条件检查: order.state === 'Modifying'
+    │      │  ├─ ... 其他修改 (商品、地址等) ...
+    │      │  ├─ 如果 input.shippingMethodIds 存在:
+    │      │  │  └─ 调用 setShippingMethods(ctx, order, input.shippingMethodIds)
+    │      │  │     (内部逻辑同路径一)
+    │      │  ├─ applyPriceAdjustments
+    │      │  └─ 如果 !dryRun: 创建 OrderModification 记录
+    │      ├─ 如失败返回错误
+    │      └─ 如成功，创建历史记录
+    │
+    ├─ ✅ 事务控制（关键！）:
+    │  if (args.input.dryRun || isGraphQlErrorResult(result)) {
+    │      await this.connection.rollBackTransaction(ctx);  ← 回滚
+    │  } else {
+    │      await this.connection.commitOpenTransaction(ctx);  ← 提交
+    │  }
+    └─ return result;
+```
+
+##### 事务边界与状态前置条件
+
+| 阶段 | 代码位置 | 状态前置条件 | 失败时行为 |
+|------|----------|--------------|------------|
+| 事务起点 | `admin/order.resolver.ts:197` | - | - |
+| 手动开启事务 | `admin/order.resolver.ts:201` | - | - |
+| 状态校验 | `order-modifier.ts:390-392` | `order.state === 'Modifying'` | 返回 `OrderModificationStateError`，**事务回滚** ✅ |
+| 修改内容校验 | `order-modifier.ts:393-395` | 至少有一项修改 | 返回 `NoChangesSpecifiedError`，**事务回滚** ✅ |
+| 调用 setShippingMethods | `order-modifier.ts:613-618` | 同路径一 | 失败则返回错误，**事务回滚** ✅ |
+| 价格调整 | `order-modifier.ts:637-639` | - | 抛异常则**回滚** |
+| dryRun 返回 | `order-modifier.ts:647-649` | - | 返回修改预览，**事务回滚** ✅ |
+| 创建 OrderModification | `order-modifier.ts:690-696` | - | 抛异常则**回滚** |
+| 事务决策 | `admin/order.resolver.ts:204-208` | - | 根据结果决定提交/回滚 |
+
+> **重要修正**：之前的分析错误地认为返回 ErrorResult 时事务会提交。实际上在手动事务模式下，resolver 会**显式检查 `isGraphQlErrorResult(result)` 并主动回滚**。
+
+##### 状态偏差风险点
+
+**✅ 修正说明**：之前的分析错误地认为 `modifyOrder` 中 ErrorResult 会导致事务提交。实际上由于使用**手动事务**，所有错误和 dryRun 都会**显式回滚**，因此不存在部分修改提交的问题。
+
+---
+
+**风险场景 1：setShippingMethods 失败 → 全部回滚（正确行为）**
+```
+modifyOrder input: {
+  orderId: 1,
+  adjustOrderLines: [...],        // 修改商品数量
+  shippingMethodIds: [id1, id2],  // 修改配送方式
+}
+
+执行:
+  1. adjustOrderLines 成功 ✓（在事务中）
+  2. setShippingMethods 失败 → return IneligibleShippingMethodError()
+  3. resolver 检查 isGraphQlErrorResult(result) → true
+  4. ✅ 调用 rollBackTransaction() → 所有修改撤销！
+
+结果:
+  ✅ adjustOrderLines 的修改已回滚
+  ✅ shippingMethodIds 未修改
+  ✅ 状态完全一致，无偏差
+```
+
+---
+
+**风险场景 2：dryRun 模式 → 全部回滚（正确行为）**
+```
+dryRun=true:
+  1. 所有 DB 修改在事务中执行（更新 OrderLine、ShippingLine 等）
+  2. resolver 检查 args.input.dryRun → true
+  3. ✅ 调用 rollBackTransaction() → 所有修改撤销
+  4. 返回预览结果
+
+结果:
+  ✅ DB 无任何修改
+  ✅ 仅返回预览数据
+  ✅ 无状态偏差
+```
+
+---
+
+**风险场景 3：已有履约后修改配送方式 → 允许但需注意**
+```
+当前状态:
+  order.state = 'Modifying'
+  order.fulfillments = [F1(state=Shipped)]
+  order.shippingLines = [SL0(method=顺丰)]
+
+修改:
+  shippingMethodIds = [id_京东]
+
+执行:
+  1. 状态校验通过 (state === 'Modifying') ✓
+  2. setShippingMethods:
+     - SL0 更新为京东 ✓
+     - 无多余 SL 删除
+     - 清空 OrderLine.shippingLineId ✓
+     - 重新分配 ✓
+  3. applyPriceAdjustments ✓
+  4. 创建 OrderModification ✓
+  5. resolver 检查 !dryRun && !isGraphQlErrorResult → true
+  6. ✅ 调用 commitOpenTransaction()
+
+结果:
+  ✅ 事务成功提交
+  ✅ F1.handlerCode 仍为 'sf-express' (不变)
+  ⚠️  order.shippingLines[0].shippingMethod 变为京东
+  ⚠️  历史履约与当前配送方式不一致（业务语义问题）
+  ⚠️  新增商品的履约会使用京东的 handler
+```
+
+---
+
+**⚠️ 风险场景 4：自定义策略返回错误对象而非抛异常 → 可能提交**
+```
+如果自定义 shippingLineAssignmentStrategy 不抛异常，
+而是返回一个**不是 GraphQLErrorResult** 的错误对象:
+
+执行:
+  1. 更新/删除/清空操作已在事务中执行
+  2. 策略返回 { error: '分配失败' }（非 GraphQLErrorResult）
+  3. 代码逻辑继续执行（因为没有 throw，也没有 return ErrorResult）
+  4. resolver 检查 isGraphQlErrorResult → false（因为不是标准错误）
+  5. ❌ 事务提交！
+
+结果:
+  ❌ 事务提交
+  ❌ 所有 OrderLine.shippingLineId = NULL（或部分分配）
+  ❌ 状态不一致
+
+注意：这是自定义策略实现不规范导致的风险，不是框架本身的问题。
+标准做法是抛异常或 return new GraphQLErrorResult()。
+```
+
+---
+
+#### 两条路径的关键差异对比
+
+| 维度 | `setOrderShippingMethod` | `modifyOrder` |
+|------|--------------------------|---------------|
+| **用户场景** | 商城用户 checkout 前修改 | 管理端修改已支付订单 |
+| **状态前置条件** | `AddingItems` \| `Draft` | `Modifying` |
+| **事务模式** | `@Transaction()` 自动 | `@Transaction('manual')` 手动 |
+| **事务起点** | `shop-order.resolver.ts:259` | `admin/order.resolver.ts:197` |
+| **修改范围** | 仅配送方式 | 商品、地址、配送、优惠等 |
+| **dryRun 支持** | 无 | 有，预览修改 |
+| **返回 ErrorResult 时** | ✅ **事务提交** | ❌ **事务回滚** ✅ |
+| **抛出异常时** | ❌ 回滚 | ❌ 回滚 |
+| **事务控制** | `TransactionWrapper` 自动 | resolver 代码显式控制 |
+| **修改记录** | 无 | 创建 OrderModification |
+| **与履约的交互** | 无（尚未履约） | 可能已有履约，不校验 |
+| **部分修改风险** | ⚠️ 高（ErrorResult 时提交） | ✅ 低（所有错误都回滚） |
+
+---
+
+#### 回滚 vs 提交的决策树
+
+```
+操作失败
+  │
+  ├─ 事务模式是?
+  │  │
+  │  ├─ 自动模式 (@Transaction()) → setOrderShippingMethod
+  │  │   ├─ 是否抛出异常?
+  │  │   │  ├─ 是 → ❌ 事务回滚
+  │  │   │  └─ 否 → 返回 ErrorResult → ✅ 事务提交 ⚠️
+  │  │   └─ 在哪一步失败?
+  │  │      ├─ 前置校验失败 → 无 DB 修改，直接返回
+  │  │      ├─ 更新 ShippingLine 失败 → 看是否抛异常
+  │  │      ├─ 删除 ShippingLine 失败 → 看是否抛异常
+  │  │      ├─ 清空 shippingLineId 失败 → 看是否抛异常
+  │  │      └─ 重新分配失败 → 看是否抛异常
+  │  │
+  │  └─ 手动模式 (@Transaction('manual')) → modifyOrder
+  │      ├─ 是否抛出异常?
+  │      │  ├─ 是 → ❌ 事务回滚（装饰器兜底）
+  │      │  └─ 否 → resolver 显式检查:
+  │      │        ├─ dryRun=true → ❌ 事务回滚 ✅
+  │      │        ├─ isGraphQlErrorResult=true → ❌ 事务回滚 ✅
+  │      │        └─ 成功 → ✅ 事务提交
+  │      └─ 事务控制完全由 resolver 代码显式决定
+  │
+  └─ 自定义策略失败?
+     ├─ 抛异常 → ❌ 回滚
+     ├─ 返回 GraphQLErrorResult → 自动模式提交，手动模式回滚
+     └─ 返回普通对象 → 代码继续执行，可能导致状态不一致 ⚠️
+```
+
+---
+
+### 5.5 状态与履约偏差的风险点总结
+
+| 风险点 | 影响路径 | 位置 | 后果 | 规避建议 |
+|--------|----------|------|------|----------|
+| 删除索引错位 | 两条路径 | `order-modifier.ts:735` | 预期外的 shipping line 被删除或保留 | 按 ID 匹配而非按索引 |
+| 首个配送行决定默认 handler | 两条路径 | `fulfill-order-dialog.component.ts:55` | 多配送方式下 handler 选择错误 | 按 OrderLine.shippingLine 分组选择 handler |
+| ⚠️ 资格检查失败导致部分修改提交 | **仅 setOrderShippingMethod** | `order-modifier.ts:706-708` | 部分 SL 更新，部分未变 | 所有校验前置，或失败时手动回滚 |
+| ⚠️ 自定义策略返回错误对象而非抛异常 | 两条路径 | `shipping-line-assignment-strategy` | OrderLine.shippingLineId 异常 | 规范：策略失败时必须**抛异常** |
+| ✅ dryRun 模式下修改被保留 | 不存在 | - | 已修正：modifyOrder 中 dryRun 会显式回滚 | 无需处理 |
+| 已有履约后修改配送方式 | 仅 modifyOrder | `order-modifier.ts:699` | 历史数据不一致 | 可选：添加警告或限制 |
+| 后端不校验 handler 匹配性 | 两条路径 | `fulfillment.service.ts:56` | handler 与配送方式不匹配 | 可选：添加校验或警告 |
+| ⚠️ 自动事务模式下 ErrorResult 提交风险 | **仅 setOrderShippingMethod** | `transaction-wrapper.ts:62-64` | 业务错误导致部分修改提交 | 关键步骤使用 `@Transaction('manual')` |
+| ⚠️ 自定义策略返回非标准错误 | 两条路径 | - | 错误未被识别，事务提交 | 规范：使用 `GraphQLErrorResult` 类型 |
+
+> **重要修正说明**：
+> - ✅ `modifyOrder` 中 `dryRun` 和 `ErrorResult` 都会**显式回滚**，不存在修改被保留的问题
+> - ⚠️ 主要风险集中在 `setOrderShippingMethod`（自动事务模式），返回 ErrorResult 时事务会提交
 
 ---
 
@@ -1183,3 +1552,8 @@ for (const shippingLine of order.shippingLines) {
 | 配送行分配策略 | `packages/core/src/config/shipping-method/shipping-line-assignment-strategy.ts` |
 | 默认配送行分配策略 | `packages/core/src/config/shipping-method/default-shipping-line-assignment-strategy.ts` |
 | 配送选项配置 | `packages/core/src/config/shipping-method/shipping-options.ts` |
+| 事务装饰器 | `packages/core/src/api/decorators/transaction.decorator.ts` |
+| 事务拦截器 | `packages/core/src/api/middleware/transaction-interceptor.ts` |
+| 事务包装器 | `packages/core/src/connection/transaction-wrapper.ts` |
+| 错误结果类型 | `packages/core/src/common/error/error-result.ts` |
+| 商城端订单 API | `packages/core/src/api/resolvers/shop/shop-order.resolver.ts` |
