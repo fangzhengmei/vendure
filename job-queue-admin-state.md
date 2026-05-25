@@ -707,3 +707,329 @@ Dashboard JobQueuePage → 按状态映射为不同颜色的徽章
 
 #### 建议 4（进阶）：显示下一次重试时间
 如"障碍分析"所述，需要 API 扩展，在服务端计算 `nextRetryAt` 并暴露给前端。
+
+#### 建议 5：为 RETRYING 和 PENDING 状态添加取消入口
+如"盲点 2"分析，后端支持取消任意非终态任务，前端也应该为这些状态显示取消按钮。
+
+## 七、任务队列状态可见性的三个盲点深度分析
+
+### 盲点 1：业务页轮询只取最新10条任务时是否会漏判未结束任务
+
+**代码位置**：`packages/dashboard/src/lib/hooks/use-job-queue-polling.ts:94-118`
+
+**查询参数**：
+```typescript
+return api.query(jobListForPollingDocument, {
+    options: {
+        filter: { queueName: { eq: queueName } },
+        sort: { createdAt: 'DESC' as const },  // 按创建时间倒序
+        take: 10,                               // 只取最新 10 条
+    },
+});
+```
+
+**时间窗口过滤**：
+```typescript
+const startTime = new Date(Date.now() - JOB_LOOKBACK_MS).toISOString();  // JOB_LOOKBACK_MS = 5000ms
+// ...
+const relevantJobs = jobsData?.jobs.items.filter(j => j.createdAt >= startTime) ?? [];
+```
+
+**完成判断逻辑**：
+```typescript
+const hasSettledJob =
+    relevantJobs.length > 0 &&
+    relevantJobs.every(j => j.state !== 'PENDING' && j.state !== 'RUNNING' && j.state !== 'RETRYING');
+```
+
+#### 漏判风险分析
+
+**可能漏判的场景**：
+当 `startTime`（调用 `startPolling()` - 5秒）之后创建的**同队列未结束任务超过 10 个**时，会发生漏判。
+
+**示例**：
+- 时间点 T0：调用 `startPolling()`，`startTime = T0 - 5s`
+- 时间点 T0~T0+5s：连续创建了 12 个 `apply-collection-filters` 任务
+- 查询 `take: 10` + `sort: createdAt DESC`：只返回最新的 10 个（第 3~12 号）
+- 第 1、2 号任务虽然在时间窗口内，但由于排序和数量限制，不在查询结果中
+- 如果第 3~12 号任务都完成了，但第 1、2 号任务还在运行
+- `relevantJobs` 只包含第 3~12 号，`every()` 判断全部完成 → 错误触发 `onComplete()`
+- 第 1、2 号任务的状态变更不会被监听
+
+#### 风险等级评估
+
+| 场景 | 风险等级 | 说明 |
+|------|---------|------|
+| 单任务操作（如创建/更新单个集合） | 低 | 通常只产生 1 个任务 |
+| 批量操作（如批量更新商品） | 中 | 可能产生多个任务，但通常 ≤ 10 |
+| 高并发批量操作 | 高 | 短时间内可能产生 >10 个任务 |
+
+#### 已有的缓解机制
+
+1. **5 秒回溯窗口**：`JOB_LOOKBACK_MS = 5000`，覆盖 mutation 返回前创建的任务
+2. **30 秒超时保护**：`MAX_POLLING_TIMEOUT_MS = 30000`，超时强制停止
+3. **按队列过滤**：只查询特定队列，减少无关任务干扰
+
+#### 改进建议
+
+1. **增加查询数量**：将 `take: 10` 改为 `take: 50` 或更大
+2. **服务端辅助判断**：添加 `totalItems` 检查，如果 `totalItems > take` 则继续轮询
+3. **添加状态校验**：完成后再额外多轮询 1-2 次确认
+
+---
+
+### 盲点 2：RETRYING 状态在管理端为何缺少取消入口及其与后端能力的差异
+
+#### 前端限制
+
+**代码位置**：`packages/dashboard/src/app/routes/_authenticated/_system/job-queue.tsx:217-235`
+
+```typescript
+{row.original.state === 'RUNNING' && (
+    <DropdownMenu>
+        <DropdownMenuTrigger render={<Button variant="ghost" size="icon-xs" />}>
+            <MoreVertical />
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end">
+            <DropdownMenuItem
+                onClick={() => cancelJobMutation.mutate(row.original.id)}
+                className="text-destructive focus:text-destructive"
+            >
+                <Ban />
+                <Trans>Cancel Job</Trans>
+            </DropdownMenuItem>
+        </DropdownMenuContent>
+    </DropdownMenu>
+)}
+```
+
+**前端判断**：只有 `state === 'RUNNING'` 时才显示取消按钮，PENDING 和 RETRYING 状态不显示。
+
+#### 后端能力
+
+**取消接口定义**：`packages/core/src/config/job-queue/inspectable-job-queue-strategy.ts:43`
+```typescript
+cancelJob(jobId: ID): Promise<Job | undefined>;
+```
+
+**取消实现**：`packages/core/src/job-queue/polling-job-queue-strategy.ts:318-325`
+```typescript
+async cancelJob(jobId: ID): Promise<Job | undefined> {
+    const job = await this.findOne(jobId);
+    if (job) {
+        job.cancel();  // 不检查当前状态，直接设置为 CANCELLED
+        await this.update(job);
+        return job;
+    }
+}
+```
+
+**Job.cancel() 方法**：`packages/core/src/job-queue/job.ts:187-190`
+```typescript
+cancel() {
+    this._settledAt = new Date();
+    this._state = JobState.CANCELLED;  // 无条件设置
+}
+```
+
+**调度查询过滤**：`sql-job-queue-strategy.ts:125-130`
+```typescript
+qb1.where('record.state = :pending', { pending: JobState.PENDING })
+   .orWhere('record.state = :retrying', { retrying: JobState.RETRYING });
+```
+只有 PENDING 和 RETRYING 状态的任务会被调度。如果 RETRYING 任务被取消，状态变为 CANCELLED，就不会被查询到，也就不会再执行。
+
+#### 前后端能力差异
+
+| 状态 | 后端是否支持取消 | 前端是否显示取消按钮 | 取消后效果 |
+|------|-----------------|---------------------|-----------|
+| PENDING | 是 | 否 | 状态变 CANCELLED，不再调度 |
+| RUNNING | 是 | 是 | 状态变 CANCELLED，正在执行的任务通过 `cancellationSub` 监听并中断 |
+| RETRYING | 是 | 否 | 状态变 CANCELLED，不再调度 |
+| COMPLETED | 否（已是终态） | - | - |
+| FAILED | 否（已是终态） | - | - |
+| CANCELLED | 否（已是终态） | - | - |
+
+#### RETRYING 任务取消后的特殊情况
+
+RUNNING 状态的任务有 `cancellationSub` 轮询监听取消状态：
+```typescript
+// polling-job-queue-strategy.ts:127-136
+const cancellationSub = interval(this.pollInterval * 5)
+    .pipe(
+        switchMap(() => this.jobQueueStrategy.findOne(nextJob.id!)),
+        filter(job => job?.state === JobState.CANCELLED),
+        take(1),
+    )
+    .subscribe(() => {
+        nextJob.cancel();
+    });
+```
+
+但 RETRYING 和 PENDING 状态的任务**没有**这个监听。不过：
+- RETRYING 任务下次被调度时，`next()` 方法只查询 PENDING 和 RETRYING 状态
+- 如果已经被取消，状态是 CANCELLED，不会被查询到，自然不会执行
+- 因此即使没有监听，取消也是有效的
+
+#### 改进建议
+
+前端应该为 PENDING 和 RETRYING 状态也显示取消按钮，因为后端完全支持：
+```typescript
+// 修改前
+{row.original.state === 'RUNNING' && (...)}
+
+// 修改后
+{(row.original.state === 'RUNNING' || 
+  row.original.state === 'PENDING' || 
+  row.original.state === 'RETRYING') && (...)}
+```
+
+---
+
+### 盲点 3：下一次重试实际触发时间除退避外还受哪些调度条件影响
+
+退避时间（`backoffDelayMs`）只是理论上的**最早可能重试时间**，实际触发时间受多层调度机制影响，可能比理论值晚很多。
+
+#### 影响因素分析
+
+##### 因素 1：轮询间隔 (pollInterval)
+
+**代码位置**：`polling-job-queue-strategy.ts:52, 279, 176-178`
+
+```typescript
+// 默认 200ms，可配置
+this.pollInterval = concurrencyOrConfig.pollInterval ?? 200;
+
+// 轮询调度
+if (this.running) {
+    this.timer = setTimeout(runNextJobs, this.pollInterval);
+}
+```
+
+**影响**：即使退避时间刚到，也要等待下一次轮询才能被发现。最坏情况下延迟接近 `pollInterval`。
+
+**示例**：`pollInterval = 200ms`，退避时间 `1000ms`，实际可能在 `1000ms ~ 1200ms` 之间触发。
+
+##### 因素 2：并发限制 (concurrency)
+
+**代码位置**：`polling-job-queue-strategy.ts:45, 278, 119-120`
+
+```typescript
+// 默认 1，可配置
+this.concurrency = concurrencyOrConfig.concurrency ?? 1;
+
+// 调度时检查
+const runningJobsCount = this.activeJobs.length;
+for (let i = runningJobsCount; i < this.concurrency; i++) {
+    const nextJob = await this.jobQueueStrategy.next(this.queueName);
+    // ...
+}
+```
+
+**影响**：如果并发槽被占满，即使退避时间到了，也要等有空闲槽位才能执行。
+
+**极端情况**：`concurrency = 1`，前面有一个长时间运行的任务，后面所有 RETRYING 任务都要排队等待。
+
+##### 因素 3：任务排序规则
+
+**代码位置**：`sql-job-queue-strategy.ts:132`
+
+```typescript
+.orderBy('record.createdAt', 'ASC');  // 按创建时间升序，旧任务优先
+```
+
+**影响**：PENDING 和 RETRYING 任务混合排序，按创建时间先后执行。即使某个 RETRYING 任务退避时间到了，如果有更早的 PENDING 或 RETRYING 任务，也会先执行更早的。
+
+**示例**：
+- T0：创建任务 A（PENDING）
+- T0+1s：创建任务 B，失败后变为 RETRYING，退避时间 1s
+- T0+2s：任务 B 退避时间到，但任务 A 更旧，先执行任务 A
+- 任务 B 实际在 T0+2s + 任务A执行时间 后才开始
+
+##### 因素 4：同一轮被跳过的任务需要等下一轮
+
+**代码位置**：`sql-job-queue-strategy.ts:144-152`
+
+```typescript
+if (record.state === JobState.RETRYING && typeof this.backOffStrategy === 'function') {
+    const msSinceLastFailure = Date.now() - +record.updatedAt;
+    const backOffDelayMs = this.backOffStrategy(queueName, record.attempts, job);
+    if (msSinceLastFailure < backOffDelayMs) {
+        // 加入 waitingJobIds，递归查询下一个
+        return await this.getNextAndSetAsRunning(manager, queueName, setLock, [
+            ...waitingJobIds,
+            record.id,
+        ]);
+    }
+}
+```
+
+**关键机制**：
+- `waitingJobIds` 在**同一轮递归查询**中传递
+- 一旦某个 RETRYING 任务因退避未到被加入 `waitingJobIds`，**本轮后续查询都会排除它**
+- 即使后面的任务处理过程中它的退避时间到了，本轮也不会再考虑
+- 必须等**下一轮轮询**（`pollInterval` 之后）才会再次检查
+
+**示例**：
+- 同一队列有 3 个 RETRYING 任务：A(剩余10ms)、B(剩余1000ms)、C(剩余1000ms)
+- 轮询开始，先拿到 A，检查：还需 10ms → 加入 waitingJobIds，递归查下一个
+- 拿到 B，检查：还需 1000ms → 加入 waitingJobIds，递归查下一个
+- 拿到 C，检查：还需 1000ms → 加入 waitingJobIds，没有更多任务
+- 整个过程耗时 20ms，此时 A 的退避时间已经到了
+- 但 A 在 waitingJobIds 中，本轮不会再被考虑
+- A 必须等待下一轮轮询（200ms 后）才会被再次检查
+
+##### 因素 5：数据库锁竞争
+
+**代码位置**：`sql-job-queue-strategy.ts:105-108, 138-139`
+
+```typescript
+// 多 worker 场景下使用事务和行锁
+connection
+    .transaction(async transactionManager => {
+        const result = await this.getNextAndSetAsRunning(transactionManager, queueName, true);
+        // ...
+    })
+
+// 行锁
+if (setLock) {
+    qb.setLock('pessimistic_write');
+}
+```
+
+**影响**：多 worker 部署时，多个 worker 同时竞争同一任务，通过数据库行锁保证只有一个能拿到。竞争失败的 worker 本轮轮询空闲，等待下一轮。
+
+##### 因素 6：队列的活跃状态
+
+**代码位置**：`polling-job-queue-strategy.ts:291-305`
+
+```typescript
+async start<Data extends JobData<Data> = object>(
+    queueName: string,
+    process: (job: Job<Data>) => Promise<any>,
+) {
+    if (!this.hasInitialized) {
+        this.started.set(queueName, process);
+        return;  // 策略未初始化时只记录，不启动
+    }
+    // ...
+}
+```
+
+**影响**：如果队列没有被正确启动（如配置了 `activeQueues` 白名单但不包含此队列），任务永远不会被调度。
+
+#### 实际触发时间公式
+
+```
+实际触发时间 = max(
+    updatedAt + backoffDelayMs,                // 退避时间
+    下一轮轮询开始时间,                          // 轮询间隔影响
+    并发槽位释放时间,                           // 并发限制影响
+    前面所有更旧任务的执行完成时间之和,          // 排序影响
+    等待下一轮轮询的时间(如果本轮被跳过)         // waitingJobIds 机制影响
+) + 数据库锁等待时间 + 调度开销
+```
+
+#### 对管理端展示的启示
+
+即使以后实现了 `nextRetryAt` 字段的展示，也应该标注这是**理论最早时间**，实际执行时间可能因上述因素而延迟。可以考虑在 tooltip 中提示："实际执行时间可能受队列负载影响"。
