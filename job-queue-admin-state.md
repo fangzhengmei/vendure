@@ -770,124 +770,262 @@ const hasSettledJob =
 2. **30 秒超时保护**：`MAX_POLLING_TIMEOUT_MS = 30000`，超时强制停止
 3. **按队列过滤**：只查询特定队列，减少无关任务干扰
 
-#### 业务页轮询已返回 totalItems 时如何用于规避 take 限制导致的完成误判
+#### 校正：totalItems 与 startTime 时间窗口的口径差异
 
-**GraphQL 查询已包含 totalItems**：`use-job-queue-polling.ts:17-28`
+**核心问题**：`totalItems` 与 `startTime` 并非同一口径，之前的推理存在边界错误。
 
-```graphql
-query JobListForPolling($options: JobListOptions) {
-    jobs(options: $options) {
-        items {
-            id
-            createdAt
-            state
-        }
-        totalItems  # ✅ 已查询，但当前完全未使用
-    }
-}
-```
-
-**当前完成判断逻辑（有缺陷）**：`use-job-queue-polling.ts:111-129`
+**totalItems 的口径**：基于查询参数中的 `filter` 条件
 
 ```typescript
-const relevantJobs = jobsData?.jobs.items.filter(j => j.createdAt >= startTime) ?? [];
-const hasSettledJob =
-    relevantJobs.length > 0 &&
-    relevantJobs.every(j => 
-        j.state !== 'PENDING' && j.state !== 'RUNNING' && j.state !== 'RETRYING'
-    );
-
-if (hasSettledJob) {
-    // 认为全部完成，触发 onComplete
-}
+// use-job-queue-polling.ts:98-104
+return api.query(jobListForPollingDocument, {
+    options: {
+        filter: { queueName: { eq: queueName } },  // 仅过滤队列名
+        sort: { createdAt: 'DESC' as const },
+        take: 10,
+    },
+});
 ```
 
-**问题**：只检查了当前返回的 `items` 中的任务，如果时间窗口内的任务总数超过 `take: 10`，会漏掉更早的任务。
+`totalItems` 反映的是**该队列的所有任务总数**（包含历史所有任务，可能有成百上千）。
+
+**startTime 的口径**：前端时间窗口，只关心 `createdAt >= startTime` 的任务
+
+```typescript
+// use-job-queue-polling.ts:141
+const startTime = new Date(Date.now() - JOB_LOOKBACK_MS).toISOString();  // JOB_LOOKBACK_MS = 5000ms
+```
+
+`startTime` 是调用 `startPolling()` 前 5 秒，只关心最近的任务。
 
 ---
 
-#### totalItems 的三种正确使用方式
+#### 把队列总量误当成窗口内任务量的场景
 
-**方案 1：检查时间窗口内的任务总数是否超过 take**
+**场景 1：队列历史任务很多，导致永远无法判定完成**
 
-利用 `totalItems` 配合额外查询，判断是否还有更多未结束的任务在时间窗口内。
+```
+队列历史任务：1000 个（totalItems = 1000）
+时间窗口内任务：3 个（都已完成）
+错误逻辑：totalItems (1000) > take (10) → 认为还有更多 → 永远不触发完成
+```
+
+如果用 `totalItems > take` 作为判断条件，会因为历史任务太多而永远不会触发完成。
+
+**场景 2：历史任务少，但窗口内任务多，导致漏判**
+
+```
+队列历史任务：8 个（totalItems = 8 < 10）
+时间窗口内任务：15 个（最新的 10 个已完成，最早的 5 个还在运行）
+错误逻辑：totalItems (8) < take (10) → 认为已全部返回 → 检查最新 10 个 → 误判完成
+```
+
+如果用 `totalItems <= take` 认为已取到全部，会因为窗口内任务超过历史总数而漏判更早的任务。
+
+**场景 3：窗口内有历史任务，误判为窗口内任务**
+
+```
+startTime = T0
+历史任务：任务 A（createdAt = T0 - 10s，状态 RUNNING）
+时间窗口内任务：任务 B（createdAt = T0 + 1s，状态 COMPLETED）
+查询返回 10 条，包含任务 A 和 B
+前端 filter 后 relevantJobs = [任务 B]（任务 A 在窗口外）
+误判：relevantJobs.every(完成) → 触发 onComplete
+但任务 A 虽然在窗口外，但可能是用户本次操作触发的（只是创建时间略早于 startTime）
+```
+
+---
+
+#### 正确的判定逻辑改造方案
+
+**前提**：`JobFilterParameter` 原生支持 `createdAt` 过滤
 
 ```typescript
+// JobFilterParameter 定义（common/generated-types.ts）
+export type JobFilterParameter = {
+    createdAt?: InputMaybe<DateOperators>;  // ✅ 支持 DateOperators
+    queueName?: InputMaybe<StringOperators>;
+    // ...
+};
+
+// DateOperators 支持 after/before/between/eq/isNull
+export type DateOperators = {
+    after?: InputMaybe<Scalars['DateTime']['input']>;
+    before?: InputMaybe<Scalars['DateTime']['input']>;
+    between?: InputMaybe<DateRange>;
+    // ...
+};
+```
+
+---
+
+**方案 1（推荐）：在服务端 filter 中加入 createdAt 过滤，让 totalItems 反映窗口内数量**
+
+将时间窗口过滤从前端移到后端查询参数中，这样 `totalItems` 就会反映**时间窗口内的任务总数**，与我们关心的口径一致。
+
+```typescript
+// 改造前
 const relevantJobs = jobsData?.jobs.items.filter(j => j.createdAt >= startTime) ?? [];
+const totalItems = jobsData?.jobs.totalItems;  // ❌ 这是队列总量，不是窗口内数量
+
+// 改造后
+const { data: jobsData } = useQuery({
+    queryKey: ['jobQueuePolling', queueName],
+    queryFn: () => {
+        setPollCount(c => c + 1);
+        return api.query(jobListForPollingDocument, {
+            options: {
+                filter: {
+                    queueName: { eq: queueName },
+                    createdAt: { after: startTimeRef.current },  // ✅ 服务端过滤
+                },
+                sort: { createdAt: 'DESC' as const },
+                take: 50,  // 适当增大
+            },
+        });
+    },
+    // ...
+});
+
+// 现在 totalItems 是时间窗口内的任务总数
+const items = jobsData?.jobs.items ?? [];
 const totalItems = jobsData?.jobs.totalItems ?? 0;
 
-// 1. 首先检查当前返回的 items 中是否有未结束的
-const hasUnfinishedInBatch = relevantJobs.some(j => 
+// 1. 检查当前批次是否有未结束的
+const hasUnfinishedInBatch = items.some(j => 
     j.state === 'PENDING' || j.state === 'RUNNING' || j.state === 'RETRYING'
 );
 
 if (hasUnfinishedInBatch) {
-    // 当前批次有未结束的，继续轮询
+    return;  // 继续轮询
+}
+
+// 2. 检查是否还有更多任务没取到（窗口内总数 > take）
+const mightHaveMore = totalItems > items.length && items.length > 0;
+
+if (mightHaveMore) {
+    // 还有更多任务没取到，需要增大 take 或继续轮询
+    // 但由于最早的任务（items 中的最后一个）已经完成，
+    // 更早的任务即使存在也应该是完成状态（因为 createdAt 更早）
+    // 不过为了安全，可以再轮询 1-2 次确认
     return;
 }
 
-// 2. 检查是否还有更多任务可能在时间窗口内
-// 如果 totalItems > take，说明还有更多任务没取到
-// 再检查当前返回的 items 中最早的 createdAt
-const earliestInBatch = relevantJobs.length > 0 
-    ? Math.min(...relevantJobs.map(j => +new Date(j.createdAt)))
+// 3. 安全触发完成
+if (items.length > 0) {
+    onComplete();
+}
+```
+
+**注意**：由于排序是 `createdAt DESC`，`items` 中最早的任务在数组最后。如果 `items.length < totalItems`，说明还有比 `items[items.length-1].createdAt` 更早的任务没取到。但这些更早的任务如果存在，也应该已经完成了（因为创建时间更早），所以可以认为是安全的。
+
+---
+
+**方案 2：纯前端推理，不依赖 totalItems，使用双保险逻辑**
+
+如果不修改服务端查询，使用更严谨的前端推理：
+
+```typescript
+const items = jobsData?.jobs.items ?? [];
+const relevantJobs = items.filter(j => j.createdAt >= startTime) ?? [];
+
+// 1. 检查当前返回的窗口内任务是否有未结束的
+const hasUnfinishedInWindow = relevantJobs.some(j => 
+    j.state === 'PENDING' || j.state === 'RUNNING' || j.state === 'RETRYING'
+);
+
+if (hasUnfinishedInWindow) {
+    return;  // 继续轮询
+}
+
+// 2. 检查当前返回的 items 中最早的 createdAt 是否早于 startTime
+// 如果最早的 createdAt < startTime，说明时间窗口内的任务已经全部包含在 items 中了
+// （因为 createdAt 更早的都在窗口外了）
+const earliestInBatch = items.length > 0 
+    ? Math.min(...items.map(j => +new Date(j.createdAt)))
     : Infinity;
 
 const startTimeMs = +new Date(startTime);
-const mightHaveMore = totalItems > 10 && earliestInBatch > startTimeMs;
+const windowFullyCovered = earliestInBatch <= startTimeMs || items.length === 0;
 
-if (mightHaveMore) {
-    // 可能还有更早的任务在时间窗口内，需要继续轮询或增大 take
-    // 可以选择将 take 改为 totalItems，查询全部
+// 3. 如果窗口未被完全覆盖，说明可能还有更早的任务在时间窗口内没被取到
+// （窗口内任务总数 > take），需要增大 take 或继续轮询
+if (!windowFullyCovered) {
+    // 可能还有更早的任务在时间窗口内
+    // 为了安全，继续轮询，或者增大 take 后再查一次
     return;
 }
 
-// 3. 现在可以安全地认为全部完成
+// 4. 现在可以安全地认为窗口内所有任务都已完成
 if (relevantJobs.length > 0) {
     onComplete();
 }
 ```
 
-**方案 2：动态调整 take 为 totalItems**
+**关键逻辑**：
+- 按 `createdAt DESC` 排序，`items` 是最新的 N 条
+- 如果 `items` 中最早的 `createdAt <= startTime`，说明窗口内的任务已经全部包含在 `items` 中了
+- 如果 `items` 中最早的 `createdAt > startTime`，说明窗口内的任务总数超过了 `take`，还有更早的任务没取到
 
-如果 `totalItems` 不太大（如 < 100），直接查询全部，避免分页问题。
+---
+
+**方案 3：混合方案，结合服务端过滤和安全校验**
+
+这是最稳妥的方案：
 
 ```typescript
-const take = Math.min(totalItems || 10, 100);  // 最多取 100 条
-return api.query(jobListForPollingDocument, {
-    options: {
-        filter: { queueName: { eq: queueName } },
-        sort: { createdAt: 'DESC' as const },
-        take: take,  // 动态调整
-    },
+// 查询时加入 createdAt 过滤
+const { data: jobsData } = useQuery({
+    queryFn: () => api.query(jobListForPollingDocument, {
+        options: {
+            filter: {
+                queueName: { eq: queueName },
+                createdAt: { after: startTimeRef.current },
+            },
+            sort: { createdAt: 'DESC' as const },
+            take: 50,
+        },
+    }),
+    // ...
 });
-```
 
-**方案 3：增加未结束任务数查询**
+const items = jobsData?.jobs.items ?? [];
+const totalItems = jobsData?.jobs.totalItems ?? 0;
 
-在后端增加一个查询，专门统计时间窗口内未结束的任务数量，前端只需判断这个数字是否为 0。
+// 1. 检查当前批次是否有未结束的
+const hasUnfinished = items.some(j => 
+    j.state === 'PENDING' || j.state === 'RUNNING' || j.state === 'RETRYING'
+);
 
-```graphql
-query UnfinishedJobCount($queueName: String!, $since: DateTime!) {
-    unfinishedJobCount(queueName: $queueName, since: $since)
+if (hasUnfinished) {
+    return;
 }
-```
 
-```typescript
-const unfinishedCount = data?.unfinishedJobCount ?? 0;
-if (unfinishedCount === 0) {
-    onComplete();  // 所有任务都结束了
+// 2. 双重确认：totalItems > take 时再轮询 1 次
+const needsFinalCheck = totalItems > items.length;
+const hasCheckedOnceRef = useRef(false);
+
+if (needsFinalCheck && !hasCheckedOnceRef.current) {
+    hasCheckedOnceRef.current = true;
+    // 再轮询一次，确保没有遗漏
+    return;
+}
+
+// 3. 触发完成
+if (items.length > 0) {
+    onComplete();
 }
 ```
 
 ---
 
-#### 改进建议
+#### 改进建议总结
 
-1. **增加查询数量**：将 `take: 10` 改为 `take: 50` 或更大
-2. **利用 totalItems 检查**：如果 `totalItems > take` 且最早的 `createdAt > startTime`，继续轮询或增大 take
-3. **动态调整 take**：将 `take` 设为 `Math.min(totalItems, 100)`，避免分页问题
-4. **添加状态校验**：完成后再额外多轮询 1-2 次确认
+1. **推荐改造**：将 `createdAt: { after: startTime }` 加入服务端 filter，让 `totalItems` 反映窗口内任务数
+2. **安全校验**：即使使用服务端过滤，当 `totalItems > take` 时，再额外多轮询 1-2 次确认
+3. **纯前端方案**：如果不改服务端，检查 `items` 中最早的 `createdAt <= startTime` 来判断窗口是否被完全覆盖
+4. **增大 take**：将 `take: 10` 改为 `take: 50`，减少漏判概率
+5. **不要直接用 totalItems**：在未加入 `createdAt` 过滤前，`totalItems` 是队列总量，与窗口内任务量无关
 
 ---
 
