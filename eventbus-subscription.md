@@ -553,15 +553,15 @@ async process(data: EmailJobData) {
 
 | 事件 | Service 文件 | 行号 | Resolver 入口 | Resolver 文件 | @Transaction() |
 |------|-------------|------|--------------|--------------|---------------|
-| `AttemptedLoginEvent` | `auth.service.ts` | :57 | `login()` / `authenticate()` | `shop-auth.resolver.ts` / `auth.resolver.ts` | 有 (Shop:65, Admin:38, Shop authenticate:81, Admin authenticate:54) |
+| `AttemptedLoginEvent` | `auth.service.ts` | :57 | `login()` / `authenticate()` | `shop-auth.resolver.ts` / `auth.resolver.ts` | 有 (Shop:65, Admin:38) |
 | `LoginEvent` | `auth.service.ts` | :109 | `login()` / `authenticate()` | `shop-auth.resolver.ts` / `auth.resolver.ts` | 有 |
 | `LogoutEvent` | `auth.service.ts` | :152 | `logout()` | `shop-auth.resolver.ts` / `auth.resolver.ts` | 有 (Shop:93, Admin:66) |
-| `AccountRegistrationEvent` | `customer.service.ts` | :272, :453, :476 | `create()` / `registerCustomerAccount()` / `refreshVerificationToken()` | `customer.resolver.ts` / `shop-auth.resolver.ts` | 有 (Shop register:110, Shop refresh:181) |
+| `AccountRegistrationEvent` | `customer.service.ts` | :272, :453, :476 | `create()` / `registerCustomerAccount()` / `refreshVerificationToken()` | `customer.resolver.ts` / `shop-auth.resolver.ts` | 有 |
 | `AccountVerifiedEvent` | `customer.service.ts` | :510 | `verifyCustomerAccount()` | `shop-auth.resolver.ts` | 有 (:133) |
 | `PasswordResetEvent` | `customer.service.ts` | :522 | `requestPasswordReset()` | `shop-auth.resolver.ts` | 有 (:196) |
 | `PasswordResetVerifiedEvent` | `customer.service.ts` | :562 | `resetPassword()` | `shop-auth.resolver.ts` | 有 (:211) |
 | `IdentifierChangeRequestEvent` | `customer.service.ts` | :606 | `requestUpdateCustomerEmailAddress()` | `shop-auth.resolver.ts` | 有 (:282) |
-| `IdentifierChangeEvent` | `customer.service.ts` | :614, :649 | `requestUpdateEmailAddress()` / `updateEmailAddress()` | `shop-auth.resolver.ts` | 有 (request:282, update:313) |
+| `IdentifierChangeEvent` | `customer.service.ts` | :614, :649 | `requestUpdateEmailAddress()` / `updateEmailAddress()` | `shop-auth.resolver.ts` | 有 |
 | `CustomerEvent` (created) | `customer.service.ts` | :295, :692 | `create()` | `customer.resolver.ts` | 有 |
 | `CustomerEvent` (updated) | `customer.service.ts` | :368 | `update()` / `updateCustomer()` | `customer.resolver.ts` / `shop-customer.resolver.ts` | 有 (Shop:35) |
 
@@ -591,111 +591,411 @@ TransactionWrapper.executeInTransaction(ctx, work, ...)
     └── await queryRunner.release()
 ```
 
-#### 4.5.2 关键事务语义分析
+---
 
-##### 4.5.2.1 所有事件都在事务内发布，异步订阅者等提交
+### 4.5.2 事件发布/跳过条件的完整分支分析
 
-由于 Resolver 有 `@Transaction()`，`ctx` 携带 `TRANSACTION_MANAGER_KEY`，所以：
-- `ofType()` / `filter()` 订阅者会经过 `awaitActiveTransactions()` 管道
-- 订阅者在**事务提交之后**才会收到事件
-- 阻塞处理器在**事务内**同步执行
+#### 4.5.2.1 `AttemptedLoginEvent` — auth.service.ts:57
 
-##### 4.5.2.2 `AttemptedLoginEvent` 的特殊行为 — 失败时也会收到
-
-`authService.authenticate()` 的关键代码：
+**发布条件**：**无条件发布**（方法开头第一行）
 
 ```typescript
-// auth.service.ts:57-74
 async authenticate(ctx, apiType, authenticationMethod, authenticationData) {
-    await this.eventBus.publish(new AttemptedLoginEvent(ctx, ...));  // ① 认证前发布
-    const authenticationStrategy = this.getAuthenticationStrategy(...);
-    const authenticateResult = await authenticationStrategy.authenticate(ctx, authenticationData);
-    if (typeof authenticateResult === 'string') {
-        return new InvalidCredentialsError({ authenticationError: authenticateResult });  // ② 返回错误，不抛出
-    }
-    return this.createAuthenticatedSessionForUser(ctx, authenticateResult, ...);
+    await this.eventBus.publish(new AttemptedLoginEvent(ctx, ...));  // ← 总是执行
+    // ... 后续验证逻辑
 }
 ```
 
-**关键点**：认证失败时，方法是 `return` 一个 `InvalidCredentialsError` 对象，**不是抛出异常**。
+**跳过情况**：无。只要方法被调用就会发布。
 
-在 `TransactionWrapper.executeInTransaction()` 中：
+**事务行为**：
+- 认证成功 → 正常流程 → 事务 commit → 订阅者收到
+- 认证失败 → `return InvalidCredentialsError`（不抛异常）→ 事务 commit → **订阅者也收到**
+
+这是有意设计的：用于登录审计和暴力破解检测，无论成功失败都应该记录。
+
+---
+
+#### 4.5.2.2 `LoginEvent` — auth.service.ts:109
+
+**发布条件**：在 `createAuthenticatedSessionForUser()` 中发布，需要全部满足：
+
+| 条件 | 代码位置 | 说明 |
+|------|---------|------|
+| 认证策略返回 User 对象 | authenticate():74 | 不是 string 也不是 null/undefined |
+| 用户已验证 OR 不需要验证 | createAuthenticatedSessionForUser():96 | `!extAuths.length && requireVerification && !user.verified` 为 false |
+
+**跳过情况**（不发布 LoginEvent，但 AttemptedLoginEvent 已发布）：
+
+1. **认证策略返回错误字符串** → `return InvalidCredentialsError` → 提前返回，不走到 createAuthenticatedSessionForUser
+2. **认证策略返回 null/undefined** → `return InvalidCredentialsError` → 提前返回
+3. **需要验证但用户未验证** → `return NotVerifiedError` → 提前返回，不执行到 :109
+
+**代码路径**：
+```typescript
+async createAuthenticatedSessionForUser(ctx, user, ...) {
+    // ... 加载 roles ...
+    if (!extAuths.length && requireVerification && !user.verified) {
+        return new NotVerifiedError();  // ← 跳过 publish，直接返回
+    }
+    // ... 更新 lastLogin、创建 session ...
+    await this.eventBus.publish(new LoginEvent(ctx, user));  // ← 只有全部通过才执行
+    return session;
+}
+```
+
+---
+
+#### 4.5.2.3 `LogoutEvent` — auth.service.ts:152
+
+**发布条件**：`session` 存在
 
 ```typescript
-// transaction-wrapper.ts:49-64
-try {
-    const result = await lastValueFrom(from(work(ctx)).pipe(...));
-    if (queryRunner.isTransactionActive) {
-        await queryRunner.commitTransaction();  // 只要 work(ctx) 不抛异常，就 commit
+async destroyAuthenticatedSession(ctx, sessionToken) {
+    const session = await this.connection.getRepository(...).findOne(...);
+    if (session) {                      // ← 关键条件
+        // ... 调用 onLogOut 回调 ...
+        await this.eventBus.publish(new LogoutEvent(ctx));  // ← 找到 session 才发布
+        return this.sessionService.deleteSessionsByUser(...);
     }
-    return result;
-} catch (error) {
-    if (queryRunner.isTransactionActive) {
-        await queryRunner.rollbackTransaction();  // 只有抛异常才 rollback
-    }
-    throw error;
+    // 没找到 session → 直接返回，不发布
 }
 ```
 
-**结论**：
-- 认证失败 → `return InvalidCredentialsError` → **事务提交** → `AttemptedLoginEvent` 被订阅者收到
-- 认证成功 → `return AuthenticatedSession` → **事务提交** → `AttemptedLoginEvent` 和 `LoginEvent` 都被收到
-- 只有当 `authenticationStrategy.authenticate()` 或后续方法**抛出异常**时（不是返回错误对象），事务才回滚，事件才会被过滤掉
+**跳过情况**：
+- token 无效 → 找不到 session → 不发布
+- 使用 API Key 登录 → ShopAuthResolver.logout() 直接 `return { success: false }`，不调用 `destroyAuthenticatedSession`
 
-这是有意的设计：`AttemptedLoginEvent` 用于登录审计和安全监控（如登录失败频率限制、暴力破解检测），无论成功失败都应该被处理。
+---
 
-##### 4.5.2.3 各事件的事务回滚条件
+#### 4.5.2.4 `AccountRegistrationEvent` — 三个发布点
 
-| 事件 | 触发方法 | 失败时行为 | 事务是否提交 | 订阅者是否收到 |
-|------|---------|-----------|-------------|--------------|
-| `AttemptedLoginEvent` | `authenticate()` | `return InvalidCredentialsError` | 是 | **总是收到** |
-| `LoginEvent` | `createAuthenticatedSessionForUser()` | 抛异常才会失败 | 仅异常时回滚 | 仅异常时过滤 |
-| `LogoutEvent` | `destroyAuthenticatedSession()` | 无失败路径 | 是 | 总是收到 |
-| `AccountRegistrationEvent` | `registerCustomerAccount()` | `return EmailAddressConflictError` | 是 | 总是收到 |
-| `AccountVerifiedEvent` | `verifyCustomerEmailAddress()` | `return VerificationTokenInvalidError` | 是 | 仅成功时发布 |
-| `PasswordResetEvent` | `requestPasswordReset()` | 用户不存在时仅不发布事件，不抛异常 | 是 | 仅找到用户时发布 |
-| `PasswordResetVerifiedEvent` | `resetPassword()` | `return PasswordResetTokenInvalidError` | 是 | 仅成功时发布 |
-| `IdentifierChangeRequestEvent` | `requestUpdateEmailAddress()` | `return EmailAddressConflictError` | 是 | 仅成功时发布 |
-| `IdentifierChangeEvent` | `updateEmailAddress()` | `return IdentifierChangeTokenInvalidError` | 是 | 仅成功时发布 |
+##### 发布点 1：Admin API `create()` — customer.service.ts:272
 
-**重要区别**：
-- **"总是收到"**：只要调用 publish，事务就会提交（即使返回 ErrorResult），所以订阅者总能收到
-- **"仅成功时发布"**：失败时根本不会调用 publish，所以不会有事件
-- **"仅异常时过滤"**：成功时正常发布；失败时如果是抛异常（不是 return ErrorResult），事务回滚，事件被过滤
+**发布条件**：**无条件发布**（只要前面的检查都通过）
 
-#### 4.5.3 非 Shop/Admin 入口的事务边界
+```typescript
+async create(ctx, input, password?) {
+    // ... 一系列提前返回检查 ...
+    //    - existingCustomerInChannel → return EmailAddressConflictAdminError
+    //    - existingCustomer || existingUser → return EmailAddressConflictAdminError
+    //    - createCustomerUser 失败 → throw customerUser (异常，回滚)
+    
+    await this.eventBus.publish(new AccountRegistrationEvent(ctx, customer.user));  // ← 检查都通过后执行
+    // ...
+}
+```
 
-`customer.service.ts` 中的 `create()` 方法（行号 272 发布 `AccountRegistrationEvent`、295 发布 `CustomerEvent`）由 Admin API 的 `customer.resolver.ts` 调用，该 Resolver 的 `create()` mutation 也有 `@Transaction()` 装饰。
+**跳过情况**：
+1. 邮箱已在当前 Channel 存在 → `return EmailAddressConflictAdminError` → 不发布
+2. Customer/User 不一致状态 → `return EmailAddressConflictAdminError` → 不发布
+3. 创建 User 失败 → `throw customerUser` → 事务回滚 → 事件被过滤
+
+##### 发布点 2：Shop API `registerCustomerAccount()` — customer.service.ts:453
+
+**发布条件**：`!user.verified`（用户未验证）
+
+```typescript
+async registerCustomerAccount(ctx, input) {
+    // ... 一系列提前返回检查 ...
+    //    - 不需要验证但没密码 → return MissingPasswordError
+    //    - 用户已验证且有本地认证方法 → return { success: true }
+    //    - createOrUpdate 失败 → return customer
+    //    - createCustomerUser 失败 → return customerUser
+    //    - addNativeAuthenticationMethod 失败 → return addAuthenticationResult
+    
+    if (!user.verified) {                                // ← 关键条件
+        await this.eventBus.publish(new AccountRegistrationEvent(ctx, user));
+    } else {
+        // 已验证用户 → 只写历史记录，不发布事件
+    }
+}
+```
+
+**跳过情况**：
+1. 不需要验证但没提供密码 → `return MissingPasswordError` → 不发布（方法开头就返回）
+2. 用户已验证且有本地认证方法 → `return { success: true }` → 不发布
+3. 创建 Customer 失败 → `return customer`（ErrorResult）→ 不发布（提前返回）
+4. 创建 User 失败 → `return customerUser`（ErrorResult）→ 不发布（提前返回）
+5. 添加认证方法失败 → `return addAuthenticationResult`（ErrorResult）→ 不发布（提前返回）
+6. **用户已验证** → 进入 else 分支 → 只写历史记录，**不发布事件**
+
+##### 发布点 3：`refreshVerificationToken()` — customer.service.ts:476
+
+**发布条件**：`user && !user.verified`（用户存在且未验证）
+
+```typescript
+async refreshVerificationToken(ctx, emailAddress) {
+    const user = await this.userService.getUserByEmailAddress(...);
+    if (user && !user.verified) {                  // ← 关键条件
+        await this.userService.setVerificationToken(ctx, user);
+        await this.eventBus.publish(new AccountRegistrationEvent(ctx, user));
+    }
+    // 用户不存在 OR 已验证 → 直接返回，不发布
+}
+```
+
+**跳过情况**：
+- 用户不存在 → 不发布
+- 用户已验证 → 不发布
+
+---
+
+#### 4.5.2.5 `AccountVerifiedEvent` — customer.service.ts:510
+
+**发布条件**：`userService.verifyUserByToken()` 成功返回 User
+
+```typescript
+async verifyCustomerEmailAddress(ctx, verificationToken, password?) {
+    const result = await this.userService.verifyUserByToken(...);
+    if (isGraphQlErrorResult(result)) {
+        return result;  // ← 验证失败 → 提前返回，不发布
+    }
+    const customer = await this.findOneByUserId(...);
+    if (!customer) {
+        throw new InternalServerError(...);  // ← 抛异常 → 事务回滚 → 事件被过滤
+    }
+    // ... 分配到 Channel、写历史记录 ...
+    await this.eventBus.publish(new AccountVerifiedEvent(ctx, customer));  // ← 全部通过才发布
+    return user;
+}
+```
+
+**跳过情况**：
+1. token 无效 → `return VerificationTokenInvalidError` → 不发布
+2. token 过期 → `return VerificationTokenExpiredError` → 不发布
+3. 缺少密码 → `return MissingPasswordError` → 不发布
+4. 密码已设置 → `return PasswordAlreadySetError` → 不发布
+5. 密码验证失败 → `return PasswordValidationError` → 不发布
+6. 找不到 Customer → `throw InternalServerError` → 事务回滚 → 事件被过滤
+
+---
+
+#### 4.5.2.6 `PasswordResetEvent` — customer.service.ts:522
+
+**发布条件**：`user` 存在（`setPasswordResetToken` 返回非 undefined）
+
+```typescript
+async requestPasswordReset(ctx, emailAddress) {
+    const user = await this.userService.setPasswordResetToken(ctx, emailAddress);
+    if (user) {                             // ← 关键条件
+        await this.eventBus.publish(new PasswordResetEvent(ctx, user));
+        // ... 写历史记录 ...
+    }
+    // 用户不存在 → 直接返回，不发布
+}
+```
+
+**userService.setPasswordResetToken() 返回 undefined 的情况**：
+1. 找不到该邮箱的 User
+2. User 没有 NativeAuthenticationMethod
+
+**设计意图**：用户不存在时**不发布事件也不报错**，防止账户枚举攻击（攻击者不能通过"是否收到邮件"判断邮箱是否已注册）。
+
+---
+
+#### 4.5.2.7 `PasswordResetVerifiedEvent` — customer.service.ts:562
+
+**发布条件**：`userService.resetPasswordByToken()` 成功返回 User
+
+```typescript
+async resetPassword(ctx, passwordResetToken, password) {
+    const result = await this.userService.resetPasswordByToken(...);
+    if (isGraphQlErrorResult(result)) {
+        return result;  // ← 失败 → 提前返回，不发布
+    }
+    const customer = await this.findOneByUserId(...);
+    if (!customer) {
+        throw new InternalServerError(...);  // ← 抛异常 → 事务回滚
+    }
+    // ... 写历史记录 ...
+    await this.eventBus.publish(new PasswordResetVerifiedEvent(ctx, result));  // ← 全部通过才发布
+    return result;
+}
+```
+
+**跳过情况**：
+1. token 无效 → `return PasswordResetTokenInvalidError` → 不发布
+2. token 过期 → `return PasswordResetTokenExpiredError` → 不发布
+3. 密码验证失败 → `return PasswordValidationError` → 不发布
+4. 找不到 Customer → `throw InternalServerError` → 事务回滚 → 事件被过滤
+
+---
+
+#### 4.5.2.8 `IdentifierChangeRequestEvent` — customer.service.ts:606
+
+**发布条件**：全部满足：
+1. 新邮箱没有冲突
+2. User 存在
+3. Customer 存在
+4. `requireVerification === true`
+
+```typescript
+async requestUpdateEmailAddress(ctx, userId, newEmailAddress) {
+    if (userWithConflictingIdentifier) {
+        return new EmailAddressConflictError();  // ← 邮箱冲突 → 提前返回
+    }
+    const user = await this.userService.getUserById(...);
+    if (!user) return false;                     // ← 找不到 User → 提前返回
+    const customer = await this.findOneByUserId(...);
+    if (!customer) return false;                 // ← 找不到 Customer → 提前返回
+    
+    if (this.configService.authOptions.requireVerification) {  // ← 关键条件
+        // ... 设置 token ...
+        await this.eventBus.publish(new IdentifierChangeRequestEvent(ctx, user));
+        return true;
+    } else {
+        // 不需要验证 → 直接更新，发布 IdentifierChangeEvent
+    }
+}
+```
+
+**跳过情况**：
+1. 新邮箱已被使用 → `return EmailAddressConflictError` → 不发布
+2. 找不到 User → `return false` → 不发布
+3. 找不到 Customer → `return false` → 不发布
+4. **不需要验证** → 进入 else 分支 → 发布 `IdentifierChangeEvent` 而不是 `IdentifierChangeRequestEvent`
+
+---
+
+#### 4.5.2.9 `IdentifierChangeEvent` — 两个发布点
+
+##### 发布点 1：不需要验证时 — customer.service.ts:614
+
+```typescript
+if (this.configService.authOptions.requireVerification) {
+    // ... 发布 IdentifierChangeRequestEvent
+} else {
+    // ... 直接更新 User 和 Customer ...
+    await this.eventBus.publish(new IdentifierChangeEvent(ctx, user, oldIdentifier));
+    // ... 写历史记录 ...
+}
+```
+
+##### 发布点 2：验证通过后 — customer.service.ts:649
+
+```typescript
+async updateEmailAddress(ctx, token) {
+    const result = await this.userService.changeIdentifierByToken(...);
+    if (isGraphQlErrorResult(result)) {
+        return result;  // ← 验证失败 → 提前返回，不发布
+    }
+    const { user, oldIdentifier } = result;
+    if (!user) return false;                     // ← 找不到 User → 不发布
+    const customer = await this.findOneByUserId(...);
+    if (!customer) return false;                 // ← 找不到 Customer → 不发布
+    
+    await this.eventBus.publish(new IdentifierChangeEvent(ctx, user, oldIdentifier));  // ← 全部通过才发布
+    // ... 更新 Customer email、写历史记录 ...
+}
+```
+
+**跳过情况**（updateEmailAddress 路径）：
+1. token 无效 → `return IdentifierChangeTokenInvalidError` → 不发布
+2. token 过期 → `return IdentifierChangeTokenExpiredError` → 不发布
+3. 找不到 User → `return false` → 不发布
+4. 找不到 Customer → `return false` → 不发布
+
+---
+
+### 4.5.3 事件发布/跳过总表
+
+| 事件 | 发布条件 | 跳过情况数量 | 事务行为 |
+|------|---------|-------------|---------|
+| `AttemptedLoginEvent` | 无条件（方法开头就发） | 0 | 总是 commit → 订阅者总能收到 |
+| `LoginEvent` | 认证成功 + 用户已验证/不需要验证 | 3 种 | 失败时 return ErrorResult → 也 commit → 但不 publish |
+| `LogoutEvent` | 找到有效 Session | 2 种 | 没找到时直接返回 → 不 publish |
+| `AccountRegistrationEvent` (Admin create) | 前面检查全部通过 | 3 种 | 创建 User 失败时 throw → 回滚 |
+| `AccountRegistrationEvent` (Shop register) | 用户未验证 + 前面检查全部通过 | 6 种 | 失败时 return ErrorResult → 也 commit → 但不 publish |
+| `AccountRegistrationEvent` (refresh) | 用户存在且未验证 | 2 种 | 不满足时直接返回 → 不 publish |
+| `AccountVerifiedEvent` | token 验证成功 + 找到 Customer | 7 种 | 找不到 Customer 时 throw → 回滚 |
+| `PasswordResetEvent` | 用户存在且有本地认证方法 | 2 种 | 不满足时直接返回 → 不 publish（安全设计） |
+| `PasswordResetVerifiedEvent` | token 验证成功 + 找到 Customer | 4 种 | 找不到 Customer 时 throw → 回滚 |
+| `IdentifierChangeRequestEvent` | 邮箱不冲突 + 找到 User/Customer + 需要验证 | 4 种 | 不需要验证时发布另一个事件 |
+| `IdentifierChangeEvent` | 不需要验证 OR token 验证成功 | 4 种 | 失败时 return ErrorResult → 也 commit → 但不 publish |
+
+---
+
+### 4.5.4 关键设计模式总结
+
+#### 模式 1："提前 return ErrorResult" — 不发布也不回滚
+
+大部分业务验证失败用这种模式：
+- `return InvalidCredentialsError`
+- `return EmailAddressConflictError`
+- `return VerificationTokenInvalidError`
+
+**效果**：
+- 事务 commit（不回滚）
+- 但事件不发布（因为 publish() 调用在 return 之后）
+- 订阅者收不到事件
+
+#### 模式 2："if 条件包裹 publish()" — 条件发布
+
+如 `AccountRegistrationEvent`、`PasswordResetEvent`、`LogoutEvent`：
+
+```typescript
+if (condition) {
+    await this.eventBus.publish(new XxxEvent(...));
+}
+// 不满足条件时直接跳过
+```
+
+**效果**：条件不满足时，既不发布事件，也不报错。
+
+#### 模式 3："throw Exception" — 回滚+过滤
+
+只有在真正意外的情况下才用这种模式：
+- `throw new InternalServerError('error.cannot-locate-customer-for-user')`
+
+**效果**：
+- 事务 rollback
+- `awaitActiveTransactions()` 返回 undefined
+- `filter(notNullOrUndefined)` 过滤掉事件
+- 订阅者收不到事件
+
+#### 模式 4："总是发布但不总是成功" — 审计事件专用
+
+只有 `AttemptedLoginEvent` 用这种模式：
+- 方法开头**无条件** publish
+- 后面无论成功失败，事务都会 commit
+- 订阅者**总能收到**事件
+
+**设计意图**：安全审计不能因为登录失败就不记录。
 
 ---
 
 ### 4.6 发布路径总览图
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                          EventBus.publish()                             │
-│                                                                         │
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│                            EventBus.publish()                                       │
+│                                                                                      │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌────────────┐  ┌────────────┐
 │  │  启动流程      │  │  Service CRUD │  │  订单编排      │  │ 辅助组件    │  │ 认证/账户    │
 │  │  (无事务)     │  │  (事务)      │  │  (事务)        │  │ (混合事务)  │  │  (事务)      │
 │  ├──────────────┤  ├──────────────┤  ├──────────────┤  ├────────────┤  ├────────────┤
 │  │ bootstrap.ts │  │ *.service.ts │  │ order.service│  │ OrderModifier│ │ auth.service│
-│  │  Bootstrapped│  │  EntityEvent │  │  StateTrans. │  │  OrderLine  │  │ AttemptedLogin│
-│  │              │  │              │  │              │  │  OrderEvent │  │ Login      │
-│  │ initializer  │  │              │  │ default-     │  │             │  │ Logout      │
+│  │  Bootstrapped│  │  EntityEvent │  │  StateTrans. │  │  OrderLine  │  │ AttemptedLogin ✅│
+│  │              │  │              │  │              │  │  OrderEvent │  │ Login      ✴│
+│  │ initializer  │  │              │  │ default-     │  │             │  │ Logout     ✴│
 │  │  Initializer │  │              │  │  order-      │  │ Fulltext    │  │ customer.s.│
-│  │              │  │              │  │  process     │  │  SearchEvent│  │ Account     │
-│  │              │  │              │  │  OrderPlaced │  │             │  │ Password   │
-│  │              │  │              │  │              │  │ EmailProc.  │  │ Identifier │
+│  │              │  │              │  │  process     │  │  SearchEvent│  │ AccountReg ✴│
+│  │              │  │              │  │  OrderPlaced │  │             │  │ Password   ✴│
+│  │              │  │              │  │              │  │ EmailProc.  │  │ Identifier ✴│
 │  │              │  │              │  │              │  │  EmailSend  │  │             │
 │  └──────────────┘  └──────────────┘  └──────────────┘  └────────────┘  └────────────┘
 │        ↓ 立即          ↓ 等事务提交      ↓ 等事务提交      ↓ 视调用方而定      ↓ 等事务提交    │
-│                                                                         │
-│  * 认证/账户事件说明：                                                │
-│    - AttemptedLoginEvent: 认证失败也 commit → 订阅者总能收到                │
-│    - 其他事件: 失败时 return ErrorResult → 也 commit → 总能收到        │
-│    - 仅抛异常时 rollback → 事件被过滤                                   │
-└─────────────────────────────────────────────────────────────────────────┘
+│                                                                                      │
+│  图例：                                                                              │
+│    ✅ = 无条件发布（总能收到）                                                       │
+│    ✴ = 条件发布（满足特定条件才发布，失败时不发布但事务仍提交）                        │
+│                                                                                      │
+│  认证/账户事件的分支逻辑：                                                           │
+│    AttemptedLoginEvent: 方法开头第一行无条件发布 → 无论成功失败都能收到                 │
+│    其他事件: 被 if 条件/提前 return 包裹 → 失败时不走到 publish → 收不到               │
+│    所有失败用 return ErrorResult（不是 throw）→ 事务仍 commit → 不会被过滤             │
+└────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -1042,6 +1342,8 @@ Resolver              TransactionWrapper      Service          EventBus         
 ### 8.6 "Return ErrorResult" vs "Throw Exception" 的事务语义差异
 
 这是 Vendure 最核心的设计模式之一，直接决定事件是否会被订阅者收到。
+
+**详细分支条件分析见第 4.5.2 节**。本节从设计模式角度总结。
 
 #### 8.6.1 两种错误处理模式
 
