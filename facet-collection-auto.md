@@ -187,11 +187,157 @@ arg.value = encodedId;
 
 ---
 
-## 四、Facet Value Filter 的核心 SQL 逻辑
+## 四、预览链路与实际归组链路对照
+
+### 4.1 两条路径入口
+
+| | 预览链路 | 实际归组链路 |
+|---|---|---|
+| **入口** | `previewCollectionVariants()` | `applyCollectionFiltersInternal()` |
+| **调用时机** | Admin UI 编辑 Collection 时的实时预览 | Job 队列异步执行 |
+| **输入来源** | `PreviewCollectionVariantsInput`（前端传入） | 已持久化的 `Collection.filters` |
+| **查询方式** | `listQueryBuilder.build()` 带 `channelId` 限制 | `masterConnection` 无 channel 限制 |
+| **返回值** | `PaginatedList<ProductVariant>`（实体对象） | `ID[]`（仅 ID） |
+
+### 4.2 inheritFilters 截断处理的核心差异
+
+这是两条路径最关键的行为分歧点。
+
+#### 预览链路：不截断，收集全部祖先 filters
+
+```ts
+// collection.service.ts:495-504
+async previewCollectionVariants(ctx, input, options, relations) {
+    const applicableFilters = this.getCollectionFiltersFromInput(input);
+    if (input.parentId && input.inheritFilters) {
+        const parentFilters = (await this.findOne(ctx, input.parentId, []))?.filters ?? [];
+        const ancestorFilters = await this.getAncestors(input.parentId).then(ancestors =>
+            ancestors.reduce(
+                (_filters, c) => [..._filters, ...(c.filters || [])],
+                [] as ConfigurableOperation[],
+            ),
+        );
+        applicableFilters.push(...parentFilters, ...ancestorFilters);
+    }
+    // ... 然后 apply filters
+}
+```
+
+逻辑：
+1. 从 `input` 解析用户正在编辑的 filters
+2. 如果 `input.parentId && input.inheritFilters` 为真，则加载：
+   - 直接 parent 的 `filters`
+   - **所有祖先的 `filters`，遍历时完全忽略 `inheritFilters: false` 截断**
+3. 合并顺序：`[...inputFilters, ...parentFilters, ...ancestorFilters]`
+
+#### 实际归组链路：截断，遇 inheritFilters: false 即停
+
+```ts
+// collection.service.ts:843-855
+private async getAncestorFilters(collection: Collection): Promise<ConfigurableOperation[]> {
+    const ancestorFilters: ConfigurableOperation[] = [];
+    if (collection.inheritFilters) {
+        const ancestors = await this.getAncestors(collection.id);
+        for (const ancestor of ancestors) {
+            ancestorFilters.push(...ancestor.filters);
+            if (ancestor.inheritFilters === false) {
+                return ancestorFilters;   // ← 截断！
+            }
+        }
+    }
+    return ancestorFilters;
+}
+
+// collection.service.ts:733-734
+const ancestorFilters = await this.getAncestorFilters(collection);
+const filters = [...ancestorFilters, ...(collection.filters || [])];
+```
+
+逻辑：
+1. 从已持久化的 `collection.inheritFilters` 判断是否要收集祖先 filters
+2. 遍历祖先时，先 push 当前祖先的 filters，**再检查**该祖先的 `inheritFilters`
+3. 一旦遇到 `inheritFilters === false` 的祖先，立即返回已收集的 filters
+4. 合并顺序：`[...ancestorFilters, ...collection.filters]`
+
+#### 差异对照表
+
+```
+假设树结构：
+  Root
+   └── A (filters: [a], inheritFilters: false)
+         └── B (filters: [b], inheritFilters: true)
+               └── C (filters: [c], inheritFilters: true)
+```
+
+| | 预览 C 时 | 实际归组 C 时 |
+|---|---|---|
+| 收集的祖先 filters | `[a, b]`（A 和 B 的全部，不检查 A 的 inheritFilters） | `[a, b]`（A 的 filters 先 push，再检查 A.inheritFilters===false → 截断返回） |
+| 最终 filter 列表 | `[c, b, a]` | `[a, b, c]` |
+
+上面这个例子碰巧结果相同，但换一个结构：
+
+```
+  Root
+   └── A (filters: [a], inheritFilters: true)
+         └── B (filters: [b], inheritFilters: false)
+               └── C (filters: [c], inheritFilters: true)
+```
+
+| | 预览 C 时（设 parentId=B, inheritFilters=true） | 实际归组 C 时 |
+|---|---|---|
+| 收集的祖先 filters | `[b, a]`（B 和 A 的全部，不检查 B 的 inheritFlags） | `[b, a]`（B 的 filters 先 push，再检查 B.inheritFilters===false → 截断返回 `[b, a]`） |
+| 最终 filter 列表 | `[c, b, a]` | `[b, a, c]` |
+
+再次碰巧相同。但关键区别在于：**预览路径不检查祖先的 `inheritFilters` 截断标记，而实际归组路径会**。当截断点在更高层时差异才暴露：
+
+```
+  Root
+   └── A (filters: [a], inheritFilters: false)
+         └── B (filters: [b], inheritFilters: true)
+               └── C (filters: [c], inheritFilters: true)
+```
+
+预览 C 时（设 `parentId=B, inheritFilters=true`）：
+- `getAncestors(B)` → 返回 `[A]`
+- `ancestorFilters = reduce([A]) → [a]`（**不检查** A.inheritFilters）
+- 最终：`[c, b, a]`
+
+实际归组 C 时：
+- `getAncestorFilters(C)` → C.inheritFilters=true，遍历 `[B, A]`
+- push B.filters → `[b]`，B.inheritFilters=true → 继续
+- push A.filters → `[b, a]`，A.inheritFilters=false → **截断返回**
+- 最终：`[b, a, c]`
+
+**结果一致**——但这是因为预览的 parentId 是 B 而非 C 的实际 parentId。预览走的是 `getAncestors(input.parentId)`，实际走的是 `getAncestors(collection.id)` 后向上遍历。两者遍历的起点不同：预览从 parent 开始向上，实际从自身开始向上。
+
+**真正的差异场景**：当 Collection C 本身的 `inheritFilters` 为 `false` 时：
+
+```
+  Root
+   └── A (filters: [a], inheritFilters: true)
+         └── C (filters: [c], inheritFilters: false)
+```
+
+| | 预览 C 时 | 实际归组 C 时 |
+|---|---|---|
+| 自身 inheritFilters | `input.inheritFilters`（前端传入，用户可能传 true 或 false） | `collection.inheritFilters`（持久化值 = false） |
+| 是否收集祖先 | 取决于 `input.inheritFilters` | `collection.inheritFilters === false` → **不收集** |
+| 最终 filter 列表 | 若 `input.inheritFilters=true`：`[c, a]` | `[c]` |
+
+**结论**：预览链路无法正确模拟 `inheritFilters: false` 的截断行为，因为它：
+1. 收集祖先 filters 时不检查任何祖先的 `inheritFilters` 标记
+2. 仅依赖前端传入的 `input.inheritFilters` 决定是否加载祖先 filters
+3. 与实际归组使用的 `getAncestorFilters()` 逻辑完全不同
+
+这意味着用户在 Admin UI 中预览一个 `inheritFilters: false` 的 Collection 时，如果前端传了 `inheritFilters: true`，预览结果会包含祖先 filters，但实际归组不会应用祖先 filters——**预览与实际结果不一致**。
+
+---
+
+## 五、Facet Value Filter 的核心 SQL 逻辑
 
 `facetValueCollectionFilter`（`default-collection-filters.ts:46-128`）的 `apply()` 函数是最关键的自动分组实现：
 
-### 4.1 查询结构
+### 5.1 查询结构
 
 ```sql
 -- 子查询1: 变体自身的 facetValue
@@ -213,18 +359,18 @@ GROUP BY variant_id
 HAVING COUNT(*) >= :count
 ```
 
-### 4.2 `containsAny` 参数的作用
+### 5.2 `containsAny` 参数的作用
 
 - `containsAny = true` → `count = 1` → 满足任一 FacetValue 即命中
 - `containsAny = false` → `count = facetValueIds.length` → 必须满足所有 FacetValue
 
-### 4.3 `combineWithAnd` 参数
+### 5.3 `combineWithAnd` 参数
 
 控制多 Filter 间的组合方式：
 - `combineWithAnd !== false` → 使用 `qb.andWhere()`（AND 组合）
 - `combineWithAnd === false` → 使用 `qb.orWhere()`（OR 组合）
 
-### 4.4 ⚠️ Bug：facetValueIds 为空时 OR 分支缺失
+### 5.4 OR 空 IDs 行为的校正定性
 
 当前代码（`default-collection-filters.ts:120-125`）：
 
@@ -234,33 +380,27 @@ HAVING COUNT(*) >= :count
     if (args.combineWithAnd !== false) {
         qb.andWhere('1 = 0');
     }
-    // ← 缺少 else 分支：combineWithAnd === false 时什么都不做
+    // ← OR 模式时空 IDs：什么都不做
 }
 ```
 
-**问题分析**：
-
-当 `facetValueIds` 为空且 `combineWithAnd === false`（OR 模式）时，代码不添加任何子句，`qb` 原样返回。这意味着此 filter 在 OR 组合中变成 **no-op（恒真）**。
-
-对比 AND 模式（`1 = 0`，恒假），语义不对称：
-- AND 模式空 IDs → 无变体匹配（合理：要求"必须拥有这 0 个 FacetValue"无意义，应不匹配）
-- OR 模式空 IDs → 对查询无约束（隐式恒真：要求"拥有这 0 个 FacetValue 之一"为空条件）
-
-与其他 Filter 的一致性对比：
+**定性**：这**不是 bug**，而是**有意的设计**，与 `variantIdCollectionFilter` / `productIdCollectionFilter` 行为完全一致：
 
 | Filter | AND + 空 IDs | OR + 空 IDs |
 |---|---|---|
 | `variantIdCollectionFilter` | `andWhere('1 = 0')` | `return qb`（显式 no-op） |
 | `productIdCollectionFilter` | `andWhere('1 = 0')` | `return qb`（显式 no-op） |
-| `facetValueCollectionFilter` | `andWhere('1 = 0')` | 隐式 no-op（**缺少显式 else**） |
+| `facetValueCollectionFilter` | `andWhere('1 = 0')` | 隐式 no-op（无显式 else） |
 
-**实际影响**：
+**OR 模式空 IDs 的 no-op 语义是合理的**：
 
-在大多数场景下，OR 模式空 IDs 的 no-op 行为是合理的——此 filter 不约束结果集，其他 filter 仍正常工作。但存在一个边界场景：
+OR 语义的本质是"满足此条件**或**其他条件之一即可"。当一个 filter 的 IDs 为空时，该 filter 不提供任何约束，等同于 `WHERE TRUE OR other_condition` → `TRUE`，即退化为对最终结果无影响。这与 AND 模式（`WHERE FALSE AND other_condition` → `FALSE`，必须全部拒绝）正好对称。
 
-若一个 Collection **仅有** 一个 facet-value-filter 且 IDs 为空、OR 模式，则 `filteredQb` 无任何 WHERE 子句，返回所有 ProductVariant，使得该 Collection 包含全部变体。这与注释声明的 "no ProductVariants will be matched" 矛盾。
+如果 OR 空 IDs 改为 `orWhere('1 = 0')`，会导致：
+- 多 filter 组合时：`WHERE other_filter_clause OR 1 = 0` → 等价于 `WHERE other_filter_clause`（无害但冗余）
+- 单 filter 且空 IDs：`WHERE 1 = 0` → 拒绝所有变体（过于严格，与"OR 语义=放宽约束"矛盾）
 
-**修正建议**：
+**代码质量问题**：虽然行为正确，但缺少显式 `else { return qb; }` 与其他 Filter 保持一致的代码风格，可读性不佳。建议补齐：
 
 ```ts
 } else {
@@ -272,23 +412,11 @@ HAVING COUNT(*) >= :count
 }
 ```
 
-显式 `return qb` 与 `variantIdCollectionFilter` / `productIdCollectionFilter` 保持一致。若需使空 IDs 在 OR 模式下也不匹配任何变体，则应改为：
-
-```ts
-} else {
-    if (args.combineWithAnd !== false) {
-        qb.andWhere('1 = 0');
-    } else {
-        qb.orWhere('1 = 0');
-    }
-}
-```
-
-但需注意 TypeORM `orWhere('1 = 0')` 会改变 SQL 结构：`WHERE existing_conditions OR 1 = 0` 等价于 `WHERE existing_conditions`，仅在**唯一 filter 为空的 OR 场景**下才有实际效果（此时无 existing_conditions，`1 = 0` 正确拒绝所有行）。
+**唯一需要注意的边界**：在 `applyCollectionFiltersInternal` 中，`filteredQb` 从零开始构建，如果 Collection 的所有 filter 都在 OR 空 IDs 模式下返回 no-op，且无祖先 filter，则 `filteredQb` 无任何 WHERE 子句，会返回全部 ProductVariant。但 `filters.length === 0` 的守卫（`collection.service.ts:746-748`）在 filters 数组本身非空时不触发，所以确实存在这个窗口。不过此场景要求管理员故意配置空 IDs 的 OR filter，Admin UI 的 `facet-value-form-input` 组件通常会阻止这种配置。
 
 ---
 
-## 五、Filter 继承机制
+## 六、Filter 继承机制
 
 Collection 以闭包表（closure-table）组织为树形结构，支持 Filter 向下继承：
 
@@ -302,14 +430,27 @@ Collection (filters: [A])
 
 1. 如果当前 Collection 的 `inheritFilters = true`，则向上遍历祖先
 2. 收集每个祖先的 `filters`
-3. 一旦遇到 `inheritFilters === false` 的祖先，立即停止遍历并返回已收集的 filters
+3. 一旦遇到 `inheritFilters === false` 的祖先，**先 push 该祖先的 filters 再截断**（因为 `push` 在 `if` 检查之前）
 4. 最终在 `applyCollectionFiltersInternal()` 中合并：`[...ancestorFilters, ...collection.filters]`
+
+注意第 3 点的执行顺序：
+
+```ts
+for (const ancestor of ancestors) {
+    ancestorFilters.push(...ancestor.filters);  // 先收集
+    if (ancestor.inheritFilters === false) {     // 再检查
+        return ancestorFilters;                  // 截断但已包含该祖先
+    }
+}
+```
+
+这意味着 `inheritFilters: false` 的祖先自身的 filters **仍会被收集**，只是阻止了更上层祖先的 filters 继续向下传递。
 
 ---
 
-## 六、商品变更触发重归组
+## 七、商品变更触发重归组
 
-### 6.1 事件监听
+### 7.1 事件监听
 
 `CollectionService.onModuleInit()`（`collection.service.ts:104-126`）订阅事件：
 
@@ -329,7 +470,7 @@ merge(productEvents$, variantEvents$)
 - **防抖 50ms**：批量更新商品时，多个事件在 50ms 内只会触发一次归组
 - **门控开关**：`applyAllFiltersOnProductUpdates` 默认为 `true`
 
-### 6.2 触发流程
+### 7.2 触发流程
 
 `triggerApplyFiltersJob()`（`collection.service.ts:687-702`）向 `apply-collection-filters` 队列添加 Job：
 
@@ -345,29 +486,32 @@ async triggerApplyFiltersJob(ctx, options?) {
 
 不同场景的触发参数差异：
 
-| 触发场景 | collectionIds | applyToChangedVariantsOnly |
-|---|---|---|
-| 商品/变体变更事件 | `[]`（全部 Collection） | `undefined`（默认 true） |
-| 创建 Collection | `[新ID]` | `undefined`（默认 true） |
-| 更新 Collection 的 filters | `[当前ID]` | `false` |
-| 移动 Collection | `[当前ID]` | `undefined` |
+| 触发场景 | collectionIds | applyToChangedVariantsOnly | ctx.channelToken |
+|---|---|---|---|
+| 商品/变体变更事件 | `[]`（全部 Collection） | `undefined`（默认 true） | 事件来源 channel |
+| 创建 Collection | `[新ID]` | `undefined`（默认 true） | 当前请求 channel |
+| 更新 Collection 的 filters | `[当前ID]` | `false` | 当前请求 channel |
+| 移动 Collection | `[当前ID]` | `undefined` | 当前请求 channel |
 
-### 6.3 Job 处理逻辑
+### 7.3 Job 处理逻辑
 
 Job 处理函数（`collection.service.ts:128-190`）：
 
-1. 如果 `collectionIds` 为空，查询所有 Collection 的 ID
-2. 逐个 Collection 调用 `applyCollectionFiltersInternal()`
-3. 每个 Collection 处理完后更新进度（`job.setProgress`）
-4. 如果有受影响变体，发布 `CollectionModificationEvent`（分块 50000）
+1. 从 `job.data.ctx` 恢复 RequestContext（`requestContextService.create({ channelOrToken: job.data.ctx.channelToken })`）
+2. 如果 `collectionIds` 为空，查询**所有 Collection** 的 ID（`rawConnection`，**跨 channel**）
+3. 逐个 Collection 调用 `applyCollectionFiltersInternal()`
+4. 每个 Collection 处理完后更新进度
+5. 如果有受影响变体，发布 `CollectionModificationEvent`（分块 50000）
 
-### 6.4 核心归组算法
+**关键细节**：步骤 2 查询所有 Collection 时不按 channel 过滤，因此 Job 在单个 channel 的 ctx 下会处理所有 channel 的 Collection。步骤 3 的 `applyCollectionFiltersInternal` 使用 `masterConnection`，同样无 channel 过滤。这意味着**一个 channel 触发的归组 Job 会影响所有 channel 的 Collection**。
+
+### 7.4 核心归组算法
 
 `applyCollectionFiltersInternal()`（`collection.service.ts:728-837`）使用 CTE 差量计算：
 
 ```
-_filtered_variants  := 所有匹配当前 Collection filter 规则的变体 ID
-_existing_variants  := 当前已属于该 Collection 的变体 ID
+_filtered_variants  := 所有匹配当前 Collection filter 规则的变体 ID（跨 channel）
+_existing_variants  := 当前已属于该 Collection 的变体 ID（跨 channel）
 
 toAdd    := _filtered_variants LEFT JOIN _existing_variants WHERE existing IS NULL
 toRemove := _existing_variants LEFT JOIN _filtered_variants WHERE filtered IS NULL
@@ -377,7 +521,7 @@ toRemove := _existing_variants LEFT JOIN _filtered_variants WHERE filtered IS NU
 - 批量移除（`chunkArray(toRemoveIds, 5000)`）
 - 批量添加（`chunkArray(toAddIds, 5000)`）
 
-### 6.5 affectedVariantIds 的两种返回模式
+### 7.5 affectedVariantIds 的两种返回模式
 
 ```ts
 if (applyToChangedVariantsOnly) {
@@ -386,9 +530,7 @@ if (applyToChangedVariantsOnly) {
 return [...existingIds, ...toRemoveIds];     // 全量（包含未变更的存量）
 ```
 
-当 `applyToChangedVariantsOnly = false`（如 filter 规则变更时），返回的 `affectedVariantIds` 包含所有现有成员 + 移除的，确保 `CollectionModificationEvent` 的下游（如搜索索引重建）能感知全量影响。
-
-### 6.6 ⚠️ 事务失败后的事件一致性风险
+### 7.6 ⚠️ 事务失败后的事件一致性风险
 
 当前 `applyCollectionFiltersInternal()` 的事务错误处理（`collection.service.ts:802-827`）：
 
@@ -423,14 +565,8 @@ if (applyToChangedVariantsOnly) {
 6. 实际 DB 状态未变 → 搜索索引与 DB 不一致
 ```
 
-**具体场景**：
+**修正建议**：事务失败时返回空数组，不发布事件：
 
-- 搜索插件收到 `CollectionModificationEvent` 后会触发 `updateSearchIndex` Job，将相关变体重新索引。如果事件声称变体 V1 已从 Collection C 移除，搜索索引会删除 V1 在 C 下的记录，但 DB 中 V1 仍在 C 中。
-- 反之，事件声称 V2 已加入 C，搜索索引会添加记录，但 DB 中 V2 实际不在 C 中。
-
-**修正建议**：
-
-方案 A：事务失败时返回空数组，不发布事件：
 ```ts
 try {
     await this.connection.rawConnection.transaction(...);
@@ -440,25 +576,11 @@ try {
 }
 ```
 
-方案 B：事务失败时重新查询实际状态，计算真实的差量：
-```ts
-try {
-    await this.connection.rawConnection.transaction(...);
-} catch (e: any) {
-    Logger.error(e);
-    const currentIds = await existingVariantsQb.getRawMany()
-        .then(results => results.map(result => result.id));
-    return currentIds;
-}
-```
-
-方案 A 更简洁且安全——既然归组失败，不如静默，让下一次归组 Job 纠正状态。
-
 ---
 
-## 七、增量重建策略切换
+## 八、增量重建策略切换
 
-### 7.1 全局开关
+### 8.1 全局开关
 
 `setApplyAllFiltersOnProductUpdates()`（`collection.service.ts:674-676`）：
 
@@ -470,7 +592,7 @@ setApplyAllFiltersOnProductUpdates(applyAllFiltersOnProductUpdates: boolean) {
 
 设计意图（注释 `collection.service.ts:661-672`）：大批量导入时，每次商品变更都触发全量归组代价太高，可以先 `setApplyAllFiltersOnProductUpdates(false)` 暂停自动归组，导入完成后手动调用 `triggerApplyFiltersJob()`。
 
-### 7.2 JobBuffer 批量合并
+### 8.2 JobBuffer 批量合并
 
 `CollectionJobBuffer`（`collection-job-buffer.ts`）在搜索插件中实现了 Job 的缓冲与合并：
 
@@ -485,6 +607,7 @@ reduce(collectedJobs): Array<Job> {
     );
     return [new Job({
         ...referenceJob,
+        id: undefined,
         data: {
             collectionIds: unique(collectionIdsToUpdate),
             ctx: referenceJob.data.ctx,
@@ -494,7 +617,7 @@ reduce(collectedJobs): Array<Job> {
 }
 ```
 
-### 7.3 ⚠️ collectionIds 空数组合并时的语义丢失
+### 8.3 ⚠️ collectionIds 空数组合并时的语义丢失
 
 Job 的 `collectionIds` 字段存在双重语义：
 - `[]`（空数组）= 更新**所有** Collection（见 `collection.service.ts:136-143`）
@@ -525,11 +648,11 @@ applyToChangedVariantsOnly = referenceJob.data.applyToChangedVariantsOnly (取 J
 **两个语义丢失**：
 
 1. **"全部"语义被吞噬**：Job A 本意是更新所有 Collection，合并后变成只更新 `[1, 2]`。Collection 3, 4, 5... 的归组被跳过。
-2. **`applyToChangedVariantsOnly` 被错误覆盖**：Job B 需要 `false`（全量重算），但合并后取了 Job A 的 `true`。结果 Collection 1 和 2 只做增量计算，filter 规则变更后应该全量重算的语义丢失。
+2. **`applyToChangedVariantsOnly` 被错误覆盖**：Job B 需要 `false`（全量重算），但合并后取了 Job A 的 `true`。
 
 **修正建议**：
 
-方案 A：空数组在 reduce 时特殊处理——如果任一 Job 的 collectionIds 为空，合并结果也为空（保留"全部"语义）：
+方案 A：空数组在 reduce 时特殊处理——如果任一 Job 的 collectionIds 为空，合并结果也为空（保留"全部"语义）；如果任一 Job 需要 `applyToChangedVariantsOnly: false`，合并结果也用 `false`：
 
 ```ts
 reduce(collectedJobs): Array<Job<any>> {
@@ -537,12 +660,8 @@ reduce(collectedJobs): Array<Job<any>> {
     const allCollectionIds = collectedJobs.reduce(
         (result, job) => [...result, ...job.data.collectionIds], [] as ID[],
     );
+    const anyRequiresFull = collectedJobs.some(job => job.data.applyToChangedVariantsOnly === false);
     const referenceJob = collectedJobs[0];
-    const shouldApplyToAll = hasAllCollectionsJob
-        ? collectedJobs.some(job => job.data.applyToChangedVariantsOnly === false)
-            ? false
-            : referenceJob.data.applyToChangedVariantsOnly
-        : referenceJob.data.applyToChangedVariantsOnly;
 
     return [new Job({
         ...referenceJob,
@@ -550,20 +669,124 @@ reduce(collectedJobs): Array<Job<any>> {
         data: {
             collectionIds: hasAllCollectionsJob ? [] : unique(allCollectionIds),
             ctx: referenceJob.data.ctx,
-            applyToChangedVariantsOnly: shouldApplyToAll,
+            applyToChangedVariantsOnly: anyRequiresFull ? false : referenceJob.data.applyToChangedVariantsOnly,
         },
     })];
 }
 ```
 
-方案 B：简单规则——如果任一 Job 需要 `applyToChangedVariantsOnly: false`，合并结果也用 `false`（宁可多算，不可少算）：
+### 8.4 ⚠️ reduce 固定使用 referenceJob.ctx 的跨 channel 影响
+
+`CollectionJobBuffer.reduce()` 始终使用 `referenceJob = collectedJobs[0]` 的 `ctx`：
 
 ```ts
-const anyRequiresFull = collectedJobs.some(job => job.data.applyToChangedVariantsOnly === false);
-applyToChangedVariantsOnly: anyRequiresFull ? false : referenceJob.data.applyToChangedVariantsOnly,
+const referenceJob = collectedJobs[0];
+// ...
+ctx: referenceJob.data.ctx,
 ```
 
-### 7.4 缓冲的激活时机
+`ApplyCollectionFiltersJobData.ctx` 包含：
+```ts
+ctx: {
+    channelToken: string;   // 触发此 Job 的 channel
+    languageCode: LanguageCode;
+}
+```
+
+**问题场景**：假设缓冲中有来自不同 channel 的 Job：
+
+| Job | ctx.channelToken | 来源 |
+|---|---|---|
+| A | `channel-default` | Channel 1 的商品变更 |
+| B | `channel-eu` | Channel 2 的商品变更 |
+
+合并后，`ctx` 取 Job A 的值 → `channelToken: 'channel-default'`。
+
+**影响分析**：
+
+在 Job 处理函数中（`collection.service.ts:130-134`）：
+```ts
+const ctx = await this.requestContextService.create({
+    apiType: 'admin',
+    languageCode: job.data.ctx.languageCode,
+    channelOrToken: job.data.ctx.channelToken,
+});
+```
+
+恢复的 `ctx` 绑定到 `channel-default`。但随后的处理中：
+
+1. **查询全部 Collection 时不按 channel 过滤**（`collection.service.ts:138-143`）：
+   ```ts
+   const collections = await this.connection.rawConnection
+       .getRepository(Collection)
+       .createQueryBuilder('collection')
+       .select('collection.id', 'id')
+       .getRawMany();
+   ```
+   跨 channel 查所有 Collection，所以 Channel 2 的 Collection 也会被处理。
+
+2. **`getEntityOrThrow` 受 channel 限制**（`collection.service.ts:153-156`）：
+   ```ts
+   collection = await this.connection.getEntityOrThrow(ctx, Collection, collectionId, {
+       retries: 5,
+       retryDelay: 50,
+   });
+   ```
+   如果 Collection 属于 Channel 2 但不属于 Channel 1，而 ctx 绑定 Channel 1，则此查询会**抛出异常**，该 Collection 被跳过。
+
+3. **`applyCollectionFiltersInternal` 无 channel 限制**：使用 `masterConnection`，查询和写入都不按 channel 过滤。
+
+**结果**：如果合并后 ctx 指向 Channel 1，那么仅属于 Channel 2 的 Collection 在步骤 2 会被跳过，其归组不执行。而属于 Channel 1 的 Collection 的 `applyCollectionFiltersInternal` 却会操作跨 channel 的 ProductVariant（步骤 3），可能错误地将其他 channel 的变体关联到 Channel 1 的 Collection。
+
+**修正建议**：
+
+方案 A：reduce 时收集所有不同的 channelToken，生成多个 Job（每个 channel 一个）：
+
+```ts
+reduce(collectedJobs): Array<Job<any>> {
+    const channelTokens = unique(collectedJobs.map(j => j.data.ctx.channelToken));
+    const hasAllCollectionsJob = collectedJobs.some(job => job.data.collectionIds.length === 0);
+    const anyRequiresFull = collectedJobs.some(job => job.data.applyToChangedVariantsOnly === false);
+
+    if (channelTokens.length === 1) {
+        // 单 channel：行为与当前一致
+        const referenceJob = collectedJobs[0];
+        const allCollectionIds = collectedJobs.reduce(
+            (r, j) => [...r, ...j.data.collectionIds], [] as ID[],
+        );
+        return [new Job({
+            ...referenceJob, id: undefined,
+            data: {
+                collectionIds: hasAllCollectionsJob ? [] : unique(allCollectionIds),
+                ctx: referenceJob.data.ctx,
+                applyToChangedVariantsOnly: anyRequiresFull ? false : referenceJob.data.applyToChangedVariantsOnly,
+            },
+        })];
+    }
+
+    // 多 channel：每个 channel 生成一个 Job
+    return channelTokens.map(token => {
+        const jobsForChannel = collectedJobs.filter(j => j.data.ctx.channelToken === token);
+        const referenceJob = jobsForChannel[0];
+        const allCollectionIds = jobsForChannel.reduce(
+            (r, j) => [...r, ...j.data.collectionIds], [] as ID[],
+        );
+        const hasAll = jobsForChannel.some(j => j.data.collectionIds.length === 0);
+        return new Job({
+            ...referenceJob, id: undefined,
+            data: {
+                collectionIds: hasAll ? [] : unique(allCollectionIds),
+                ctx: referenceJob.data.ctx,
+                applyToChangedVariantsOnly: anyRequiresFull ? false : referenceJob.data.applyToChangedVariantsOnly,
+            },
+        });
+    });
+}
+```
+
+方案 B：更激进的方案——让 `applyCollectionFiltersInternal` 在每个 Collection 所属的 channel 上下文中执行，而非使用 Job 的统一 ctx。但这需要更大的重构。
+
+### 8.5 缓冲的激活时机
 
 `SearchJobBufferService`（`search-job-buffer.service.ts:25-29`）在应用启动时根据配置激活：
 
@@ -576,9 +799,7 @@ onApplicationBootstrap() {
 }
 ```
 
-`bufferUpdates` 由 `DefaultSearchPlugin` 的 `BUFFER_SEARCH_INDEX_UPDATES` 注入标记控制。
-
-### 7.5 缓冲的 flush 流程
+### 8.6 缓冲的 flush 流程
 
 `JobQueueService.flush()` → `JobBufferService.flush()`：
 1. 从缓冲存储中取出所有收集的 Job
@@ -587,7 +808,7 @@ onApplicationBootstrap() {
 
 ---
 
-## 八、完整数据流图
+## 九、完整数据流图
 
 ```
 Product/Variant 变更
@@ -599,32 +820,39 @@ Product/Variant 变更
   debounceTime(50ms) ──── applyAllFiltersOnProductUpdates = false? ── 跳过
         │
         ▼
-  triggerApplyFiltersJob(ctx) ── collectionIds: [] (全量)
+  triggerApplyFiltersJob(ctx) ── collectionIds: [] (全量), ctx: 当前 channel
         │
         ▼
   JobQueue.add() ──► CollectionJobBuffer.collect() ── 缓冲
         │                                         │
         │                                  flush 时 reduce()
-        │                                         │ ⚠️ 空数组语义丢失风险
+        │                                         │ ⚠️ 空数组语义丢失
+        │                                         │ ⚠️ referenceJob.ctx 丢失其他 channel
         ▼                                         ▼
-  apply-collection-filters Job 执行         合并后的单个 Job
+  apply-collection-filters Job 执行         合并后的单个/多个 Job
         │
         ▼
-  遍历所有 Collection
+  requestContextService.create({ channelOrToken })  ← 从 job.data.ctx 恢复
         │
+        ▼
+  查询所有 Collection (跨 channel, rawConnection)
+        │
+        ▼
+  getEntityOrThrow(ctx, Collection, id) ← 受 channel 限制！
+        │                                    ⚠️ 仅属于其他 channel 的 Collection 被跳过
         ▼
   applyCollectionFiltersInternal(collection):
-    1. getAncestorFilters() 收集继承的 filters
+    1. getAncestorFilters(collection)  ← 有 inheritFilters 截断
     2. 合并 [ancestorFilters + collection.filters]
-    3. 构建 filteredQb → 匹配规则的变体 ID
-    4. 构建 existingVariantsQb → 已在 Collection 中的变体 ID
+    3. 构建 filteredQb (masterConnection, 跨 channel)
+    4. 构建 existingVariantsQb (masterConnection, 跨 channel)
     5. CTE 差量: toAdd / toRemove
     6. 事务执行: 批量 add/remove (chunk=5000)
         │
         ├─ 事务成功 ──► 返回 affectedVariantIds
         │                    │
         │                    ▼
-        │              CollectionModificationEvent
+        │              CollectionModificationEvent(ctx, collection, chunk)
         │                    │
         │                    ▼
         │              搜索索引更新 / 其他下游处理
@@ -636,23 +864,36 @@ Product/Variant 变更
                                │
                                ▼
                          搜索索引与 DB 不一致
+
+  ┌─ 预览链路（对照）──────────────────────────────────────────┐
+  │ previewCollectionVariants(ctx, input):                      │
+  │   1. getCollectionFiltersFromInput(input)                   │
+  │   2. if input.parentId && input.inheritFilters:             │
+  │        parentFilters = findOne(parentId).filters             │
+  │        ancestorFilters = getAncestors(parentId).reduce(...)  │
+  │        ⚠️ 不检查祖先的 inheritFilters 截断                  │
+  │   3. 合并 [inputFilters, parentFilters, ancestorFilters]     │
+  │   4. listQueryBuilder.build() (带 channelId 限制)            │
+  │   5. 返回 PaginatedList<ProductVariant>                      │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 九、已识别问题汇总
+## 十、已识别问题汇总
 
 | # | 问题 | 位置 | 严重性 | 触发条件 |
 |---|---|---|---|---|
-| 1 | facetValueIds 空 + OR 分支缺少显式处理 | `default-collection-filters.ts:120-125` | 低 | 空 IDs + OR 模式，且为唯一 filter |
+| 1 | 预览链路不遵循 inheritFilters 截断 | `collection.service.ts:496-504` | 中 | 预览 inheritFilters=false 的 Collection，前端传 inheritFilters=true |
 | 2 | 非列表 ID 编码多做 `JSON.stringify` | `configurable-operation-codec.ts:75-76` | 中 | 自定义 Filter 使用 `type:'ID', list:false` 且启用非恒等 EntityIdStrategy |
 | 3 | 事务失败后仍返回预期变更 ID | `collection.service.ts:802-830` | 高 | 事务执行失败（如死锁、超时） |
 | 4 | JobBuffer 合并吞噬空数组"全量"语义 | `collection-job-buffer.ts:16-18` | 高 | 缓冲中混合"全量"Job 和"指定"Job |
 | 5 | JobBuffer 合并错误取 `applyToChangedVariantsOnly` | `collection-job-buffer.ts:27` | 高 | 缓冲中混合 `true` 和 `false` 的 Job |
+| 6 | JobBuffer reduce 固定用 referenceJob.ctx 丢失其他 channel | `collection-job-buffer.ts:26` | 高 | 缓冲中混合来自不同 channel 的 Job |
 
 ---
 
-## 十、关键文件索引
+## 十一、关键文件索引
 
 | 文件 | 核心职责 |
 |---|---|
@@ -662,10 +903,14 @@ Product/Variant 变更
 | `core/src/entity/collection/collection.entity.ts:70` | filters 以 `simple-json` 存储 |
 | `core/src/entity/collection/collection.entity.ts:75` | inheritFilters 字段 |
 | `core/src/service/services/collection.service.ts:104-126` | 事件监听 + 防抖触发 |
+| `core/src/service/services/collection.service.ts:489-527` | 预览链路 ⚠️ inheritFilters 截断缺失 |
 | `core/src/service/services/collection.service.ts:728-837` | 核心归组算法（CTE 差量） |
+| `core/src/service/services/collection.service.ts:843-855` | getAncestorFilters 有截断 |
 | `core/src/service/services/collection.service.ts:802-827` | 事务执行与错误处理 ⚠️ |
 | `core/src/service/services/collection.service.ts:674-676` | 全局开关 setApplyAllFiltersOnProductUpdates |
 | `core/src/service/services/collection.service.ts:687-702` | triggerApplyFiltersJob 入口 |
+| `core/src/service/services/collection.service.ts:130-134` | Job 处理中从 ctx 恢复 RequestContext |
+| `core/src/service/services/collection.service.ts:136-143` | 空 collectionIds 时跨 channel 查全部 Collection |
 | `core/src/api/common/configurable-operation-codec.ts:28-52` | 解码：GraphQL → DB 的 ID 转换 |
 | `core/src/api/common/configurable-operation-codec.ts:57-82` | 编码：DB → GraphQL 的 ID 转换 ⚠️ |
 | `core/src/api/resolvers/admin/collection.resolver.ts:117,130` | Resolver 层调用 decode |
@@ -679,3 +924,4 @@ Product/Variant 变更
 | `core/src/job-queue/job-buffer/job-buffer.ts` | JobBuffer 接口定义 |
 | `core/src/job-queue/job-buffer/job-buffer.service.ts` | 缓冲存储、flush、reduce 调度 |
 | `core/src/service/helpers/config-arg/config-arg.service.ts:72-80` | parseInput 将 API 输入转为存储格式 |
+| `core/src/api/schema/admin-api/collection.api.graphql:69-73` | PreviewCollectionVariantsInput 定义 |
