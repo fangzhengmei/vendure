@@ -628,35 +628,49 @@ async forAllocation(ctx, stockLocations, orderLine, quantity) {
 
 #### 7.1.1 计算逻辑的关键特性
 
-**逐仓累加算法**：
+**逐仓累加算法（有 bug）**：
 ```
 输入：需求 quantity = 10
 对每个仓库（按配置顺序）：
   计算该仓可售量 = stockOnHand - stockAllocated - threshold
   如果可售量 > 0：
-    分配量 = min(需求总量, 可售量)  ← 注意：不是 min(剩余需求, 可售量)
+    分配量 = min(需求总量, 可售量)  ← ❌ 应该是 min(剩余需求, 可售量)
     累计 totalAllocated += 分配量
   如果 totalAllocated >= 需求总量：退出循环
 ```
 
-**示例（需求 10 件）**：
-- 仓库 A：可售 6 件 → 分配 `min(10, 6) = 6`，累计 6
-- 仓库 B：可售 5 件 → 分配 `min(10, 5) = 5`，累计 11
-- `totalAllocated(11) >= 需求(10)` → 退出
-- **实际返回**：A=6, B=5（共 11 件，超过需求）
+**反例（需求 10 件）**：
+- 仓库 A：可售 7 件 → 分配 `min(10, 7) = 7`，累计 7
+- 仓库 B：可售 8 件 → 分配 `min(10, 8) = 8`，累计 15
+- `totalAllocated(15) >= 需求(10)` → 退出
+- **实际返回**：A=7, B=8（共 15 件，超额分配 5 件！）
 
-**看似的 bug 实际不是 bug**：
+**这是真实的 bug**：
 - `Math.min(quantity, quantityAvailable)` 这里用的是**原始需求**而非剩余需求
-- 但后面有 `totalAllocated >= quantity` 的 break 条件
-- 实际效果：第一个仓库分配 `min(需求, 可售)`，第二个仓库也分配 `min(需求, 可售)`，直到累计满足需求
-- **最终分配总量可能略超过需求**，但 `createAllocationsForOrderLines` 中会按实际返回的 `quantityToAllocate` 逐个仓库更新库存
+- `totalAllocated >= quantity` 的 break 条件无法阻止超额分配
+- 因为第二个仓库的 `min(10, 8) = 8` 直接把总量推到了 15
+- `createAllocationsForOrderLines` 中会按返回的 `quantityToAllocate` **直接更新库存**，没有任何裁剪逻辑
+
+**对比：getLocationsBasedOnAllocations 是正确的实现**：
+```typescript
+let unallocated = quantity;  // 跟踪剩余需求
+for (const allocation of allocations) {
+    const qtyToAdd = Math.min(allocation.quantity, unallocated);  // ✅ 用剩余需求
+    unallocated -= qtyToAdd;  // 递减剩余需求
+}
+```
 
 #### 7.1.2 对库存一致性的影响
 
 这个算法有两个重要特性：
 
-1. **支持超额分配**：如果最后一个仓库的分配导致 `totalAllocated > quantity`，仍然会返回超额的分配
+1. **确实会超额分配**：当需要跨多个仓库分配时，最终分配总量 `sum(quantityToAllocate)` **可能显著超过** `quantity`
 2. **按仓库顺序优先分配**：排在前面的仓库优先被分配（类似于货架从左到右取货）
+
+**超额分配的实际影响**：
+- StockLevel.stockAllocated 会被多扣，导致可售量被不必要地压低
+- 后续的 Sale 操作跟随 Allocation 记录，也会多扣 stockOnHand
+- 这是一个"累积性"bug——分配时超额多少，后续操作都会延续这个误差
 
 **对可售量判断的影响**：
 - 分配前计算的 `quantityAvailable` 基于查询时的 StockLevel 快照
@@ -915,6 +929,110 @@ const cancellation = new Cancellation({
 - StockLevel 更新的 `change` 参数 = 该仓库实际发生的变动数量
 
 这样就可以安全地通过 StockMovement 审计日志反推库存状态。
+
+---
+
+### 7.5 库存一致性判断：可直接复用的结论
+
+综合以上分析，以下是可以直接复用的库存一致性判断结论：
+
+#### 7.5.1 已知 bug 清单
+
+| Bug 位置 | 影响范围 | 严重程度 | 触发条件 |
+|---------|---------|---------|---------|
+| **forAllocation 超额分配** | `MultiChannelStockLocationStrategy.forAllocation()` | ⚠️ 高 | 订单行数量需要从 ≥2 个仓库分配时 |
+| **Sale 记录口径错误** | `createSalesForOrder()` | ⚠️ 高 | 订单行涉及 ≥2 个仓库时 |
+| **Release 记录口径错误** | `createReleasesForOrderLines()` | ⚠️ 高 | 订单行涉及 ≥2 个仓库时 |
+| **Cancellation 记录口径错误** | `createCancellationsForOrderLines()` | ⚠️ 高 | 订单行涉及 ≥2 个仓库时 |
+| **释放查询无排序** | `getLocationsBasedOnAllocations()` | 🟡 中 | 订单行涉及 ≥2 个仓库且部分释放时 |
+
+#### 7.5.2 一致性校验公式（当前代码下）
+
+**✅ 总是成立（StockLevel 自洽）**：
+```
+StockLevel.stockAllocated = sum(Allocation.quantity for this location)
+                          - sum(Release.quantity for this location)
+                          - sum(Sale.quantity for this location)  // 因为 Sale.quantity 是负数
+
+StockLevel.stockOnHand = 初始值
+                       + sum(StockAdjustment.quantity for this location)
+                       + sum(Sale.quantity for this location)    // 因为 Sale.quantity 是负数
+                       + sum(Cancellation.quantity for this location)
+```
+
+注意：以上公式成立**不是因为 StockMovement 记录正确**，而是因为 StockLevel 更新直接用了 `*Location.quantity` 参数，与 StockMovement.quantity 字段无关。
+
+**❌ 不成立（StockMovement 审计不可信）**：
+```
+// 多仓场景下以下公式不成立！
+订单行总销量 ≠ sum(Sale.quantity for this orderLine)
+订单行总释放 ≠ sum(Release.quantity for this orderLine)
+订单行总取消 ≠ sum(Cancellation.quantity for this orderLine)
+```
+
+**⚠️ 谨慎使用（可能受超额分配影响）**：
+```
+// 如果 forAllocation 超额分配了，以下也会失真
+订单行总分配 ≠ sum(Allocation.quantity for this orderLine)
+```
+
+#### 7.5.3 正确的一致性校验方式（绕过 bug）
+
+要做正确的库存对账，**不要直接汇总 StockMovement.quantity**，而是：
+
+**方式 A：按 StockLevel 为准（推荐）**：
+```
+对每个 (variant, location)：
+  expected_stockAllocated = sum(Allocation.quantity where stockLocationId=X)
+                          - sum(Release.quantity where stockLocationId=X)
+                          - sum(Sale.quantity where stockLocationId=X)
+  assert StockLevel.stockAllocated == expected_stockAllocated
+```
+但这仍然依赖 StockMovement.quantity，如果记录口径错误仍然不可信。
+
+**方式 B：通过 OrderLine 反向计算（最可靠）**：
+```
+对每个 OrderLine：
+  total_allocated = sum(Allocation.quantity for this orderLine)
+  total_sold = sum(FulfillmentLine.quantity for this orderLine)
+              - sum(Cancellation.quantity for this orderLine)
+  total_released = ...  // 需要从 OrderModification 等表追溯
+  
+  // 注意：这里用 FulfillmentLine 而不是 Sale，因为 FulfillmentLine 记录的是真实数量
+```
+
+**方式 C：仅校验数量变更方向（保守）**：
+```
+对每个 StockMovement：
+  assert Allocation.quantity > 0
+  assert Release.quantity > 0
+  assert Sale.quantity < 0
+  assert Cancellation.quantity > 0
+  assert StockAdjustment.quantity != 0
+```
+这样至少可以保证每条记录的正负号是正确的。
+
+#### 7.5.4 与记录口径 bug 的关系分析
+
+| 场景 | Allocation 记录 | Sale 记录 | Release 记录 | Cancellation 记录 | StockLevel 最终状态 |
+|------|----------------|----------|-------------|------------------|--------------------|
+| 单仓分配 10 件 | ✅ 10（正确） | ✅ -10（碰巧正确） | ✅ 10（碰巧正确） | ✅ 10（碰巧正确） | ✅ 正确 |
+| 多仓分配 A=7, B=8（超额） | ⚠️ A=7, B=8（合计 15） | ⚠️ A=-10, B=-10（合计 -20） | ⚠️ A=10, B=10（合计 20） | ⚠️ A=10, B=10（合计 20） | ⚠️ 被超额分配污染 |
+| 多仓分配 A=6, B=4（正常） | ✅ A=6, B=4（合计 10） | ⚠️ A=-10, B=-10（合计 -20） | ⚠️ A=10, B=10（合计 20） | ⚠️ A=10, B=10（合计 20） | ✅ 碰巧正确 |
+
+**关键结论**：
+1. **StockLevel 的正确性取决于 `*Location.quantity` 参数**，与 StockMovement.quantity 字段无关
+2. **StockMovement 记录只影响审计和报表**，不影响实际库存扣减
+3. **forAllocation 的超额分配 bug 会污染 StockLevel**——这是唯一能"击穿"到实际库存的 bug
+4. **记录口径 bug 是"表面"bug**——只影响日志，不影响实际库存（但影响对账）
+
+#### 7.5.5 优先级建议
+
+| 修复优先级 | 问题 | 理由 |
+|-----------|------|------|
+| 🔴 最高 | forAllocation 超额分配 | 直接影响 StockLevel 正确性，导致实际库存扣减错误 |
+| 🟡 中等 | Sale/Release/Cancellation 记录口径 | 影响审计和报表，但不影响实际库存 |
+| 🟢 较低 | 释放查询无排序 | 仅影响仓库间分布，总量正确 |
 
 ---
 
