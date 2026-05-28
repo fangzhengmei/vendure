@@ -586,7 +586,339 @@ async forAllocation(ctx, stockLocations, orderLine, quantity) {
 
 ---
 
-## 7. 各 StockMovement 类型对 StockLevel 的影响汇总
+## 7. 多仓分配中的数量累加与库存更新口径对齐分析
+
+本节深入分析 `forAllocation` 的累计分配逻辑，以及 Sale/Release/Cancellation 记录数量与各仓库存扣减之间的关系——这是多仓库场景下最容易产生理解偏差的部分。
+
+### 7.1 forAllocation 的累计分配数量计算逻辑
+
+`MultiChannelStockLocationStrategy.forAllocation()` 负责将订单行的分配需求拆解到多个仓库。
+
+**源码位置**：`packages/core/src/config/catalog/multi-channel-stock-location-strategy.ts:97-136`
+
+```typescript
+async forAllocation(ctx, stockLocations, orderLine, quantity) {
+    const stockLevels = await this.getStockLevelsForVariant(ctx, orderLine.productVariantId);
+    let totalAllocated = 0;
+    const locations: LocationWithQuantity[] = [];
+    
+    for (const stockLocation of stockLocations) {
+        const stockLevel = stockLevels.find(sl => sl.stockLocationId === stockLocation.id);
+        if (stockLevel && await this.stockLevelAppliesToActiveChannel(ctx, stockLevel)) {
+            const quantityAvailable = inventoryNotTracked
+                ? Number.MAX_SAFE_INTEGER
+                : stockLevel.stockOnHand - stockLevel.stockAllocated - effectiveOutOfStockThreshold;
+            
+            if (quantityAvailable > 0) {
+                const quantityToAllocate = Math.min(quantity, quantityAvailable);
+                locations.push({
+                    location: stockLocation,
+                    quantity: quantityToAllocate,
+                });
+                totalAllocated += quantityToAllocate;
+            }
+        }
+        if (totalAllocated >= quantity) {
+            break;
+        }
+    }
+    return locations;
+}
+```
+
+#### 7.1.1 计算逻辑的关键特性
+
+**逐仓累加算法**：
+```
+输入：需求 quantity = 10
+对每个仓库（按配置顺序）：
+  计算该仓可售量 = stockOnHand - stockAllocated - threshold
+  如果可售量 > 0：
+    分配量 = min(需求总量, 可售量)  ← 注意：不是 min(剩余需求, 可售量)
+    累计 totalAllocated += 分配量
+  如果 totalAllocated >= 需求总量：退出循环
+```
+
+**示例（需求 10 件）**：
+- 仓库 A：可售 6 件 → 分配 `min(10, 6) = 6`，累计 6
+- 仓库 B：可售 5 件 → 分配 `min(10, 5) = 5`，累计 11
+- `totalAllocated(11) >= 需求(10)` → 退出
+- **实际返回**：A=6, B=5（共 11 件，超过需求）
+
+**看似的 bug 实际不是 bug**：
+- `Math.min(quantity, quantityAvailable)` 这里用的是**原始需求**而非剩余需求
+- 但后面有 `totalAllocated >= quantity` 的 break 条件
+- 实际效果：第一个仓库分配 `min(需求, 可售)`，第二个仓库也分配 `min(需求, 可售)`，直到累计满足需求
+- **最终分配总量可能略超过需求**，但 `createAllocationsForOrderLines` 中会按实际返回的 `quantityToAllocate` 逐个仓库更新库存
+
+#### 7.1.2 对库存一致性的影响
+
+这个算法有两个重要特性：
+
+1. **支持超额分配**：如果最后一个仓库的分配导致 `totalAllocated > quantity`，仍然会返回超额的分配
+2. **按仓库顺序优先分配**：排在前面的仓库优先被分配（类似于货架从左到右取货）
+
+**对可售量判断的影响**：
+- 分配前计算的 `quantityAvailable` 基于查询时的 StockLevel 快照
+- 但分配时不检查"其他仓库已经分配了多少"，只检查累计总量
+- 这意味着单个仓库的分配决策不考虑其他仓库的分配结果
+
+---
+
+### 7.2 StockMovement 记录数量 vs 库存更新数量：口径不一致问题
+
+这是多仓库场景下的**核心隐蔽问题**：`Sale`/`Release`/`Cancellation` 实体记录的 `quantity` 字段，与实际更新到 `StockLevel` 的数量，使用了不同的口径。
+
+#### 7.2.1 Allocation：口径一致（正确）
+
+**源码位置**：`packages/core/src/service/services/stock-movement.service.ts:172-188`
+
+```typescript
+for (const allocationLocation of allocationLocations) {
+    const allocation = new Allocation({
+        productVariant: new ProductVariant({ id: orderLine.productVariantId }),
+        stockLocation: allocationLocation.location,
+        quantity: allocationLocation.quantity,  // ✅ 用仓库分配的数量
+        orderLine,
+    });
+    allocations.push(allocation);
+
+    if (this.trackInventoryForVariant(productVariant, globalTrackInventory)) {
+        await this.stockLevelService.updateStockAllocatedForLocation(
+            ctx,
+            orderLine.productVariantId,
+            allocationLocation.location.id,
+            allocationLocation.quantity,  // ✅ 同样用仓库分配的数量
+        );
+    }
+}
+```
+
+**口径一致**：Allocation 实体的 `quantity` = StockLevel 更新的 `change`，都是 `allocationLocation.quantity`。
+
+---
+
+#### 7.2.2 Sale：口径不一致（多仓场景有问题）
+
+**源码位置**：`packages/core/src/service/services/stock-movement.service.ts:227-249`
+
+```typescript
+for (const saleLocation of saleLocations) {
+    const sale = new Sale({
+        productVariant,
+        quantity: lineRow.quantity * -1,  // ❌ 用的是订单行总数量！
+        orderLine,
+        stockLocation: saleLocation.location,
+    });
+    sales.push(sale);
+
+    if (this.trackInventoryForVariant(productVariant, globalTrackInventory)) {
+        await this.stockLevelService.updateStockAllocatedForLocation(
+            ctx,
+            orderLine.productVariantId,
+            saleLocation.location.id,
+            -saleLocation.quantity,  // ✅ 用的是当前仓库分配的数量
+        );
+        await this.stockLevelService.updateStockOnHandForLocation(
+            ctx,
+            orderLine.productVariantId,
+            saleLocation.location.id,
+            -saleLocation.quantity,  // ✅ 用的是当前仓库分配的数量
+        );
+    }
+}
+```
+
+**问题点**：
+| 位置 | 使用的数量 | 含义 |
+|------|-----------|------|
+| `Sale.quantity` | `lineRow.quantity * -1` | 订单行**总数量**的负数 |
+| `updateStockAllocatedForLocation` | `-saleLocation.quantity` | 当前仓库的销售数量 |
+| `updateStockOnHandForLocation` | `-saleLocation.quantity` | 当前仓库的销售数量 |
+
+---
+
+#### 7.2.3 Release：口径不一致
+
+**源码位置**：`packages/core/src/service/services/stock-movement.service.ts:338-353`
+
+```typescript
+for (const releaseLocation of releaseLocations) {
+    const release = new Release({
+        productVariant: orderLine.productVariant,
+        quantity: lineInput.quantity,  // ❌ 用的是订单行总数量！
+        orderLine,
+        stockLocation: releaseLocation.location,
+    });
+    releases.push(release);
+    
+    if (this.trackInventoryForVariant(orderLine.productVariant, globalTrackInventory)) {
+        await this.stockLevelService.updateStockAllocatedForLocation(
+            ctx,
+            orderLine.productVariantId,
+            releaseLocation.location.id,
+            -releaseLocation.quantity,  // ✅ 用的是当前仓库释放的数量
+        );
+    }
+}
+```
+
+---
+
+#### 7.2.4 Cancellation：口径不一致
+
+**源码位置**：`packages/core/src/service/services/stock-movement.service.ts:288-304`
+
+```typescript
+for (const cancellationLocation of cancellationLocations) {
+    const cancellation = new Cancellation({
+        productVariant: orderLine.productVariant,
+        quantity: lineInput.quantity,  // ❌ 用的是订单行总数量！
+        orderLine,
+        stockLocation: cancellationLocation.location,
+    });
+    cancellations.push(cancellation);
+
+    if (this.trackInventoryForVariant(orderLine.productVariant, globalTrackInventory)) {
+        await this.stockLevelService.updateStockOnHandForLocation(
+            ctx,
+            orderLine.productVariantId,
+            cancellationLocation.location.id,
+            cancellationLocation.quantity,  // ✅ 用的是当前仓库取消的数量
+        );
+    }
+}
+```
+
+---
+
+### 7.3 口径不一致的实际影响
+
+#### 7.3.1 单仓库场景：碰巧正确
+
+如果订单行的分配/销售/释放/取消都只涉及一个仓库：
+- `allocationLocations.length = 1`
+- `saleLocation.quantity = lineRow.quantity`
+- 此时 `Sale.quantity = lineRow.quantity * -1` 恰好等于实际扣减数量
+- **结果：StockMovement 记录与库存更新一致**
+
+这就是为什么单仓库场景下没有暴露这个问题。
+
+---
+
+#### 7.3.2 多仓库场景：审计日志失真
+
+**示例场景**：
+- 订单行数量：10 件
+- 仓库分配：A 仓 6 件，B 仓 4 件（通过 `getLocationsBasedOnAllocations` 跟随原始分配）
+
+**Sale 创建过程**：
+```
+循环处理每个 saleLocation：
+
+  仓库 A：
+    Sale.quantity = 10 * -1 = -10  ← 记录的是总数量
+    updateStockAllocatedForLocation(A, -6)  ← 实际扣减 6
+    updateStockOnHandForLocation(A, -6)      ← 实际扣减 6
+
+  仓库 B：
+    Sale.quantity = 10 * -1 = -10  ← 记录的是总数量
+    updateStockAllocatedForLocation(B, -4)  ← 实际扣减 4
+    updateStockOnHandForLocation(B, -4)      ← 实际扣减 4
+```
+
+**结果对比**：
+| 维度 | 期望值 | 实际值 | 偏差 |
+|------|-------|-------|------|
+| StockLevel.stockAllocated 变化 | -10 | -10 | ✅ 正确 |
+| StockLevel.stockOnHand 变化 | -10 | -10 | ✅ 正确 |
+| Sale 记录 quantity 总和 | -10 | -20 | ❌ 翻倍！ |
+
+---
+
+#### 7.3.3 对库存一致性判断的连锁影响
+
+1. **审计日志不可信**：
+   - 不能通过 `sum(Sale.quantity)` 反推总销量
+   - 不能通过 `sum(Allocation.quantity) - sum(Release.quantity)` 反推当前 allocated
+   - 不能通过 `sum(StockAdjustment.quantity) - sum(Sale.quantity) + sum(Cancellation.quantity)` 反推 stockOnHand
+
+2. **报表和分析失真**：
+   - 如果按 StockMovement 表做销售报表，多仓订单会被重复计算
+   - 按仓库分组的销量统计完全错误（每个仓库都记录了总销量）
+
+3. **业务对账困难**：
+   - 财务系统按订单行对账：10 件销量 ✓
+   - 库存系统按 StockLevel 扣减：10 件 ✓
+   - 审计系统按 StockMovement 汇总：20 件 ✗
+   - 三方对账不一致
+
+4. **测试用例的局限性**：
+   - 现有 E2E 测试大多使用单仓库场景（`DefaultStockLocationStrategy`）
+   - 多仓库 E2E 测试（`stock-control-multi-location.e2e-spec.ts`）只验证了 StockLevel 的最终状态，没有断言 StockMovement 记录的数量
+
+---
+
+### 7.4 问题根源与修复方向
+
+#### 7.4.1 问题根源
+
+代码注释暗示了最初的设计假设：
+
+```typescript
+// Sale 实体的 quantity 字段在单仓库场景下是正确的
+// 但多仓库引入后，没有同步更新这三处的 quantity 赋值
+```
+
+本质是**多仓重构时的遗漏**：
+- `Allocation` 在多仓重构时被正确修改了（使用 `allocationLocation.quantity`）
+- `Sale`/`Release`/`Cancellation` 三处遗漏了类似的修改
+
+#### 7.4.2 修复方案
+
+统一使用 `*Location.quantity` 作为 StockMovement 记录的数量：
+
+**Sale 的修复**：
+```typescript
+const sale = new Sale({
+    productVariant,
+    quantity: saleLocation.quantity * -1,  // ✅ 改为 saleLocation.quantity
+    orderLine,
+    stockLocation: saleLocation.location,
+});
+```
+
+**Release 的修复**：
+```typescript
+const release = new Release({
+    productVariant: orderLine.productVariant,
+    quantity: releaseLocation.quantity,  // ✅ 改为 releaseLocation.quantity
+    orderLine,
+    stockLocation: releaseLocation.location,
+});
+```
+
+**Cancellation 的修复**：
+```typescript
+const cancellation = new Cancellation({
+    productVariant: orderLine.productVariant,
+    quantity: cancellationLocation.quantity,  // ✅ 改为 cancellationLocation.quantity
+    orderLine,
+    stockLocation: cancellationLocation.location,
+});
+```
+
+#### 7.4.3 修复后的一致性保证
+
+修复后，所有 StockMovement 类型都遵循同一规则：
+- StockMovement 实体的 `quantity` 字段 = 该仓库实际发生的变动数量
+- StockLevel 更新的 `change` 参数 = 该仓库实际发生的变动数量
+
+这样就可以安全地通过 StockMovement 审计日志反推库存状态。
+
+---
+
+## 8. 各 StockMovement 类型对 StockLevel 的影响汇总
 
 | StockMovement 类型 | stockOnHand | stockAllocated | saleable 变化 |
 |-------------------|-------------|----------------|--------------|
@@ -599,9 +931,9 @@ async forAllocation(ctx, stockLocations, orderLine, quantity) {
 
 ---
 
-## 8. 并发安全分析
+## 9. 并发安全分析
 
-### 8.1 现有实现的并发模型
+### 9.1 现有实现的并发模型
 
 `StockLevelService` 的更新使用"先读后写"模式：
 
@@ -625,7 +957,7 @@ TypeORM 的 `update()` 生成 `UPDATE stock_level SET stockOnHand = ? WHERE id =
 
 所以对于**同一订单**的操作不存在并发问题。但**不同订单同时分配同一 SKU** 的场景下确实存在竞态条件。
 
-### 8.2 可售量检查与分配之间的时间窗口
+### 9.2 可售量检查与分配之间的时间窗口
 
 ```
 时刻 T1: 订单 A 检查可售量 = 5 ✓
@@ -636,7 +968,7 @@ TypeORM 的 `update()` 生成 `UPDATE stock_level SET stockOnHand = ? WHERE id =
 
 这是典型的 TOCTOU（Time-of-Check-to-Time-of-Use）问题。Vendure 通过 `outOfStockThreshold` 允许设为负值来"容忍"超卖（back order），而非通过数据库锁来防止。
 
-### 8.3 对并发安全有实际保障的机制
+### 9.3 对并发安全有实际保障的机制
 
 1. **TypeORM 的 `@Transaction()`**：同一事务内的操作具有数据库隔离级别保证
 2. **OrderStateMachine**：同一订单的状态转换是串行的，不会并发
@@ -645,7 +977,7 @@ TypeORM 的 `update()` 生成 `UPDATE stock_level SET stockOnHand = ? WHERE id =
 
 ---
 
-## 9. 关键源码文件索引
+## 10. 关键源码文件索引
 
 | 文件 | 职责 |
 |------|------|
