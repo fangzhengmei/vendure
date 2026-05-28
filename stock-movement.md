@@ -333,7 +333,170 @@ interface StockLocationStrategy {
 
 **关键设计**：Release/Sale/Cancellation **跟随 Allocation 的仓库分布**，而不是重新分配。这确保了"从哪个仓库分配的，就还给哪个仓库"。
 
-### 5.3 MultiChannelStockLocationStrategy 的 forAllocation
+### 5.3 释放路径的查询顺序约束与时序稳定性分析
+
+`BaseStockLocationStrategy.getLocationsBasedOnAllocations()` 是 Release、Sale、Cancellation 三个操作的共用核心逻辑，其实现对仓库选择顺序有重大影响。
+
+**源码位置**：`packages/core/src/config/catalog/default-stock-location-strategy.ts:61-92`
+
+```typescript
+private async getLocationsBasedOnAllocations(
+    ctx: RequestContext,
+    stockLocations: StockLocation[],
+    orderLine: OrderLine,
+    quantity: number,
+) {
+    const allocations = await this.connection.getRepository(ctx, Allocation).find({
+        where: {
+            orderLine: { id: orderLine.id },
+        },
+    });
+    let unallocated = quantity;
+    const quantityByLocationId = new Map<ID, number>();
+    for (const allocation of allocations) {
+        if (unallocated <= 0) {
+            break;
+        }
+        const qtyAtLocation = quantityByLocationId.get(allocation.stockLocationId);
+        const qtyToAdd = Math.min(allocation.quantity, unallocated);
+        if (qtyAtLocation != null) {
+            quantityByLocationId.set(allocation.stockLocationId, qtyAtLocation + qtyToAdd);
+        } else {
+            quantityByLocationId.set(allocation.stockLocationId, qtyToAdd);
+        }
+        unallocated -= qtyToAdd;
+    }
+    return [...quantityByLocationId.entries()].map(([locationId, qty]) => ({
+        location: stockLocations.find(l => idsAreEqual(l.id, locationId))!,
+        quantity: qty,
+    }));
+}
+```
+
+#### 5.3.1 查询顺序约束的缺失
+
+**关键问题**：代码中的 `.find()` 查询**没有指定 `order` 排序条件**。
+
+```typescript
+// ❌ 没有排序约束
+const allocations = await this.connection.getRepository(ctx, Allocation).find({
+    where: { orderLine: { id: orderLine.id } },
+});
+```
+
+这意味着：
+1. TypeORM 不会在 SQL 中添加 `ORDER BY` 子句
+2. 查询结果的顺序完全由数据库的**默认排序行为**决定
+3. SQL 标准规定：没有 `ORDER BY` 的查询结果顺序是**未定义**的
+
+#### 5.3.2 不同数据库下可能出现的顺序差异
+
+不同数据库在无 `ORDER BY` 时的默认排序行为不一致：
+
+| 数据库 | 默认排序行为 | 顺序稳定性 |
+|--------|-------------|-----------|
+| **MySQL / MariaDB** | 通常按 `PRIMARY KEY`（id）升序返回 | ✅ 相对稳定（只要主键是自增） |
+| **PostgreSQL** | 按物理存储顺序（`ctid`）返回 | ❌ 不稳定（VACUUM、UPDATE 后可能改变） |
+| **SQLite** | 按 `rowid` 顺序返回 | ✅ 相对稳定（只要没有 DELETE） |
+| **SQL Server** | 按聚集索引顺序返回 | ✅ 相对稳定 |
+
+**实际风险场景**：
+- **MySQL 自动增量主键**：通常按 id 升序 → 按 Allocation 创建时间先后 → FIFO（先分配的先释放）
+- **UUID 主键策略**：完全无序 → 释放顺序不确定
+- **PostgreSQL 表经历大量更新后**：物理存储碎片化 → 查询顺序随机化
+
+#### 5.3.3 对可用量判断的影响
+
+释放顺序的不确定性会直接影响**各仓库的库存分布**，进而影响后续的分配决策。
+
+**示例场景**：
+
+假设订单行在两个仓库有分配：
+- 仓库 A（id=1）：Allocation 数量 5
+- 仓库 B（id=2）：Allocation 数量 5
+- 现在要部分释放 5 件
+
+**场景 1：MySQL + 自增主键，Allocation A 先创建**
+```
+遍历顺序：A → B
+释放结果：A 释放 5，B 释放 0
+各仓库释放后 allocated：A=0, B=5
+```
+
+**场景 2：PostgreSQL + 碎片化存储，随机先返回 B**
+```
+遍历顺序：B → A
+释放结果：B 释放 5，A 释放 0
+各仓库释放后 allocated：A=5, B=0
+```
+
+**对后续可用量的连锁影响**：
+
+假设仓库 A 的 `stockOnHand = 10`，仓库 B 的 `stockOnHand = 0`（B 已补货）：
+
+| 释放结果 | A 可售量 | B 可售量 | 后续订单能否从 B 分配 |
+|---------|---------|---------|-------------------|
+| 场景 1（A 全释放） | `10 - 0 = 10` | `0 - 5 = -5` | ❌ B 仍被占用 5 件 |
+| 场景 2（B 全释放） | `10 - 5 = 5` | `0 - 0 = 0` | ✅ B 释放了，可重新分配 |
+
+**关键影响**：
+1. **仓库间库存流转不均**：随机顺序导致某些仓库的 allocated 永远先被释放，另一些持续"积压"
+2. **跨仓调拨判断失真**：如果基于 allocated 做调拨决策，顺序不稳定会导致决策反复
+3. **测试不可重现**：同一测试用例在不同数据库环境下可能得到不同结果
+
+#### 5.3.4 与 OrderModifier 中汇总逻辑的对比
+
+有趣的是，`OrderModifier.cancelOrderByOrderLines()` 中计算 `totalAllocated` 时也有类似的无排序查询：
+
+**源码位置**：`packages/core/src/service/helpers/order-modifier/order-modifier.ts:281-302`
+
+```typescript
+const allocationsForLine = await this.connection
+    .getRepository(ctx, Allocation)
+    .createQueryBuilder('allocation')
+    .leftJoinAndSelect('allocation.orderLine', 'orderLine')
+    .where('orderLine.id = :orderLineId', { orderLineId: lineInput.orderLineId })
+    .getMany();  // 同样没有 .orderBy()
+```
+
+但这里**顺序不影响结果**，因为最后是用 `summate()` 做纯汇总：
+
+```typescript
+const totalAllocated =
+    summate(allocationsForLine, 'quantity') +
+    summate(salesForLine, 'quantity') -
+    summate(releasesForLine, 'quantity');
+```
+
+**对比结论**：
+- `OrderModifier` 的汇总逻辑：无排序 → ✅ 不影响正确性
+- `getLocationsBasedOnAllocations` 的分配逻辑：无排序 → ❌ 影响仓库选择，可能产生业务偏差
+
+#### 5.3.5 修复方向（当前代码未实现）
+
+如果要保证释放顺序的确定性，可以：
+
+**方案 A：按创建时间排序（FIFO）**
+```typescript
+const allocations = await this.connection.getRepository(ctx, Allocation).find({
+    where: { orderLine: { id: orderLine.id } },
+    order: { createdAt: 'ASC' },  // 先创建的先释放
+});
+```
+
+**方案 B：按仓库优先级排序（LILO，Last-In-Last-Out）**
+```typescript
+const allocations = await this.connection.getRepository(ctx, Allocation).find({
+    where: { orderLine: { id: orderLine.id } },
+    order: { createdAt: 'DESC' },  // 后创建的先释放
+});
+```
+
+**方案 C：按仓库优先级+创建时间混合排序**
+- 结合 `StockLocationStrategy` 的优先级逻辑
+- 释放时优先从优先级低的仓库释放（保持高优先级仓库的占用状态）
+
+### 5.4 MultiChannelStockLocationStrategy 的 forAllocation
 
 `packages/core/src/config/catalog/multi-channel-stock-location-strategy.ts:97`
 
