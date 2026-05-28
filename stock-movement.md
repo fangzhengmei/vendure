@@ -932,107 +932,231 @@ const cancellation = new Cancellation({
 
 ---
 
-### 7.5 库存一致性判断：可直接复用的结论
+### 7.5 库存一致性判断：可执行核对口径
 
-综合以上分析，以下是可以直接复用的库存一致性判断结论：
+本节彻底修正之前的口径矛盾，明确哪些可直接用于对账，哪些仅作为风险提示。
 
-#### 7.5.1 已知 bug 清单
+#### 7.5.1 已知 bug 清单（按影响维度分类）
 
-| Bug 位置 | 影响范围 | 严重程度 | 触发条件 |
+| Bug 位置 | 影响维度 | 严重程度 | 触发条件 |
 |---------|---------|---------|---------|
-| **forAllocation 超额分配** | `MultiChannelStockLocationStrategy.forAllocation()` | ⚠️ 高 | 订单行数量需要从 ≥2 个仓库分配时 |
-| **Sale 记录口径错误** | `createSalesForOrder()` | ⚠️ 高 | 订单行涉及 ≥2 个仓库时 |
-| **Release 记录口径错误** | `createReleasesForOrderLines()` | ⚠️ 高 | 订单行涉及 ≥2 个仓库时 |
-| **Cancellation 记录口径错误** | `createCancellationsForOrderLines()` | ⚠️ 高 | 订单行涉及 ≥2 个仓库时 |
-| **释放查询无排序** | `getLocationsBasedOnAllocations()` | 🟡 中 | 订单行涉及 ≥2 个仓库且部分释放时 |
+| **forAllocation 超额分配** | StockLevel 实际值 | 🔴 高 | 订单行需要从 ≥2 个仓库分配时 |
+| **Sale 记录口径错误** | StockMovement 记录值 | 🟡 中 | 订单行涉及 ≥2 个仓库时 |
+| **Release 记录口径错误** | StockMovement 记录值 | 🟡 中 | 订单行涉及 ≥2 个仓库时 |
+| **Cancellation 记录口径错误** | StockMovement 记录值 | 🟡 中 | 订单行涉及 ≥2 个仓库时 |
+| **释放查询无排序** | 仓库间分布 | 🟢 低 | 订单行涉及 ≥2 个仓库且部分释放时 |
 
-#### 7.5.2 一致性校验公式（当前代码下）
+**影响维度定义**：
+- **StockLevel 实际值**：直接影响库存扣减结果，影响可售量计算
+- **StockMovement 记录值**：仅影响审计日志，不影响实际库存
+- **仓库间分布**：影响仓库间库存分布，总量正确
 
-**✅ 总是成立（StockLevel 自洽）**：
+---
+
+#### 7.5.2 修正后的一致性校验公式
+
+**⚠️ 之前的"恒成立公式"是错误的！** 以下是修正后的结论：
+
+##### ✅ 可直接用于对账的公式（100% 可信）
+
+这些公式不依赖 StockMovement.quantity 字段，可以安全用于对账：
+
 ```
-StockLevel.stockAllocated = sum(Allocation.quantity for this location)
-                          - sum(Release.quantity for this location)
-                          - sum(Sale.quantity for this location)  // 因为 Sale.quantity 是负数
+1. 订单行已分配总量（按 Allocation 汇总）
+   sum(Allocation.quantity for this OrderLine) = 各仓分配总量
 
-StockLevel.stockOnHand = 初始值
-                       + sum(StockAdjustment.quantity for this location)
-                       + sum(Sale.quantity for this location)    // 因为 Sale.quantity 是负数
-                       + sum(Cancellation.quantity for this location)
+2. 订单行已发货总量（按 FulfillmentLine 汇总）
+   sum(FulfillmentLine.quantity for this OrderLine)
+     - sum(Cancellation.quantity for this OrderLine)
+   = 真实发货总量
+
+3. StockLevel 总量校验（variant 维度）
+   对每个 (productVariantId, stockLocationId):
+     StockLevel.stockAllocated = 初始值
+       + sum(Allocation where variant=X and location=Y).quantity
+       - sum(Release where variant=X and location=Y).quantity  ← 但 Release.quantity 口径错误！
+       - sum(Sale where variant=X and location=Y).quantity      ← 但 Sale.quantity 口径错误！
+   
+   ❌ 以上公式在多仓场景下不成立！
 ```
 
-注意：以上公式成立**不是因为 StockMovement 记录正确**，而是因为 StockLevel 更新直接用了 `*Location.quantity` 参数，与 StockMovement.quantity 字段无关。
+**正确的 StockLevel 校验方式**：
+- **不通过 StockMovement 反推**——因为 StockMovement.quantity 不可信
+- **直接信任 StockLevel 表**——它是唯一反映真实库存的数据源
+- **通过业务单据反向验证**——用 Fulfillment、OrderModification 等业务表
 
-**❌ 不成立（StockMovement 审计不可信）**：
+---
+
+##### ❌ 绝对不能用的公式（多仓场景下必然错误）
+
+这些公式在多仓场景下完全错误，绝不能用于对账：
+
 ```
-// 多仓场景下以下公式不成立！
-订单行总销量 ≠ sum(Sale.quantity for this orderLine)
-订单行总释放 ≠ sum(Release.quantity for this orderLine)
-订单行总取消 ≠ sum(Cancellation.quantity for this orderLine)
+1. ❌ 错误：订单行销量 = sum(Sale.quantity for this OrderLine)
+   正确：订单行销量 = sum(FulfillmentLine.quantity) - sum(Cancellation.quantity)
+
+2. ❌ 错误：订单行释放量 = sum(Release.quantity for this OrderLine)
+   正确：订单行释放量 = 从 OrderModification 追溯
+
+3. ❌ 错误：订单行取消量 = sum(Cancellation.quantity for this OrderLine)
+   正确：订单行取消量 = sum(Cancellation.quantity)  ← 这个其实是对的？
+
+4. ❌ 错误：按仓库汇总销量 = sum(Sale.quantity where stockLocationId=X)
+   正确：按仓库汇总销量 = 从 FulfillmentLine + StockLocation 关联查询
 ```
 
-**⚠️ 谨慎使用（可能受超额分配影响）**：
+---
+
+##### ⚠️ 仅可用于单仓场景的公式（碰巧正确）
+
+这些公式在单仓场景下碰巧正确，但多仓场景下错误，**不推荐使用**：
+
 ```
-// 如果 forAllocation 超额分配了，以下也会失真
-订单行总分配 ≠ sum(Allocation.quantity for this orderLine)
+// 仅当 DefaultStockLocationStrategy（单仓）时成立：
+sum(Sale.quantity for this OrderLine) = -订单行销量
+sum(Release.quantity for this OrderLine) = 订单行释放量
+sum(Cancellation.quantity for this OrderLine) = 订单行取消量
 ```
 
-#### 7.5.3 正确的一致性校验方式（绕过 bug）
+**建议**：即使当前是单仓场景，也不要使用这些公式，避免未来切换多仓时出现隐性错误。
 
-要做正确的库存对账，**不要直接汇总 StockMovement.quantity**，而是：
+---
 
-**方式 A：按 StockLevel 为准（推荐）**：
-```
-对每个 (variant, location)：
-  expected_stockAllocated = sum(Allocation.quantity where stockLocationId=X)
-                          - sum(Release.quantity where stockLocationId=X)
-                          - sum(Sale.quantity where stockLocationId=X)
-  assert StockLevel.stockAllocated == expected_stockAllocated
-```
-但这仍然依赖 StockMovement.quantity，如果记录口径错误仍然不可信。
+#### 7.5.3 可执行核对清单（按优先级排序）
 
-**方式 B：通过 OrderLine 反向计算（最可靠）**：
+##### 🔴 Level 1：核心库存一致性（必须校验）
+
+**校验对象**：StockLevel 表 × 业务单据
+
+**校验方式**：不依赖 StockMovement，直接用业务单据反向验证
+
 ```
-对每个 OrderLine：
-  total_allocated = sum(Allocation.quantity for this orderLine)
-  total_sold = sum(FulfillmentLine.quantity for this orderLine)
-              - sum(Cancellation.quantity for this orderLine)
-  total_released = ...  // 需要从 OrderModification 等表追溯
+对每个 ProductVariant：
+  -- 总已分配 = sum(StockLevel.stockAllocated for all locations)
   
-  // 注意：这里用 FulfillmentLine 而不是 Sale，因为 FulfillmentLine 记录的是真实数量
+  -- 通过业务单据计算理论已分配：
+  理论已分配 = sum(
+    for each OrderLine in (ArrangingPayment, PaymentAuthorized, PaymentSettled):
+      if 未发货部分数量
+  )
+  
+  -- 容差：考虑并发和超时未处理的订单
+  
+  assert |实际已分配 - 理论已分配| <= 容差
 ```
 
-**方式 C：仅校验数量变更方向（保守）**：
-```
-对每个 StockMovement：
-  assert Allocation.quantity > 0
-  assert Release.quantity > 0
-  assert Sale.quantity < 0
-  assert Cancellation.quantity > 0
-  assert StockAdjustment.quantity != 0
-```
-这样至少可以保证每条记录的正负号是正确的。
+**可执行 SQL 思路**：
+1. 查询所有状态为已支付未发货的 OrderLine
+2. 对每个 OrderLine，计算 `quantity - sum(FulfillmentLine.quantity`
+3. 汇总得到理论 allocated
+4. 与 StockLevel 汇总值对比
 
-#### 7.5.4 与记录口径 bug 的关系分析
+---
 
-| 场景 | Allocation 记录 | Sale 记录 | Release 记录 | Cancellation 记录 | StockLevel 最终状态 |
+##### 🟡 Level 2：StockMovement 完整性（可选校验）
+
+**校验对象**：StockMovement 记录数量是否正确
+
+**校验目的**：发现记录口径 bug，但不影响实际库存
+
+```
+对每个 OrderLine 涉及多仓的：
+  -- Allocation 记录数 = 实际分配的仓库数
+  -- Sale 记录数 = 实际发货的仓库数
+  -- Release 记录数 = 实际释放的仓库数
+  -- Cancellation 记录数 = 实际取消的仓库数
+  
+  -- 每条记录的 quantity 字段：
+     Allocation.quantity = 该仓实际分配数量  ✅ 正确
+     Sale.quantity = 订单行总数量（负数）        ❌ 错误（应为该仓实际发货数量）
+     Release.quantity = 订单行总数量            ❌ 错误（应为该仓实际释放数量）
+     Cancellation.quantity = 订单行总数量        ❌ 错误（应为该仓实际取消数量）
+```
+
+**这是已知的记录口径 bug，多仓场景下必然出现。
+
+---
+
+##### 🟢 Level 3：变更方向校验（ always true）
+
+**校验对象**：StockMovement 的正负号是否正确
+
+**校验目的**：防止正负号错误（最基本的一致性
+
+```
+对每条 StockMovement 记录：
+  ✅ Allocation.quantity > 0
+  ✅ Release.quantity > 0
+  ✅ Sale.quantity < 0
+  ✅ Cancellation.quantity > 0
+  ✅ StockAdjustment.quantity != 0
+```
+
+这个校验总是成立，可以作为最基本的健康检查。
+
+---
+
+#### 7.5.4 各类型 StockMovement 的可信度评级
+
+| StockMovement 类型 | 单仓可信度 | 多仓可信度 | 可用于对账 | 备注 |
+|----------------|------------|------------|------------|------|
+| **Allocation** | ✅ 高 | ✅ 高 | ✅ 是 | forAllocation 无 bug 则正确，否则超额分配影响的是分配逻辑，不是记录口径 |
+| **Sale** | ✅ 高（碰巧） | ❌ 低 | ❌ 否 | 多仓场景下 quantity 是订单行总量，非仓库量 |
+| **Release** | ✅ 高（碰巧） | ❌ 低 | ❌ 否 | 多仓场景下 quantity 是订单行总量，非仓库量 |
+| **Cancellation** | ✅ 高（碰巧） | ❌ 低 | ❌ 否 | 多仓场景下 quantity 是订单行总量，非仓库量 |
+| **StockAdjustment** | ✅ 高 | ✅ 高 | ✅ 是 | 总是正确 |
+
+---
+
+#### 7.5.5 与记录口径 bug 的关系矩阵
+
+| 场景 | Allocation 记录 | Sale 记录 | Release 记录 | Cancellation 记录 | StockLevel 实际值 |
 |------|----------------|----------|-------------|------------------|--------------------|
-| 单仓分配 10 件 | ✅ 10（正确） | ✅ -10（碰巧正确） | ✅ 10（碰巧正确） | ✅ 10（碰巧正确） | ✅ 正确 |
-| 多仓分配 A=7, B=8（超额） | ⚠️ A=7, B=8（合计 15） | ⚠️ A=-10, B=-10（合计 -20） | ⚠️ A=10, B=10（合计 20） | ⚠️ A=10, B=10（合计 20） | ⚠️ 被超额分配污染 |
-| 多仓分配 A=6, B=4（正常） | ✅ A=6, B=4（合计 10） | ⚠️ A=-10, B=-10（合计 -20） | ⚠️ A=10, B=10（合计 20） | ⚠️ A=10, B=10（合计 20） | ✅ 碰巧正确 |
+| **单仓分配 10 件** | ✅ 10 | ✅ -10 | ✅ 10 | ✅ 10 | ✅ 正确 |
+| **多仓 A=6, B=4（正常分配） | ✅ A=6, B=4 | ❌ A=-10, B=-10 | ❌ A=10, B=10 | ❌ A=10, B=10 | ✅ 正确 |
+| **多仓 A=7, B=8（超额分配）** | ❌ A=7, B=8 | ❌ A=-10, B=-10 | ❌ A=10, B=10 | ❌ A=10, B=10 | ❌ 错误（超额 5 件） |
 
 **关键结论**：
-1. **StockLevel 的正确性取决于 `*Location.quantity` 参数**，与 StockMovement.quantity 字段无关
-2. **StockMovement 记录只影响审计和报表**，不影响实际库存扣减
-3. **forAllocation 的超额分配 bug 会污染 StockLevel**——这是唯一能"击穿"到实际库存的 bug
-4. **记录口径 bug 是"表面"bug**——只影响日志，不影响实际库存（但影响对账）
+1. **StockLevel 实际值的正确性 = forAllocation 分配逻辑的正确性**——与记录口径无关
+2. **记录口径 bug 是独立问题**——只影响审计日志，不影响实际库存
+3. **超额分配 bug 是核心问题**——直接污染 StockLevel
+4. **对账时，StockLevel 是唯一可信源**——不要通过 StockMovement 反推
 
-#### 7.5.5 优先级建议
+---
 
-| 修复优先级 | 问题 | 理由 |
-|-----------|------|------|
-| 🔴 最高 | forAllocation 超额分配 | 直接影响 StockLevel 正确性，导致实际库存扣减错误 |
-| 🟡 中等 | Sale/Release/Cancellation 记录口径 | 影响审计和报表，但不影响实际库存 |
-| 🟢 较低 | 释放查询无排序 | 仅影响仓库间分布，总量正确 |
+#### 7.5.6 对账实操建议
+
+**生产环境对账顺序**：
+
+1. **第一步**：校验 StockLevel 与业务单据一致性（Level 1）
+   - 如果不一致 → 检查是否触发了超额分配 bug
+   - 这是最关键的防线
+
+2. **第二步**：校验 StockMovement 记录完整性（Level 2）
+   - 如果不一致 → 检查是否触发了记录口径 bug
+   - 不影响实际库存，但影响报表
+
+3. **第三步**：校验变更方向（Level 3）
+   - 如果不一致 → 严重问题，需要立即修复
+
+**常见问题定位**：
+
+| 现象 | 可能原因 | 影响 | 优先级 |
+|------|---------|------|---------|
+| StockLevel 汇总 ≠ 业务单据计算 | 超额分配 bug | 实际库存错误 | 🔴 立即修复 |
+| StockMovement 汇总 ≠ 订单行数量 | 记录口径 bug | 报表错误 | 🟡 规划修复 |
+| StockMovement 正负号错误 | 代码逻辑错误 | 严重错误 | 🔴 立即修复 |
+| 同一 OrderLine 部分释放时仓库分布不稳定 | 释放查询无排序 | 分布不均 | 🟢 观察即可 |
+
+---
+
+#### 7.5.7 优先级建议（修正版）
+
+| 修复优先级 | 问题 | 理由 | 对账影响 |
+|-----------|------|------|----------|
+| 🔴 最高 | forAllocation 超额分配 | 直接影响 StockLevel 正确性，导致实际库存错误 | 无法通过业务单据对账 |
+| 🟡 中等 | Sale/Release/Cancellation 记录口径 | 影响审计和报表，不影响实际库存 | 无法通过 StockMovement 对账 |
+| 🟢 较低 | 释放查询无排序 | 仅影响仓库间分布，总量正确 | 不影响对账，仅影响仓库分配策略 |
 
 ---
 
