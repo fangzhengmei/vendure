@@ -273,7 +273,7 @@ async delete(ctx: RequestContext, id: ID): Promise<DeletionResponse> {
 
 ---
 
-### 2.1.3 删除路径事件链差异对搜索索引更新的影响
+### 2.1.3 删除路径事件链差异对搜索索引的影响分层分析
 
 **事件订阅配置**:
 
@@ -296,72 +296,103 @@ this.eventBus
     });
 ```
 
-**影响分析**:
+---
 
-1. **场景：删除默认税区的某税率**
-   - 路径：Admin UI → TaxRateService.delete()
-   - 发布事件：仅 `TaxRateEvent`（type = 'deleted'）
-   - DefaultSearchPlugin：不监听 `TaxRateEvent`，因此**不触发重新索引**
-   - 缓存状态：`SelfRefreshingCache` 仍保留已删除的税率数据，直到 TTL 过期
+#### 第一层：事件触发链缺口
 
-2. **搜索索引价格不一致窗口**
-   - 删除操作后 → 缓存 TTL 过期前，搜索查询返回的商品价格仍使用已删除的税率计算
-   - 产品详情页（走 `ProductPriceApplicator`）也可能读到缓存中的旧税率
-   - 管理员在管理后台看到税率已删除，但前端搜索结果仍显示旧价格，直到缓存自动刷新
+| 环节 | create/update 行为 | delete 行为 | 差异点 |
+|------|------------------|-------------|--------|
+| 事件发布 | 发布 `TaxRateModificationEvent` | 不发布 `TaxRateModificationEvent`，仅发布 `TaxRateEvent` | delete 路径缺事件 |
+| 事件监听 | `DefaultSearchPlugin.ofType(TaxRateModificationEvent)` 能捕获 | 监听不到（只监听 TaxRateModificationEvent） | 搜索插件感知不到删除 |
+| 触发重索引 | defaultTaxZone 内变更时调用 `reindex()` | 不会调用 `reindex()` | 删除不触发索引重建 |
 
-3. **与 update/create 的对比**
-   - update/create 发布 `TaxRateModificationEvent`，会触发默认税区税率变更时的全量重索引
-   - delete 没有 `TaxRateModificationEvent`，搜索索引不会感知到税率已删除
-
-**修复方向**：在 `delete()` 方法中补充发布 `TaxRateModificationEvent`，或让 `DefaultSearchPlugin` 同时监听 `TaxRateEvent` 并过滤 type = 'deleted'。
+**问题根源**：`tax-rate.service.ts:170-185` 中 `delete()` 方法只发布了 `TaxRateEvent`，没有发布 `TaxRateModificationEvent`。
 
 ---
 
-### 2.1.4 findAll 方法 categoryId 过滤映射不一致问题
+#### 第二层：索引重建链与缓存 TTL 的边界
 
-**代码位置**: `packages/core/src/service/services/tax-rate.service.ts:83-86`
+搜索索引价格不一致实际由两个独立问题共同导致，边界清晰：
+
+| 问题来源 | 影响对象 | 持续时间 | 影响范围 |
+|---------|---------|---------|----------|
+| 事件触发链缺口 | 搜索索引文档 | **永久**（直到下一次全量重索引） | 搜索查询结果中的产品价格 |
+| 税率缓存不刷新 | TaxRateService 全局缓存 | 直到 `taxRateCacheTtl` 过期（默认？） | 产品详情页、购物车、订单计算 |
+
+**场景还原（删除默认税区的某税率）**：
+
+```
+T0: 删除税率 R
+    ├─→ 事件层：仅发布 TaxRateEvent，DefaultSearchPlugin 不捕获
+    │     └─→ 搜索索引文档中的价格字段永久停留在旧值
+    └─→ 缓存层：TaxRateService 不刷新 SelfRefreshingCache
+          └─→ 缓存内仍包含已删除税率 R，直到 TTL 过期
+
+T0 ~ TTL: 双重不一致
+    - 搜索结果：从索引文档读 → 旧价格（永久）
+    - 产品详情：从缓存读 → 旧税率（临时）
+
+TTL 后: 仅搜索索引不一致
+    - 搜索结果：仍从索引文档读 → 旧价格（永久）
+    - 产品详情：刷新后的缓存已不含 R → 读默认 0% 税率（新行为）
+```
+
+**修复方向**：
+1. 在 `delete()` 方法中补充发布 `TaxRateModificationEvent`（匹配 create/update 行为）
+2. 或让 `DefaultSearchPlugin` 同时监听 `TaxRateEvent` 并过滤 `type = 'deleted'`
+3. 缓存刷新问题可与事件链一同修复：发布 `TaxRateModificationEvent` 时在处理端也调用 `updateActiveTaxRates()`
+
+---
+
+### 2.1.4 findAll 方法 categoryId 过滤映射分析
+
+**代码位置**: `packages/core/src/service/services/tax-rate.service.ts:79-86`
 
 ```typescript
 if (hasZoneIdFilter) {
     effectiveRelations.push('zone');
-    customPropertyMap.zoneId = 'zone.id';           // 正确：zoneId → zone.id
+    customPropertyMap.zoneId = 'zone.id';           // 实际多余
 }
 if (hasCategoryIdFilter) {
     effectiveRelations.push('category');
-    customPropertyMap.zoneId = 'category.id';        // ⚠️ BUG：应该是 categoryId → category.id
+    customPropertyMap.zoneId = 'category.id';      // 键名错误：应该是 categoryId
 }
 ```
 
-**bug 分析**:
-- 第 81 行：`customPropertyMap.zoneId = 'zone.id'` —— 正确，将 `zoneId` 过滤字段映射到关联表 `zone` 的 `id` 字段
-- 第 85 行：`customPropertyMap.zoneId = 'category.id'` —— 错误，使用了相同的键 `zoneId`，**覆盖**了第 81 行的配置
+**过滤执行流程解析** (`parseFilterParams.ts:134-144`):
 
-**ListQueryBuilder 工作机制**:
-- `customPropertyMap` 是 `{ [filterFieldName: string]: string }` 结构
-- `parseFilterParams.ts:141-142` 中通过 `customPropertyMap[key]` 查找过滤字段对应的关联路径
-- 当过滤参数包含 `categoryId` 时，应该用 `customPropertyMap['categoryId']` 查找，但实际写入的是 `customPropertyMap['zoneId']`
+过滤字段的查找按以下优先级顺序：
+1. **实体列** (`columns.find(c => c.propertyName === key)`) → 直接使用 `tax_rate.zoneId`
+2. **翻译列** → 使用关联翻译表
+3. **计算列** → 使用计算列表达式
+4. **customPropertyMap** → 使用关联路径映射
 
-**后果**:
+关键事实：**TaxRate 实体本身就有 `zoneId` 和 `categoryId` 作为实体列**（通过 `@EntityId()` 装饰器定义，存在于 `tax_rate` 表中）。
 
-| 过滤场景 | 实际行为 |
-|----------|----------|
-| 仅 `categoryId` 过滤 | ❌ 抛出 `UserInputError: error.invalid-filter-field`，因为 `customPropertyMap['categoryId']` 不存在 |
-| 仅 `zoneId` 过滤 | ✅ 正常工作，但如果 `hasCategoryIdFilter` 也为 true，会被覆盖为 `category.id`，导致 zoneId 过滤失败 |
-| `zoneId` + `categoryId` 同时过滤 | ❌ zoneId 过滤被覆盖为 `category.id`，实际按 category.id 过滤；categoryId 过滤字段不存在，报错 |
+| 过滤字段 | 是否为实体列 | customPropertyMap 是否参与 | 实际行为 |
+|----------|--------------|--------------------------|------------|
+| zoneId | ✅ 是 | ❌ 不参与（先走实体列分支） | 直接查询 `tax_rate.zoneId`，正常工作 |
+| categoryId | ✅ 是 | ❌ 不参与（先走实体列分支） | 直接查询 `tax_rate.categoryId`，正常工作 |
 
-**正确的写法应该是**:
-```typescript
-if (hasCategoryIdFilter) {
-    effectiveRelations.push('category');
-    customPropertyMap.categoryId = 'category.id';    // 修正：键改为 categoryId
-}
-```
+**代码问题定性**:
+
+1. **customPropertyMap 设置是多余的**：由于 zoneId 和 categoryId 都是实体列，查询时走第 1 步就匹配了，根本不会走到 customPropertyMap 分支
+2. **第 85 行的键名错误**：`customPropertyMap.zoneId = 'category.id'` 是复制粘贴错误，正确应为 `customPropertyMap.categoryId = 'category.id'`
+3. **实际无功能影响**：因为 customPropertyMap 不会被用到，所以这个错误**不会导致实际的 categoryId 过滤失效**
+
+**后果分析**:
+- 单独按 zoneId 过滤：✅ 正常工作（通过实体列）
+- 单独按 categoryId 过滤：✅ 正常工作（通过实体列）
+- 同时按 zoneId + categoryId 过滤：✅ 正常工作（都通过实体列）
+- `effectiveRelations.push()` 也多余地 JOIN 了 zone 和 category 关联，但无副作用
+
+**代码清理方向**：可以直接删除 customPropertyMap 相关逻辑，因为实体列本身就有 zoneId 和 categoryId，完全不需要 customPropertyMap 映射。
 
 ---
 
-### 2.1.5 customerGroup 参与税率匹配时对缓存键的影响
+### 2.1.5 customerGroup 参与税率匹配时的最小改造面与缓存污染风险
 
-当前税率匹配逻辑忽略 `customerGroup`，缓存键设计也没有考虑 `customerGroup`。如果后续修复或自定义策略让 `customerGroup` 参与匹配，以下缓存键需要同步调整。
+当前税率匹配逻辑忽略 `customerGroup`，缓存键设计也没有考虑 `customerGroup`。如果后续修复或自定义策略让 `customerGroup` 参与匹配，以下是最小改造面和不改的后果。
 
 **当前缓存层级与键设计**:
 
@@ -409,10 +440,103 @@ if (hasCategoryIdFilter) {
    - 如果 customerGroup 需要影响税区选择（如 B2B 客户走不同税区），则 `determineTaxZone()` 接口和缓存键都需要调整
 
 **缓存污染风险**:
-如果只修改 `test()` 和 `getApplicableTaxRate()` 加入 customerGroup 匹配，但**忘记更新缓存键**，会出现：
-- VIP 客户先访问，缓存了 VIP 税率（如 0%）
-- 普通客户后访问，命中同一条缓存，错误适用 0% 税率
-- 反之亦然，普通客户缓存的 20% 税率可能被 VIP 客户命中
+如果只修改匹配逻辑但**忘记更新缓存键**，会出现以下具体污染场景：
+
+**场景 1：VIP 客户先访问**
+```
+T0: VIP客户（客户组 G1）访问产品 P（税类 C，税区 Z）
+    ├─→ 查找缓存键 `applicableTaxRate-Z-C` → 未命中
+    ├─→ 查询数据库，匹配 G1 专属税率 0%
+    └─→ 缓存 `applicableTaxRate-Z-C` → 税率 0%
+
+T1: 普通客户（无 customerGroup）访问同一产品 P
+    ├─→ 查找缓存键 `applicableTaxRate-Z-C` → 命中
+    └─→ 错误适用 0% 税率（应为 20%）
+```
+
+**场景 2：普通客户先访问**
+```
+T0: 普通客户访问产品 P
+    ├─→ 查找缓存键 `applicableTaxRate-Z-C` → 未命中
+    ├─→ 查询数据库，匹配通用税率 20%
+    └─→ 缓存 `applicableTaxRate-Z-C` → 税率 20%
+
+T1: VIP客户访问同一产品 P
+    ├─→ 查找缓存键 `applicableTaxRate-Z-C` → 命中
+    └─→ 错误适用 20% 税率（应为 0%，无法享受 VIP 优惠）
+```
+
+两种场景都会导致：订单税费计算错误、前端展示价格异常。
+
+---
+
+#### 最小改造面（仅需改 3 处）
+
+| 改造点 | 文件位置 | 改动内容 |
+|--------|---------|----------|
+| **匹配逻辑** | `tax-rate.entity.ts:94-98` | `test()` 方法补充 customerGroup 参数及判断 |
+| **请求级缓存键** | `product-price-applicator.ts` | 缓存键追加 `-${customerGroupId ?? ''}` |
+| **函数级缓存键** | `order-calculator.ts:createTaxRateGetter` | Map 键改为 `[taxCategoryId, customerGroupId]` 复合键 |
+
+**改动 1：匹配逻辑（TaxRate.test()）**
+```typescript
+// 修改前（当前）
+test(zone: Zone | ID, taxCategory: TaxCategory | ID): boolean {
+    return idsAreEqual(taxCategoryId, this.categoryId) && idsAreEqual(zoneId, this.zoneId);
+}
+
+// 修改后
+test(zone: Zone | ID, taxCategory: TaxCategory | ID, customerGroup?: CustomerGroup | ID): boolean {
+    const zoneMatch = idsAreEqual(zoneId, this.zoneId);
+    const categoryMatch = idsAreEqual(taxCategoryId, this.categoryId);
+    // customerGroup 为 null/undefined 时匹配无 customerGroup 的税率
+    const customerGroupMatch = !this.customerGroupId || 
+        (customerGroup && idsAreEqual(this.isId(customerGroup) ? customerGroup : customerGroup.id, this.customerGroupId));
+    return zoneMatch && categoryMatch && customerGroupMatch;
+}
+```
+
+**改动 2：请求级缓存键（ProductPriceApplicator）**
+```typescript
+// 修改前
+const applicableTaxRate = await this.requestCache.get(
+    ctx,
+    `applicableTaxRate-${activeTaxZone.id}-${variant.taxCategory.id}`,
+    () => this.taxRateService.getApplicableTaxRate(ctx, activeTaxZone, variant.taxCategory),
+);
+
+// 修改后
+const customerGroupId = ctx.activeUserId ? (await this.customerService.getUserGroup(ctx))?.id : null;
+const applicableTaxRate = await this.requestCache.get(
+    ctx,
+    `applicableTaxRate-${activeTaxZone.id}-${variant.taxCategory.id}-${customerGroupId ?? ''}`,
+    () => this.taxRateService.getApplicableTaxRate(ctx, activeTaxZone, variant.taxCategory, customerGroupId),
+);
+```
+
+**改动 3：函数级缓存键（OrderCalculator）**
+```typescript
+// 修改前
+private createTaxRateGetter(ctx: RequestContext, activeZone: Zone): (taxCategoryId: ID) => Promise<TaxRate> {
+    const taxRateCache = new Map<ID, TaxRate>();
+    return async (taxCategoryId: ID): Promise<TaxRate> => {
+        const cached = taxRateCache.get(taxCategoryId);
+        // ...
+    };
+}
+
+// 修改后
+private createTaxRateGetter(ctx: RequestContext, activeZone: Zone, customerGroupId?: ID): (taxCategoryId: ID) => Promise<TaxRate> {
+    const taxRateCache = new Map<string, TaxRate>();  // 键改为 string 复合键
+    const cacheKey = (catId: ID) => `${catId}-${customerGroupId ?? ''}`;
+    return async (taxCategoryId: ID): Promise<TaxRate> => {
+        const cached = taxRateCache.get(cacheKey(taxCategoryId));
+        // ...
+    };
+}
+```
+
+**注**：`TaxRateService.getApplicableTaxRate()` 的全局缓存（`SelfRefreshingCache<TaxRate[]>`）不需要修改，因为它是全量缓存，匹配逻辑在 `Array.find()` 中动态执行。
 
 ---
 
@@ -463,10 +587,6 @@ test(zone: Zone | ID, taxCategory: TaxCategory | ID): boolean {
 - 但 `test()` 方法仅匹配 zone 和 category，完全忽略 customerGroup
 - 因此 `getApplicableTaxRate()` 实际也忽略了 customerGroup
 - 若同一 zone + category 组合下存在多条 TaxRate（仅 customerGroup 不同），`Array.find()` 返回第一条匹配项，结果取决于数据库返回顺序，具有不确定性
-
----
-
-### 2.2 税率匹配逻辑
 
 ```
 输入参数: Zone (税区) + TaxCategory (税类)
@@ -950,6 +1070,6 @@ OrderCalculator.applyPriceAdjustments()
 5. **促销-税费交互**: 促销后重新计算税费，确保税基正确
 6. **降级设计**: 无匹配税率时返回 0%，避免系统异常
 7. **缓存刷新不对称**: create/update 立即刷新缓存，delete 不刷新（依赖 TTL），delete 也不发布 TaxRateModificationEvent
-8. **事件链不一致**: 删除税率仅发布 TaxRateEvent，DefaultSearchPlugin 不监听该事件，导致搜索索引价格与实际不一致
-9. **已知 Bug**: TaxRateService.findAll() 中 categoryId 过滤映射键名错误（写为 zoneId），导致按 categoryId 过滤时报错
-10. **缓存键设计隐患**: 现有缓存键均不含 customerGroup，若未来启用 customerGroup 税率匹配，需同步调整所有缓存键否则会出现缓存污染
+8. **事件链不一致**: 删除税率仅发布 TaxRateEvent，DefaultSearchPlugin 只监听 TaxRateModificationEvent，导致搜索索引价格**永久**不一致（直到全量重索引）
+9. **代码冗余**: TaxRateService.findAll() 中 customPropertyMap 设置多余，categoryId/zoneId 本身就是实体列，直接过滤即可
+10. **缓存键设计隐患**: 现有缓存键（请求级、函数级）均不含 customerGroup，若未来启用 customerGroup 税率匹配，需同步调整 3 处缓存键否则会出现缓存污染（VIP 与普通客户互相命中对方税率）
