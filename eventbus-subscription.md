@@ -5,29 +5,39 @@
 Vendure 的事件系统建立在 NestJS 依赖注入之上，核心组件关系如下：
 
 ```
-┌────────────────────────────────────────────────────────────────┐
-│                        GraphQL Resolver                        │
-│  @Transaction() → TransactionInterceptor → TransactionWrapper  │
-│       │                                                        │
-│       │  ctx (携带 TRANSACTION_MANAGER_KEY)                     │
-│       ▼                                                        │
-│  ┌─────────────┐                                               │
-│  │  Service 层  │ ──── eventBus.publish(new XxxEvent(ctx,…))   │
-│  └─────────────┘           │                                   │
-│                            ▼                                   │
-│                    ┌──────────────┐                             │
-│                    │   EventBus   │ (单例 Subject<VendureEvent>)│
-│                    └──────┬───────┘                             │
-│              ┌────────────┼────────────┐                        │
-│              ▼            ▼            ▼                        │
-│     ofType() 订阅   filter() 订阅  BlockingHandler             │
-│     (异步,等事务)    (异步,等事务)   (同步,阻塞publish)          │
-│              │            │            │                        │
-│              └───── awaitActiveTransactions ────┘               │
-│                     (TransactionSubscriber)                     │
-│                            │                                   │
-│                  TypeORM afterTransactionCommit                 │
-└────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│                        GraphQL Resolver                                │
+│  @Transaction() → TransactionInterceptor → TransactionWrapper          │
+│       │                                                                │
+│       │  ctx (携带 TRANSACTION_MANAGER_KEY)                             │
+│       ▼                                                                │
+│  ┌─────────────┐  ┌──────────────┐  ┌──────────────────────┐          │
+│  │  Service 层  │  │ OrderProcess │  │ 辅助组件              │          │
+│  │  CRUD 发布   │  │ 回调内发布    │  │ OrderModifier        │          │
+│  └──────┬──────┘  └──────┬───────┘  │ FulltextSearchService │          │
+│         │                │           └──────────┬───────────┘          │
+│         └────────────────┼──────────────────────┘                      │
+│                          ▼                                             │
+│                  ┌──────────────┐                                      │
+│                  │   EventBus   │ (单例 Subject<VendureEvent>)          │
+│                  └──────┬───────┘                                      │
+│            ┌────────────┼────────────┐                                 │
+│            ▼            ▼            ▼                                 │
+│   ofType() 订阅   filter() 订阅  BlockingHandler                      │
+│   (异步,等事务)    (异步,等事务)   (同步,阻塞publish)                    │
+│            │            │            │                                 │
+│            └───── awaitActiveTransactions ────┘                        │
+│                   (TransactionSubscriber)                              │
+│                          │                                             │
+│                TypeORM afterTransactionCommit                          │
+│                                                                        │
+│  ┌─────────────────────────────────────────────────────────┐           │
+│  │  非事务发布路径                                           │           │
+│  │  bootstrap.ts → BootstrappedEvent (无 ctx,立即投递)       │           │
+│  │  InitializerService → InitializerEvent (无 ctx,立即投递)  │           │
+│  │  EmailProcessor → EmailSendEvent (Worker JobQueue,无事务)  │           │
+│  └─────────────────────────────────────────────────────────┘           │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
 **关键源文件**：
@@ -44,6 +54,12 @@ Vendure 的事件系统建立在 NestJS 依赖注入之上，核心组件关系�
 | `core/src/api/middleware/transaction-interceptor.ts` | 拦截器，调用 TransactionWrapper 包装 resolver |
 | `core/src/common/constants.ts` | `TRANSACTION_MANAGER_KEY = Symbol('TRANSACTION_MANAGER')` |
 | `core/src/api/common/request-context.ts` | RequestContext，携带事务 EntityManager |
+| `core/src/bootstrap.ts` | Server/Worker 启动入口，发布 `BootstrappedEvent` |
+| `core/src/service/initializer.service.ts` | 服务初始化编排，发布 `InitializerEvent` |
+| `core/src/config/order/default-order-process.ts` | 内置 OrderProcess，`onTransitionEnd` 中发布 `OrderPlacedEvent` |
+| `core/src/service/helpers/order-state-machine/order-state-machine.ts` | OrderStateMachine — 回调分发，不直接发布事件 |
+| `core/src/service/helpers/order-modifier/order-modifier.ts` | OrderModifier — 订单修改辅助器，发布 OrderLineEvent/OrderEvent |
+| `email-plugin/src/email-processor.ts` | EmailProcessor — Worker 内邮件发送，发布 EmailSendEvent |
 
 ---
 
@@ -160,6 +176,11 @@ VendureEvent                          ← 所有事件的根
 | `InitializerEvent` | `VendureEvent` | 数据初始化完成 |
 | `BootstrappedEvent` | `VendureEvent` | 服务器/Worker 启动完成 |
 
+#### Email 插件（`@vendure/email-plugin`）
+| 事件类 | 继承自 | 事件触发场景 |
+|--------|--------|-------------|
+| `EmailSendEvent` | `VendureEvent` | 邮件发送成功或失败 |
+
 ---
 
 ## 3. EventBus 核心实现详解
@@ -250,34 +271,73 @@ registerBlockingEventHandler<T extends VendureEvent>(handlerOptions: BlockingEve
 
 ## 4. 事件发布位置汇总
 
-所有 `eventBus.publish()` 调用均在 Service 层。以下按发布场景分类：
+`eventBus.publish()` 调用并非全部在 Service 层。按**发布者角色**分为以下五类：
 
-### 4.1 实体 CRUD 事件 — 在 Service 的 create/update/delete 方法末尾
+---
 
-典型模式（以 `ProductService` 为例）：
+### 4.1 启动流程 — 无事务上下文的事件
+
+这两处发布发生在 Nest 应用初始化阶段，**不携带 `RequestContext`**，因此不存在事务等待问题，订阅者会立即收到事件。
+
+| 文件 | 事件 | 行号 | 触发时机 |
+|------|------|------|----------|
+| `core/src/bootstrap.ts` | `BootstrappedEvent` | :228 | Server 进程 `app.listen()` 完成后 |
+| `core/src/bootstrap.ts` | `BootstrappedEvent` | :280 | Worker 进程 `NestFactory.createApplicationContext()` 完成后 |
+| `core/src/service/initializer.service.ts` | `InitializerEvent` | :59 | `onModuleInit()` 中所有服务初始化完成后 |
+
+**启动时序**：
+
+```
+bootstrapServer()
+  ├── NestFactory.create(AppModule)
+  ├── InitializerService.onModuleInit()
+  │     ├── zoneService.initZones()
+  │     ├── globalSettingsService.initGlobalSettings()
+  │     ├── sellerService.initSellers()
+  │     ├── channelService.initChannels()
+  │     ├── roleService.initRoles()
+  │     ├── administratorService.initAdministrators()
+  │     ├── shippingMethodService.initShippingMethods()
+  │     ├── taxRateService.initTaxRates()
+  │     ├── stockLocationService.initStockLocations()
+  │     └── eventBus.publish(new InitializerEvent())      ← ① InitializerEvent
+  ├── app.listen(port)
+  └── eventBus.publish(new BootstrappedEvent())           ← ② BootstrappedEvent
+
+bootstrapWorker()
+  ├── NestFactory.createApplicationContext(WorkerModule)
+  ├── validateDbTablesForWorker()
+  └── eventBus.publish(new BootstrappedEvent())           ← ③ BootstrappedEvent (Worker)
+```
+
+---
+
+### 4.2 Service 层 CRUD 事件 — 在 create/update/delete 方法末尾
+
+这是数量最多的发布点。典型模式（以 `ProductService` 为例）：
 
 ```typescript
 // core/src/service/services/product.service.ts:257
 async create(ctx: RequestContext, input: CreateProductInput): Promise<Product> {
     const product = await this.translatableSaver.create(...);
-    // ... 保存逻辑 ...
-    await this.eventBus.publish(new ProductEvent(ctx, product, 'created', input));  // 事务内发布
+    await this.eventBus.publish(new ProductEvent(ctx, product, 'created', input));
     return product;
 }
 ```
 
-所有 CRUD 事件的发布位置：
+**事务上下文**：这些调用发生在 Service 方法内，而 Service 方法通常由 `@Transaction()` 装饰的 Resolver 调用。此时 `ctx` 携带 `TRANSACTION_MANAGER_KEY`，因此 ofType/filter 订阅者会**等事务提交后才收到事件**。
 
-| Service 文件 | 事件 | 操作 |
-|-------------|------|------|
+| Service 文件 | 事件 | 操作与行号 |
+|-------------|------|-----------|
 | `product.service.ts` | ProductEvent | created:257, updated:288, deleted:304 |
 | `product.service.ts` | ProductChannelEvent | assigned:369, removed:431 |
+| `product.service.ts` | ProductOptionGroupChangeEvent | :461, :504 |
 | `product-variant.service.ts` | ProductVariantEvent | created:392, updated:407, deleted:713 |
 | `product-variant.service.ts` | ProductVariantPriceEvent | created:617, updated:641, deleted:681 |
 | `product-variant.service.ts` | ProductVariantChannelEvent | assigned:659, removed:697 |
 | `product-option.service.ts` | ProductOptionEvent | created:118, updated:130, deleted:169 |
 | `product-option-group.service.ts` | ProductOptionGroupEvent | created:168, updated:183, deleted:241,302 |
-| `customer.service.ts` | CustomerEvent | created:295, updated:368, deleted:807 |
+| `customer.service.ts` | CustomerEvent | created:295,692, updated:368, deleted:807 |
 | `customer.service.ts` | CustomerAddressEvent | created:725, updated:762, deleted:792 |
 | `customer-group.service.ts` | CustomerGroupEvent | created:112, updated:126, deleted:135 |
 | `customer-group.service.ts` | CustomerGroupChangeEvent | assigned:168, removed:194 |
@@ -301,69 +361,233 @@ async create(ctx: RequestContext, input: CreateProductInput): Promise<Product> {
 | `zone.service.ts` | ZoneMembersEvent | assigned:197, removed:211 |
 | `province.service.ts` | ProvinceEvent | created:78, updated:89, deleted:98 |
 | `seller.service.ts` | SellerEvent | created:65, updated:79, deleted:87 |
-| `stock-location.service.ts` | StockLocationEvent | created:94, updated:108 |
-| `payment-method.service.ts` | PaymentMethodEvent | created:114, updated:146 |
+| `stock-location.service.ts` | StockLocationEvent | created:94, updated:108, deleted:170 |
+| `payment-method.service.ts` | PaymentMethodEvent | created:114, updated:146, deleted:173,190 |
 | `global-settings.service.ts` | GlobalSettingsEvent | updated:80 |
-| `history.service.ts` | HistoryEntryEvent | order-created:299, order-updated:365, order-deleted:373, customer-updated:392, customer-deleted:400 |
-| `api-key.service.ts` | ApiKeyEvent | (CRUD) |
+| `history.service.ts` | HistoryEntryEvent | order-created:299,340, order-updated:365, order-deleted:373, customer-updated:392, customer-deleted:400 |
+| `order.service.ts` | OrderEvent | created:469,483, updated:518,552,615, deleted:2099 |
+| `order.service.ts` | OrderLineEvent | deleted:885,973 |
+| `order.service.ts` | CouponCodeEvent | assigned:1080, removed:1098 |
+| `order.service.ts` | RefundEvent | created:1963 |
+| `fulfillment.service.ts` | FulfillmentEvent | created:114 |
+| `stock-movement.service.ts` | StockMovementEvent | adjust:126, allocate:193, sale:254, cancel:309, release:358 |
 
-### 4.2 状态转换事件 — 在 withTransaction 回调内发布
+---
 
-这些事件在 `connection.withTransaction()` 内发布，使用 `txCtx`（携带事务 EntityManager 的上下文副本）：
+### 4.3 订单流程编排 — OrderProcess 回调内发布
 
-| Service 文件 | 事件 | 行号 |
-|-------------|------|------|
-| `order.service.ts` | OrderStateTransitionEvent | 1309 |
-| `order.service.ts` | RefundStateTransitionEvent | 1363, 1991 |
-| `payment.service.ts` | PaymentStateTransitionEvent | 158, 257, 303 |
-| `payment.service.ts` | RefundStateTransitionEvent | 452 |
-| `fulfillment.service.ts` | FulfillmentStateTransitionEvent | 200 |
-| `default-order-process.ts` | OrderPlacedEvent | 423 |
+这是最复杂的发布路径。事件不在 Service 方法中直接发布，而是在 **状态机转换回调** 中发布，由 `OrderStateMachine.transition()` → `FSM.transitionTo()` → `onTransitionEnd` 链路触发。
 
-典型模式：
+#### 4.3.1 OrderStateMachine 的回调分发机制
+
+`OrderStateMachine`（`core/src/service/helpers/order-state-machine/order-state-machine.ts`）本身**不发布任何事件**，也不持有 `eventBus` 引用。它的职责是：
+
+1. 合并所有 `OrderProcess` 的 transitions 定义
+2. 在 `onTransitionStart` / `onTransitionEnd` / `onTransitionError` 中依次调用每个 `OrderProcess` 的同名回调
 
 ```typescript
-// core/src/service/services/order.service.ts:1296-1313
-async transitionToState(ctx, orderId, state) {
-    return this.connection.withTransaction(ctx, async txCtx => {
-        const order = await this.getOrderOrThrow(txCtx, orderId);
-        const result = await this.orderStateMachine.transition(txCtx, order, state);
-        await this.connection.getRepository(txCtx, Order).save(order, { reload: false });
-        await this.eventBus.publish(new OrderStateTransitionEvent(fromState, state, txCtx, order));
-        await finalize();
-        await this.connection.getRepository(txCtx, Order).save(order, { reload: false });
-        return order;
-    });
+// order-state-machine.ts:76-81
+onTransitionEnd: async (fromState, toState, data) => {
+    for (const process of orderProcesses) {
+        if (typeof process.onTransitionEnd === 'function') {
+            await awaitPromiseOrObservable(process.onTransitionEnd(fromState, toState, data));
+        }
+    }
+},
+```
+
+关键点：`OrderStateMachine.transition()` 在 `OrderService.transitionToState()` 的 **`withTransaction` 回调内** 被调用，因此 `onTransitionEnd` 的执行也在同一事务中。
+
+#### 4.3.2 defaultOrderProcess — OrderPlacedEvent 的发布
+
+`defaultOrderProcess`（`core/src/config/order/default-order-process.ts`）是 Vendure 内置的 `OrderProcess` 实现。它在 `onTransitionEnd` 中发布 `OrderPlacedEvent`：
+
+```typescript
+// default-order-process.ts:402-426
+async onTransitionEnd(fromState, toState, data) {
+    const { ctx, order } = data;
+    const { orderPlacedStrategy } = configService.orderOptions;
+    if (order.active) {
+        const shouldSetAsPlaced = orderPlacedStrategy.shouldSetAsPlaced(ctx, fromState, toState, order);
+        if (shouldSetAsPlaced) {
+            order.active = false;
+            order.orderPlacedAt = new Date();
+            // ... 更新 OrderLine.orderPlacedQuantity ...
+            await eventBus.publish(new OrderPlacedEvent(fromState, toState, ctx, order));  // ← :423
+            await orderSplitter.createSellerOrders(ctx, order);
+        }
+    }
+    // ... 库存分配、历史记录 ...
 }
 ```
 
-### 4.3 认证/账户事件
+**发布链路**：
+```
+OrderService.transitionToState(ctx, orderId, 'PaymentSettled')
+  → connection.withTransaction(ctx, async txCtx => {
+      OrderStateMachine.transition(txCtx, order, 'PaymentSettled')
+        → FSM.transitionTo()
+          → onTransitionEnd(fromState, toState, { ctx: txCtx, order })
+            → defaultOrderProcess.onTransitionEnd()
+              → eventBus.publish(new OrderPlacedEvent(...))
+      // 回到 OrderService：
+      await this.eventBus.publish(new OrderStateTransitionEvent(fromState, state, txCtx, order));
+  })
+```
 
-| Service 文件 | 事件 | 行号 |
-|-------------|------|------|
-| `auth.service.ts` | AttemptedLoginEvent | 57 |
-| `auth.service.ts` | LoginEvent | 109 |
-| `auth.service.ts` | LogoutEvent | 152 |
-| `customer.service.ts` | AccountRegistrationEvent | 272, 453, 476 |
-| `customer.service.ts` | AccountVerifiedEvent | 510 |
-| `customer.service.ts` | PasswordResetEvent | 522 |
-| `customer.service.ts` | PasswordResetVerifiedEvent | 562 |
-| `customer.service.ts` | IdentifierChangeRequestEvent | 606 |
-| `customer.service.ts` | IdentifierChangeEvent | 614, 649 |
+**事务边界**：`OrderPlacedEvent` 和 `OrderStateTransitionEvent` 都在**同一个 `withTransaction` 回调**中发布。`OrderPlacedEvent` 先于 `OrderStateTransitionEvent` 进入 `eventStream`，订阅者按相同顺序接收。
 
-### 4.4 库存移动事件
+#### 4.3.3 defaultOrderProcess 的 init() — 懒注入 EventBus
 
-| Service 文件 | 事件 | 行号 |
-|-------------|------|------|
-| `stock-movement.service.ts` | StockMovementEvent | adjust:126, allocate:193, sale:254, cancel:309, release:358 |
+`defaultOrderProcess` 不是 NestJS Provider，不能通过构造函数注入。它通过 `OrderProcess.init(injector)` 钩子延迟获取依赖：
 
-### 4.5 基础设施事件
+```typescript
+// default-order-process.ts:237-258
+async init(injector) {
+    const EventBus = await import('../../event-bus/index.js').then(m => m.EventBus);
+    const StockMovementService = await import('../../service/index.js').then(m => m.StockMovementService);
+    // ... 其他懒导入 ...
+    connection = injector.get(TransactionalConnection);
+    eventBus = injector.get(EventBus);
+    stockMovementService = injector.get(StockMovementService);
+    // ...
+}
+```
 
-| 文件 | 事件 | 行号 |
+使用动态 `import()` 避免循环依赖——`defaultOrderProcess` 是 `DefaultConfig` 的一部分，在模块加载时就会求值，如果静态导入 EventBus 会形成循环。
+
+#### 4.3.4 自定义 OrderProcess 的扩展点
+
+用户通过 `configureDefaultOrderProcess()` 或自定义 `OrderProcess` 可以：
+- 在 `onTransitionEnd` 中发布自己的事件（通过 `init()` 注入 EventBus）
+- 在 `onTransitionStart` 中阻止状态转换（返回 `false` 或错误消息字符串）
+- 在 `onTransitionError` 中记录日志
+
+#### 4.3.5 其他状态转换事件的发布
+
+除 `OrderPlacedEvent` 在 OrderProcess 回调中发布外，其他状态转换事件（`OrderStateTransitionEvent`、`PaymentStateTransitionEvent`、`FulfillmentStateTransitionEvent`、`RefundStateTransitionEvent`）均在 Service 层的 `withTransaction` 回调内发布：
+
+| Service 文件 | 事件 | 行号 | 事务上下文 |
+|-------------|------|------|-----------|
+| `order.service.ts` | OrderStateTransitionEvent | :1309 | `withTransaction(ctx, txCtx => { ... })` |
+| `order.service.ts` | RefundStateTransitionEvent | :1362, :1990 | `withTransaction(ctx, txCtx => { ... })` |
+| `payment.service.ts` | PaymentStateTransitionEvent | :157, :256, :302 | `withTransaction(ctx, txCtx => { ... })` |
+| `payment.service.ts` | RefundStateTransitionEvent | :452 | `withTransaction(ctx, txCtx => { ... })` |
+| `fulfillment.service.ts` | FulfillmentStateTransitionEvent | :199 | `withTransaction(ctx, txCtx => { ... })` |
+
+**注意**：这些事件的 `ctx` 参数使用的是 `txCtx`（事务上下文副本），携带活跃的 `TRANSACTION_MANAGER_KEY`。
+
+---
+
+### 4.4 辅助组件 — Helper 与 Plugin 内部的发布
+
+这些发布点不在标准 Service 的 CRUD 方法中，而在辅助逻辑或插件内部。
+
+#### 4.4.1 OrderModifier — 订单修改辅助器
+
+`OrderModifier`（`core/src/service/helpers/order-modifier/order-modifier.ts`）处理订单修改（管理员修改已下单订单），独立发布事件：
+
+| 事件 | 行号 | 操作 |
 |------|------|------|
-| `bootstrap.ts` | BootstrappedEvent | server:228, worker:280 |
-| `initializer.service.ts` | InitializerEvent | 59 |
-| `fulltext-search.service.ts` | SearchEvent | 58 |
+| `OrderLineEvent` | :204 | created — 修改中新增订单行 |
+| `OrderLineEvent` | :247 | updated — 修改中更新订单行数量 |
+| `OrderLineEvent` | :339 | cancelled — 修改中取消订单行 |
+| `OrderEvent` | :695 | updated — 修改完成后更新整个订单 |
+
+**调用链路**：
+```
+OrderService.modifyOrder(ctx, input)
+  → connection.withTransaction(ctx, async txCtx => {
+      OrderModifier.modifyOrder(txCtx, input, order)
+        → OrderModifier.addOrderLine(ctx, ...)
+          → eventBus.publish(new OrderLineEvent(ctx, order, orderLine, 'created'))
+        → eventBus.modifyOrderLines(ctx, ...)
+          → eventBus.publish(new OrderLineEvent(ctx, order, orderLine, 'cancelled'))
+        → eventBus.publish(new OrderEvent(ctx, order, 'updated', input))
+    })
+```
+
+#### 4.4.2 FulltextSearchService — 搜索服务
+
+`FulltextSearchService`（`core/src/plugin/default-search-plugin/fulltext-search.service.ts`）在搜索查询执行时发布：
+
+| 事件 | 行号 |
+|------|------|
+| `SearchEvent` | :58 |
+
+```typescript
+async search(ctx: RequestContext, input: SearchInput): Promise<SearchResult> {
+    await this.eventBus.publish(new SearchEvent(ctx, input));
+    // ... 执行搜索 ...
+}
+```
+
+#### 4.4.3 EmailProcessor — 邮件插件
+
+`EmailProcessor`（`email-plugin/src/email-processor.ts`）在邮件发送后发布：
+
+| 事件 | 行号 | 场景 |
+|------|------|------|
+| `EmailSendEvent` | :83 | 邮件发送成功 |
+| `EmailSendEvent` | :94 | 邮件发送失败 |
+
+```typescript
+async process(data: EmailJobData) {
+    try {
+        await this.emailSender.send(emailDetails, transportSettings);
+        await this.eventBus.publish(new EmailSendEvent(ctx, emailDetails, true, undefined, data.metadata));
+    } catch (err) {
+        await this.eventBus.publish(new EmailSendEvent(ctx, emailDetails, false, err, data.metadata));
+        throw err;
+    }
+}
+```
+
+**特别注意**：`EmailProcessor` 运行在 Worker 的 JobQueue 中，不在 HTTP 请求的事务上下文中。`EmailSendEvent` 携带的 `ctx` 可能已不含活跃事务，订阅者会立即收到。
+
+---
+
+### 4.5 认证/账户事件 — 无显式事务包装的发布
+
+| Service 文件 | 事件 | 行号 |
+|-------------|------|------|
+| `auth.service.ts` | AttemptedLoginEvent | :57 |
+| `auth.service.ts` | LoginEvent | :109 |
+| `auth.service.ts` | LogoutEvent | :152 |
+| `customer.service.ts` | AccountRegistrationEvent | :272, :453, :476 |
+| `customer.service.ts` | AccountVerifiedEvent | :510 |
+| `customer.service.ts` | PasswordResetEvent | :522 |
+| `customer.service.ts` | PasswordResetVerifiedEvent | :562 |
+| `customer.service.ts` | IdentifierChangeRequestEvent | :606 |
+| `customer.service.ts` | IdentifierChangeEvent | :614, :649 |
+
+这些方法的 Resolver 未使用 `@Transaction()` 装饰（如 `auth.service.ts` 的 `login` / `logout`），或使用了不同的调用路径（如 `customer.service.ts` 的 `registerCustomerAccount` 由 Shop API 的非事务 Resolver 调用）。事务行为取决于上层 Resolver 是否有 `@Transaction()` 装饰。
+
+---
+
+### 4.6 发布路径总览图
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          EventBus.publish()                             │
+│                                                                         │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌────────────┐  │
+│  │  启动流程      │  │  Service CRUD │  │  订单编排      │  │ 辅助组件    │  │
+│  │  (无事务)     │  │  (隐式事务)   │  │  (显式事务)    │  │ (混合事务)  │  │
+│  ├──────────────┤  ├──────────────┤  ├──────────────┤  ├────────────┤  │
+│  │ bootstrap.ts │  │ *.service.ts │  │ order.service│  │ OrderModifier│ │
+│  │  Bootstrapped│  │  EntityEvent │  │  StateTrans. │  │  OrderLine  │  │
+│  │              │  │              │  │              │  │  OrderEvent │  │
+│  │ initializer  │  │              │  │ default-     │  │             │  │
+│  │  Initializer │  │              │  │  order-      │  │ Fulltext    │  │
+│  │              │  │              │  │  process     │  │  SearchEvent│  │
+│  │              │  │              │  │  OrderPlaced │  │             │  │
+│  │              │  │              │  │              │  │ EmailProc.  │  │
+│  │              │  │              │  │              │  │  EmailSend  │  │
+│  └──────────────┘  └──────────────┘  └──────────────┘  └────────────┘  │
+│        ↓ 立即          ↓ 等事务提交      ↓ 等事务提交      ↓ 视调用方而定  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
@@ -402,6 +626,29 @@ async onApplicationBootstrap() {
     this.eventBus.ofType(TaxRateModificationEvent).pipe(delay(1)).subscribe(event => { ... });
 }
 ```
+
+#### EmailPlugin（`email-plugin/src/plugin.ts`）
+
+EmailPlugin 使用声明式 `EmailEventHandler` 配置，在 `onApplicationBootstrap` 中统一订阅：
+
+```typescript
+// plugin.ts:397-402
+private async setupEventSubscribers() {
+    for (const handler of EmailPlugin.options.handlers) {
+        this.eventBus.ofType(handler.event).subscribe(event => {
+            return this.handleEvent(handler, event);
+        });
+    }
+}
+```
+
+每个 `EmailEventHandler` 声明监听一种事件类型（如 `OrderStateTransitionEvent`），在收到事件后：
+1. 匹配过滤条件（如 `toState === 'PaymentSettled'`）
+2. 生成邮件内容
+3. 将邮件任务推入 `JobQueue`（异步发送）或同步发送（测试模式）
+4. `EmailProcessor` 发送完成后发布 `EmailSendEvent`
+
+**关键点**：EmailPlugin 订阅者收到事件时已在事务提交之后，但邮件发送通过 JobQueue 解耦，即使发送失败也不会影响原始事务。
 
 #### CollectionService（`core/src/service/services/collection.service.ts`）
 
