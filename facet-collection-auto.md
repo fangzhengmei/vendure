@@ -331,6 +331,67 @@ const filters = [...ancestorFilters, ...(collection.filters || [])];
 
 这意味着用户在 Admin UI 中预览一个 `inheritFilters: false` 的 Collection 时，如果前端传了 `inheritFilters: true`，预览结果会包含祖先 filters，但实际归组不会应用祖先 filters——**预览与实际结果不一致**。
 
+### 4.3 混合 AND/OR 条件下的过滤器应用顺序差异
+
+两条路径的过滤器应用逻辑结构完全相同：
+
+```ts
+const { collectionFilters } = this.configService.catalogOptions;
+for (const filterType of collectionFilters) {               // 外层：按 config 顺序遍历 filterType
+    const filtersOfType = filters.filter(f => f.code === filterType.code);
+    if (filtersOfType.length) {
+        for (const collectionFilter of filtersOfType) {     // 内层：按数组顺序应用该类型的所有 filter
+            qb = filterType.apply(qb, collectionFilter.args);
+        }
+    }
+}
+```
+
+**差异仅在于 `filters` 数组的顺序**：
+
+| 路径 | filters 数组顺序 |
+|---|---|
+| 预览 | `[...inputFilters, ...parentFilters, ...ancestorFilters]` |
+| 实际归组 | `[...ancestorFilters, ...collection.filters]` |
+
+**对 SQL 语义的影响**：
+
+SQL 中 `AND` 的优先级高于 `OR`，因此过滤器的应用顺序会直接影响最终的 WHERE 子句语义。
+
+例如，假设 Collection 配置如下：
+- 祖先 A: `facet-value-filter` (combineWithAnd = true, facetValueIds = [1]) → `AND productVariant.id IN (...)`
+- 自身 C: `facet-value-filter` (combineWithAnd = false, facetValueIds = [2]) → `OR productVariant.id IN (...)`
+
+| 路径 | 应用顺序 | 生成的 SQL WHERE | 实际语义 |
+|---|---|---|---|
+| 预览 | `[C, A]` | `cond_C OR cond_A` | 任一 filter 满足即可 |
+| 实际归组 | `[A, C]` | `cond_A AND cond_C` | 两个 filter 必须同时满足 |
+
+两者语义完全相反！
+
+**实际场景验证**：
+
+如果祖先 filter 是 `AND facetValueIds=[1]`，自身 filter 是 `OR facetValueIds=[2]`：
+- 预览：`cond2 OR cond1` → 变体有 facetValue 2 或 1 都会匹配
+- 实际归组：`cond1 AND cond2` → 变体必须同时有 facetValue 1 和 2
+
+**问题根源**：
+
+`combineWithAnd` 参数控制的是**这个 filter 相对于已有条件的组合方式**，而不是 filter 内部的逻辑。因此，当同一 filterType 存在多个实例且 `combineWithAnd` 混合时，应用顺序直接决定了 SQL 的组合逻辑。
+
+**修正建议**：
+
+在 `getCollectionFiltersFromInput` 中调整预览的 filter 合并顺序，使其与实际归组一致：
+
+```ts
+// 修正前
+applicableFilters.push(...parentFilters, ...ancestorFilters);
+// 修正后
+applicableFilters.unshift(...ancestorFilters, ...parentFilters);
+```
+
+这样预览的 filter 顺序变为 `[...ancestorFilters, ...parentFilters, ...inputFilters]`，与实际归组的 `[...ancestorFilters, ...collection.filters]` 一致。
+
 ---
 
 ## 五、Facet Value Filter 的核心 SQL 逻辑
@@ -505,7 +566,60 @@ Job 处理函数（`collection.service.ts:128-190`）：
 
 **关键细节**：步骤 2 查询所有 Collection 时不按 channel 过滤，因此 Job 在单个 channel 的 ctx 下会处理所有 channel 的 Collection。步骤 3 的 `applyCollectionFiltersInternal` 使用 `masterConnection`，同样无 channel 过滤。这意味着**一个 channel 触发的归组 Job 会影响所有 channel 的 Collection**。
 
-### 7.4 核心归组算法
+### 7.4 getEntityOrThrow 未传 channelId 的查询意图分析
+
+在 Job 处理函数中，加载 Collection 时调用（`collection.service.ts:153-156`）：
+
+```ts
+collection = await this.connection.getEntityOrThrow(ctx, Collection, collectionId, {
+    retries: 5,
+    retryDelay: 50,
+});
+```
+
+**未传入 `options.channelId`**。
+
+#### getEntityOrThrow 的分支逻辑
+
+`getEntityOrThrowInternal`（`transactional-connection.ts:313-333`）的实现：
+
+```ts
+if (options.channelId != null) {
+    // 分支 A：传入了 channelId → 走 findOneInChannel
+    entity = await this.findOneInChannel(ctx, entityType, id, options.channelId, ...);
+} else {
+    // 分支 B：未传入 channelId → 直接 findOne，无 channel 过滤
+    const optionsWithId = { ...options, where: { ...(options.where || {}), id } };
+    entity = await this.getRepository(ctx, entityType)
+        .findOne(optionsWithId)
+        .then(result => result ?? undefined);
+}
+```
+
+`findOneInChannel` 的实现（`transactional-connection.ts:372-374`）：
+```ts
+qb.leftJoin('entity.channels', '__channel')
+    .andWhere('entity.id = :id', { id })
+    .andWhere('__channel.id = :channelId', { channelId });
+```
+
+#### 设计意图
+
+**不传入 `channelId` 是有意的设计**，理由：
+
+1. **全局归组操作**：`apply-collection-filters` Job 是全局操作——当 `collectionIds` 为空时（商品变更事件触发），需要处理所有 Collection，无论它们属于哪个 channel。
+
+2. **Collection 的全局特性**：Collection 实体本身是全局的，channel 关联通过 `collection.channels` 多对多关系表管理。`getEntityOrThrow` 不按 channel 过滤才能加载到所有 Collection。
+
+3. **与前置查询一致**：步骤 2 查询所有 Collection ID 时用的是 `rawConnection`（无 channel 过滤），如果步骤 3 突然按 channel 过滤，会导致步骤 2 查到的 Collection 在步骤 3 加载不到。
+
+#### 对之前分析的修正
+
+**之前的分析有误**：我之前认为 `getEntityOrThrow` 会按 `ctx.channelId` 过滤其他 channel 的 Collection，实际上由于没有传 `channelId`，它**不会**按 channel 过滤。跨 channel Job 的真正问题在于：
+- 恢复的 `ctx` 绑定到某个 channel，但 Collection 查询本身不受影响
+- 后续发布的 `CollectionModificationEvent(ctx, ...)` 携带的 ctx 可能与 Collection 实际所属的 channel 不匹配
+
+### 7.5 核心归组算法
 
 `applyCollectionFiltersInternal()`（`collection.service.ts:728-837`）使用 CTE 差量计算：
 
@@ -521,7 +635,7 @@ toRemove := _existing_variants LEFT JOIN _filtered_variants WHERE filtered IS NU
 - 批量移除（`chunkArray(toRemoveIds, 5000)`）
 - 批量添加（`chunkArray(toAddIds, 5000)`）
 
-### 7.5 affectedVariantIds 的两种返回模式
+### 7.6 affectedVariantIds 的两种返回模式
 
 ```ts
 if (applyToChangedVariantsOnly) {
@@ -530,7 +644,7 @@ if (applyToChangedVariantsOnly) {
 return [...existingIds, ...toRemoveIds];     // 全量（包含未变更的存量）
 ```
 
-### 7.6 ⚠️ 事务失败后的事件一致性风险
+### 7.7 ⚠️ 事务失败后的事件一致性风险
 
 当前 `applyCollectionFiltersInternal()` 的事务错误处理（`collection.service.ts:802-827`）：
 
@@ -675,7 +789,7 @@ reduce(collectedJobs): Array<Job<any>> {
 }
 ```
 
-### 8.4 ⚠️ reduce 固定使用 referenceJob.ctx 的跨 channel 影响
+### 8.4 ⚠️ reduce 固定使用 referenceJob.ctx 的影响
 
 `CollectionJobBuffer.reduce()` 始终使用 `referenceJob = collectedJobs[0]` 的 `ctx`：
 
@@ -693,6 +807,8 @@ ctx: {
 }
 ```
 
+#### 8.4.1 跨 channel 影响（修正之前的分析）
+
 **问题场景**：假设缓冲中有来自不同 channel 的 Job：
 
 | Job | ctx.channelToken | 来源 |
@@ -702,7 +818,7 @@ ctx: {
 
 合并后，`ctx` 取 Job A 的值 → `channelToken: 'channel-default'`。
 
-**影响分析**：
+**影响分析（已修正）**：
 
 在 Job 处理函数中（`collection.service.ts:130-134`）：
 ```ts
@@ -725,18 +841,92 @@ const ctx = await this.requestContextService.create({
    ```
    跨 channel 查所有 Collection，所以 Channel 2 的 Collection 也会被处理。
 
-2. **`getEntityOrThrow` 受 channel 限制**（`collection.service.ts:153-156`）：
+2. **`getEntityOrThrow` 也不按 channel 过滤**（`collection.service.ts:153-156`）：
    ```ts
    collection = await this.connection.getEntityOrThrow(ctx, Collection, collectionId, {
        retries: 5,
        retryDelay: 50,
    });
    ```
-   如果 Collection 属于 Channel 2 但不属于 Channel 1，而 ctx 绑定 Channel 1，则此查询会**抛出异常**，该 Collection 被跳过。
+   **之前的分析有误**：由于没有传 `channelId` 选项，`getEntityOrThrow` 走的是直接 `findOne({ where: { id } })` 分支，**不会**按 channel 过滤。所有 Collection 都能正常加载。
 
 3. **`applyCollectionFiltersInternal` 无 channel 限制**：使用 `masterConnection`，查询和写入都不按 channel 过滤。
 
-**结果**：如果合并后 ctx 指向 Channel 1，那么仅属于 Channel 2 的 Collection 在步骤 2 会被跳过，其归组不执行。而属于 Channel 1 的 Collection 的 `applyCollectionFiltersInternal` 却会操作跨 channel 的 ProductVariant（步骤 3），可能错误地将其他 channel 的变体关联到 Channel 1 的 Collection。
+**真正的跨 channel 问题**：
+- 恢复的 `ctx` 绑定到某个 channel，但后续处理完全忽略这个 channel 限制
+- 发布 `CollectionModificationEvent(ctx, ...)` 时携带的 `ctx` 可能与 Collection 实际所属的 channel 不匹配
+- 这可能导致下游消费者（如搜索插件）使用错误的 channel 上下文处理事件
+
+#### 8.4.2 搜索索引语言上下文更新的影响
+
+`CollectionModificationEvent` 的下游是搜索插件的 `updateVariantsById` 流程：
+
+```
+CollectionModificationEvent
+        │
+        ▼
+default-search-plugin.ts:181-195 缓冲（debounceTime(50)）
+        │
+        ▼
+ctx = events[0].ctx  ← 取第一个事件的 ctx
+        │
+        ▼
+searchIndexService.updateVariantsById(ctx, ids)
+        │
+        ▼
+Job 队列：type: 'update-variants-by-id'
+        │
+        ▼
+indexer.controller.ts:123-161 updateVariantsById
+        │
+        ├─ ctx = MutableRequestContext.deserialize(rawContext)
+        ├─ getSearchIndexQueryBuilder(ctx, { channels: await this.getAllChannels(ctx), ... })
+        └─ saveVariants(ctx, batch)
+```
+
+**ctx.languageCode 对搜索索引更新的实际影响**：
+
+`saveVariants`（`indexer.controller.ts:401-515`）的核心逻辑：
+```ts
+for (const variant of variants) {
+    const availableLanguageCodes = unique(ctx.channel.availableLanguageCodes);
+    for (const languageCode of availableLanguageCodes) {   // ← 遍历 channel 的所有语言
+        const productTranslation = this.getTranslation(product, languageCode);
+        const variantTranslation = this.getTranslation(variant, languageCode);
+        // ... 为每种语言创建 SearchIndexItem
+        for (const channel of variant.channels) {
+            for (const currencyCode of availableCurrencyCodes) {
+                const item = new SearchIndexItem({
+                    channelId: ctx.channelId,
+                    languageCode,          // ← 使用循环变量，不是 ctx.languageCode
+                    currencyCode,
+                    // ...
+                });
+            }
+        }
+    }
+}
+```
+
+**结论**：`ctx.languageCode` **不影响**搜索索引更新的语言覆盖范围——因为：
+1. `availableLanguageCodes` 来自 `ctx.channel.availableLanguageCodes`，不是 `ctx.languageCode`
+2. 内层循环显式遍历 `availableLanguageCodes`，为每种语言创建 `SearchIndexItem`
+3. `getTranslation()` 的参数是循环变量 `languageCode`，不是 `ctx.languageCode`
+
+**唯一例外**：`saveSyntheticVariant`（仅当产品没有变体时调用）确实使用 `ctx.languageCode`：
+```ts
+private async saveSyntheticVariant(ctx: RequestContext, product: Product) {
+    const productTranslation = this.getTranslation(product, ctx.languageCode);  // ← 用了 ctx.languageCode
+    const item = new SearchIndexItem({
+        // ...
+        languageCode: ctx.languageCode,  // ← 用了 ctx.languageCode
+    });
+}
+```
+
+但在 `updateVariantsById` 流程中，产品有变体（我们正在更新变体），所以 `saveSyntheticVariant` 不会被调用——它只在 `updateProductInChannel` 等产品更新流程中调用。
+
+**最终结论**：`referenceJob.ctx.languageCode` 固定取值对搜索索引语言上下文更新**没有实质性影响**——搜索索引总是为 `channel.availableLanguageCodes` 中的所有语言更新记录。
 
 **修正建议**：
 
@@ -885,11 +1075,12 @@ Product/Variant 变更
 | # | 问题 | 位置 | 严重性 | 触发条件 |
 |---|---|---|---|---|
 | 1 | 预览链路不遵循 inheritFilters 截断 | `collection.service.ts:496-504` | 中 | 预览 inheritFilters=false 的 Collection，前端传 inheritFilters=true |
-| 2 | 非列表 ID 编码多做 `JSON.stringify` | `configurable-operation-codec.ts:75-76` | 中 | 自定义 Filter 使用 `type:'ID', list:false` 且启用非恒等 EntityIdStrategy |
-| 3 | 事务失败后仍返回预期变更 ID | `collection.service.ts:802-830` | 高 | 事务执行失败（如死锁、超时） |
-| 4 | JobBuffer 合并吞噬空数组"全量"语义 | `collection-job-buffer.ts:16-18` | 高 | 缓冲中混合"全量"Job 和"指定"Job |
-| 5 | JobBuffer 合并错误取 `applyToChangedVariantsOnly` | `collection-job-buffer.ts:27` | 高 | 缓冲中混合 `true` 和 `false` 的 Job |
-| 6 | JobBuffer reduce 固定用 referenceJob.ctx 丢失其他 channel | `collection-job-buffer.ts:26` | 高 | 缓冲中混合来自不同 channel 的 Job |
+| 2 | 预览与实际归组的 filter 顺序相反，混合 AND/OR 时语义不同 | `collection.service.ts:495-522` vs `733-758` | 高 | 同一 filterType 既有祖先 filter 又有自身 filter，且 `combineWithAnd` 混合 |
+| 3 | 非列表 ID 编码多做 `JSON.stringify` | `configurable-operation-codec.ts:75-76` | 中 | 自定义 Filter 使用 `type:'ID', list:false` 且启用非恒等 EntityIdStrategy |
+| 4 | 事务失败后仍返回预期变更 ID | `collection.service.ts:802-830` | 高 | 事务执行失败（如死锁、超时） |
+| 5 | JobBuffer 合并吞噬空数组"全量"语义 | `collection-job-buffer.ts:16-18` | 高 | 缓冲中混合"全量"Job 和"指定"Job |
+| 6 | JobBuffer 合并错误取 `applyToChangedVariantsOnly` | `collection-job-buffer.ts:27` | 高 | 缓冲中混合 `true` 和 `false` 的 Job |
+| 7 | JobBuffer reduce 固定用 referenceJob.ctx 丢失其他 channel | `collection-job-buffer.ts:26` | 中 | 缓冲中混合来自不同 channel 的 Job |
 
 ---
 
