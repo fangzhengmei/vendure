@@ -898,55 +898,98 @@ async updateEmailAddress(ctx, token) {
 
 ---
 
-### 4.5.3 事件发布/跳过总表
+### 4.5.3 统一口径：三类分支下的发布/跳过规则
 
-| 事件 | 发布条件 | 跳过情况数量 | 事务行为 |
-|------|---------|-------------|---------|
-| `AttemptedLoginEvent` | 无条件（方法开头就发） | 0 | 总是 commit → 订阅者总能收到 |
-| `LoginEvent` | 认证成功 + 用户已验证/不需要验证 | 3 种 | 失败时 return ErrorResult → 也 commit → 但不 publish |
-| `LogoutEvent` | 找到有效 Session | 2 种 | 没找到时直接返回 → 不 publish |
-| `AccountRegistrationEvent` (Admin create) | 前面检查全部通过 | 3 种 | 创建 User 失败时 throw → 回滚 |
-| `AccountRegistrationEvent` (Shop register) | 用户未验证 + 前面检查全部通过 | 6 种 | 失败时 return ErrorResult → 也 commit → 但不 publish |
-| `AccountRegistrationEvent` (refresh) | 用户存在且未验证 | 2 种 | 不满足时直接返回 → 不 publish |
-| `AccountVerifiedEvent` | token 验证成功 + 找到 Customer | 7 种 | 找不到 Customer 时 throw → 回滚 |
-| `PasswordResetEvent` | 用户存在且有本地认证方法 | 2 种 | 不满足时直接返回 → 不 publish（安全设计） |
-| `PasswordResetVerifiedEvent` | token 验证成功 + 找到 Customer | 4 种 | 找不到 Customer 时 throw → 回滚 |
-| `IdentifierChangeRequestEvent` | 邮箱不冲突 + 找到 User/Customer + 需要验证 | 4 种 | 不需要验证时发布另一个事件 |
-| `IdentifierChangeEvent` | 不需要验证 OR token 验证成功 | 4 种 | 失败时 return ErrorResult → 也 commit → 但不 publish |
+按**冲突分支**、**校验失败分支**、**成功分支**三类，统一每个事件的行为：
+
+| 事件 | 冲突分支 | 校验失败分支 | 成功分支 | 最终结论 |
+|------|---------|-------------|---------|---------|
+| **`AttemptedLoginEvent`** | 无冲突场景 | 密码错误：<br>✅ 已发布<br>⚠️ return `InvalidCredentialsError`<br>✅ 事务 commit<br>✅ **订阅者收到** | 认证成功：<br>✅ 已发布<br>✅ 事务 commit<br>✅ **订阅者收到** | 🔴 **总是收到**<br>（方法开头无条件发布） |
+| **`LoginEvent`** | 无冲突场景 | 密码错误：<br>❌ 提前 return<br>❌ 不走到 publish<br>❌ 订阅者收不到<br><br>未验证用户：<br>❌ return `NotVerifiedError`<br>❌ 不走到 publish<br>❌ 订阅者收不到 | 认证成功+已验证：<br>✅ 走到 publish<br>✅ 事务 commit<br>✅ **订阅者收到** | 🟡 **仅成功时收到** |
+| **`LogoutEvent`** | 无冲突场景 | token 无效：<br>❌ 不进入 `if (session)` 块<br>❌ 不发布<br>❌ 订阅者收不到 | 找到有效 session：<br>✅ 走到 publish<br>✅ 事务 commit<br>✅ **订阅者收到** | 🟡 **仅成功时收到** |
+| **`AccountRegistrationEvent`**<br>(Shop register) | 邮箱已验证且有本地认证：<br>❌ return `{ success: true }`<br>❌ 不走到 publish<br>❌ 订阅者收不到<br><br>邮箱不一致状态：<br>❌ 上游 `createOrUpdate` 返回错误<br>❌ 不走到 publish<br>❌ 订阅者收不到 | 不需要验证但没密码：<br>❌ return `MissingPasswordError`<br>❌ 不走到 publish<br>❌ 订阅者收不到<br><br>密码验证失败：<br>❌ return `PasswordValidationError`<br>❌ 不走到 publish<br>❌ 订阅者收不到 | 成功**且用户未验证**：<br>✅ 走到 publish<br>✅ 事务 commit<br>✅ **订阅者收到**<br><br>成功**但用户已验证**：<br>❌ 进入 else 分支<br>❌ 不发布（只写历史）<br>❌ 订阅者收不到 | 🟡 **仅无冲突、校验通过、用户未验证时收到** |
+| **`AccountRegistrationEvent`**<br>(Admin create) | 邮箱已存在：<br>❌ return `EmailAddressConflictAdminError`<br>❌ 不走到 publish<br>❌ 订阅者收不到 | 无校验失败场景 | 无冲突+全部检查通过：<br>✅ 走到 publish<br>✅ 事务 commit<br>✅ **订阅者收到** | 🟡 **仅无冲突且成功时收到** |
+| **`AccountRegistrationEvent`**<br>(refresh) | 无冲突场景 | 用户不存在/已验证：<br>❌ 不进入 `if (user && !user.verified)`<br>❌ 不发布<br>❌ 订阅者收不到 | 用户存在且未验证：<br>✅ 走到 publish<br>✅ 事务 commit<br>✅ **订阅者收到** | 🟡 **仅用户存在且未验证时收到** |
+| **`AccountVerifiedEvent`** | 无冲突场景 | token 无效/过期：<br>❌ return `VerificationTokenInvalidError`<br>❌ 不走到 publish<br>❌ 订阅者收不到<br><br>缺密码/密码已设/密码无效：<br>❌ return 对应 ErrorResult<br>❌ 不走到 publish<br>❌ 订阅者收不到 | token 验证成功：<br>✅ 走到 publish<br>✅ 事务 commit<br>✅ **订阅者收到** | 🟡 **仅验证成功时收到** |
+| **`PasswordResetEvent`** | 无冲突场景 | 用户不存在/无本地认证：<br>❌ `setPasswordResetToken` 返回 undefined<br>❌ 不进入 `if (user)`<br>❌ 不发布<br>❌ 订阅者收不到 | 用户存在且有本地认证：<br>✅ 走到 publish<br>✅ 事务 commit<br>✅ **订阅者收到** | 🟡 **仅用户存在时有收到**<br>（安全设计：不存在时静默） |
+| **`PasswordResetVerifiedEvent`** | 无冲突场景 | token 无效/过期：<br>❌ return `PasswordResetTokenInvalidError`<br>❌ 不走到 publish<br>❌ 订阅者收不到<br><br>密码无效：<br>❌ return `PasswordValidationError`<br>❌ 不走到 publish<br>❌ 订阅者收不到 | token 验证成功：<br>✅ 走到 publish<br>✅ 事务 commit<br>✅ **订阅者收到** | 🟡 **仅验证成功时收到** |
+| **`IdentifierChangeRequestEvent`** | 新邮箱已存在：<br>❌ return `EmailAddressConflictError`<br>❌ 不走到 publish<br>❌ 订阅者收不到 | 找不到 User/Customer：<br>❌ return `false`<br>❌ 不走到 publish<br>❌ 订阅者收不到<br><br>不需要验证：<br>❌ 进入 else 分支<br>❌ 发布 `IdentifierChangeEvent` 替代 | 邮箱不冲突+找到 User/Customer+需要验证：<br>✅ 走到 publish<br>✅ 事务 commit<br>✅ **订阅者收到** | 🟡 **仅无冲突、找到、需要验证时收到** |
+| **`IdentifierChangeEvent`**<br>(不需要验证路径) | 新邮箱已存在：<br>❌ return `EmailAddressConflictError`<br>❌ 不走到 publish<br>❌ 订阅者收不到 | 找不到 User/Customer：<br>❌ return `false`<br>❌ 不走到 publish<br>❌ 订阅者收不到<br><br>需要验证：<br>❌ 进入 if 分支<br>❌ 发布 `IdentifierChangeRequestEvent` 替代 | 邮箱不冲突+找到 User/Customer+不需要验证：<br>✅ 走到 publish<br>✅ 事务 commit<br>✅ **订阅者收到** | 🟡 **仅无冲突、找到、不需要验证时收到** |
+| **`IdentifierChangeEvent`**<br>(token 验证路径) | 无冲突场景 | token 无效/过期：<br>❌ return `IdentifierChangeTokenInvalidError`<br>❌ 不走到 publish<br>❌ 订阅者收不到<br><br>找不到 User/Customer：<br>❌ return `false`<br>❌ 不走到 publish<br>❌ 订阅者收不到 | token 验证成功+找到 User/Customer：<br>✅ 走到 publish<br>✅ 事务 commit<br>✅ **订阅者收到** | 🟡 **仅验证成功且找到时收到** |
 
 ---
 
-### 4.5.4 关键设计模式总结
+### 4.5.4 关键设计模式总结（与上表对应）
 
-#### 模式 1："提前 return ErrorResult" — 不发布也不回滚
+#### 🔴 模式 A："无条件前置发布" — 仅 `AttemptedLoginEvent`
 
-大部分业务验证失败用这种模式：
-- `return InvalidCredentialsError`
-- `return EmailAddressConflictError`
-- `return VerificationTokenInvalidError`
+```typescript
+// auth.service.ts:57
+async authenticate(ctx, ...) {
+    await this.eventBus.publish(new AttemptedLoginEvent(ctx, ...));  // ← 方法开头第一行
+    // ... 后续验证 ...
+    if (失败) return new InvalidCredentialsError();  // ← 已发布了，不影响
+}
+```
+
+**对应上表**：`AttemptedLoginEvent` 的所有分支都是✅收到
+
+**效果**：无论成功失败，订阅者**总能收到**。用于安全审计（暴力破解检测、登录频率限制）。
+
+---
+
+#### 🟡 模式 B："提前 return ErrorResult" — 不发布也不回滚
+
+大部分事件的冲突/校验失败用这种模式：
+
+```typescript
+if (邮箱冲突) return new EmailAddressConflictError();  // ← 提前 return
+if (token无效) return new VerificationTokenInvalidError();  // ← 提前 return
+
+// ↓ 永远走不到
+await this.eventBus.publish(new AccountRegistrationEvent(ctx, user));
+```
+
+**对应上表**：冲突/校验失败列的❌收不到，成功列的✅收到
 
 **效果**：
 - 事务 commit（不回滚）
-- 但事件不发布（因为 publish() 调用在 return 之后）
+- 但 publish() 调用永远走不到
 - 订阅者收不到事件
 
-#### 模式 2："if 条件包裹 publish()" — 条件发布
+这是 Vendure 最常用的模式。
 
-如 `AccountRegistrationEvent`、`PasswordResetEvent`、`LogoutEvent`：
+---
+
+#### 🟢 模式 C："if 条件包裹 publish()" — 条件发布
+
+用 if 条件包裹 publish，条件不满足时静默跳过：
 
 ```typescript
-if (condition) {
-    await this.eventBus.publish(new XxxEvent(...));
+if (user && !user.verified) {  // ← 条件检查
+    await this.eventBus.publish(new AccountRegistrationEvent(ctx, user));
 }
-// 不满足条件时直接跳过
+// 条件不满足时，既不发布也不报错，静默继续
 ```
 
-**效果**：条件不满足时，既不发布事件，也不报错。
+**对应上表**：`AccountRegistrationEvent` (refresh)、`PasswordResetEvent`、`LogoutEvent`
 
-#### 模式 3："throw Exception" — 回滚+过滤
+**效果**：条件不满足时，既不发布事件，也不报错。常用于可选功能（如用户不存在时不发重置邮件）。
+
+---
+
+#### 🔴 模式 D："throw Exception" — 回滚+过滤
 
 只有在真正意外的情况下才用这种模式：
-- `throw new InternalServerError('error.cannot-locate-customer-for-user')`
+
+```typescript
+const customer = await this.findOneByUserId(ctx, result.id, false);
+if (!customer) {
+    throw new InternalServerError('error.cannot-locate-customer-for-user');
+}
+```
+
+**对应上表**：所有事件的"找不到 Customer"边缘情况（极少发生）
 
 **效果**：
 - 事务 rollback
@@ -954,14 +997,19 @@ if (condition) {
 - `filter(notNullOrUndefined)` 过滤掉事件
 - 订阅者收不到事件
 
-#### 模式 4："总是发布但不总是成功" — 审计事件专用
+---
 
-只有 `AttemptedLoginEvent` 用这种模式：
-- 方法开头**无条件** publish
-- 后面无论成功失败，事务都会 commit
-- 订阅者**总能收到**事件
+### 4.5.5 全局结论（与上表一致）
 
-**设计意图**：安全审计不能因为登录失败就不记录。
+| 事件组 | 订阅者能否收到的关键 |
+|--------|---------------------|
+| **登录事件** | `AttemptedLoginEvent` 总能收到；`LoginEvent` 仅认证成功+已验证时收到 |
+| **注册事件** | 仅"无冲突、校验通过、满足发布条件（如用户未验证）"三者同时满足时收到 |
+| **token 验证事件** | 仅 token 有效且未过期时收到 |
+| **密码重置事件** | 用户存在且有本地认证方法时收到（不存在时静默，防止枚举） |
+| **邮箱变更事件** | 需要验证时发 `IdentifierChangeRequestEvent`，不需要时发 `IdentifierChangeEvent`，二选一 |
+
+**最容易混淆的一点**：业务失败时（返回 ErrorResult）事务仍然 commit，不是 rollback，所以**如果已经发布了事件**（如 AttemptedLoginEvent），订阅者会收到。事件不被收到的原因不是回滚，而是**publish() 调用根本没执行到**。
 
 ---
 
@@ -988,13 +1036,13 @@ if (condition) {
 │        ↓ 立即          ↓ 等事务提交      ↓ 等事务提交      ↓ 视调用方而定      ↓ 等事务提交    │
 │                                                                                      │
 │  图例：                                                                              │
-│    ✅ = 无条件发布（总能收到）                                                       │
-│    ✴ = 条件发布（满足特定条件才发布，失败时不发布但事务仍提交）                        │
+│    ✅ = 无条件前置发布（总能收到，如 AttemptedLoginEvent）                           │
+│    ✴ = 成功路径末尾发布（冲突/校验失败时提前 return，不走到 publish）                │
 │                                                                                      │
-│  认证/账户事件的分支逻辑：                                                           │
-│    AttemptedLoginEvent: 方法开头第一行无条件发布 → 无论成功失败都能收到                 │
-│    其他事件: 被 if 条件/提前 return 包裹 → 失败时不走到 publish → 收不到               │
-│    所有失败用 return ErrorResult（不是 throw）→ 事务仍 commit → 不会被过滤             │
+│  认证/账户事件的统一口径（见第 4.5.3 节）：                                           │
+│    AttemptedLoginEvent: 方法开头无条件发布 → 无论成功失败都能收到                     │
+│    其他事件: 冲突/校验失败时提前 return → 不走到 publish → 收不到                     │
+│    关键: 事务总是 commit（不 throw）→ 已发布的事件不会被过滤，但大多根本没发布        │
 └────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -1421,13 +1469,22 @@ filter(notNullOrUndefined),  // 事务回滚时 event 变为 undefined，被过�
 
 如果认证失败时事件被过滤掉，安全监控插件就无法统计失败的登录尝试，这会是一个严重的安全缺陷。
 
-#### 8.6.5 其他事件的设计选择
+#### 8.6.5 各事件的实际设计选择（与第 4.5.3 节对照）
 
-| 事件 | 失败模式 | 设计意图 |
-|------|---------|---------|
-| `AccountRegistrationEvent` | `return EmailAddressConflictError` | 邮箱冲突时也需要发通知邮件（"有人试图用你的邮箱注册"） |
-| `IdentifierChangeRequestEvent` | `return EmailAddressConflictError` | 新邮箱冲突时也需要记录日志 |
-| `PasswordResetEvent` | 用户不存在时**不 publish**，不抛异常 | 不泄露"该邮箱是否已注册"信息（防止账户枚举攻击） |
-| `AccountVerifiedEvent` | 验证失败时 `return` ErrorResult，但**不 publish** | 只有验证成功才发欢迎邮件 |
+**详细分支分析见第 4.5.3 节统一口径表**。以下从设计意图角度总结：
 
-这个模式贯穿整个 Vendure 代码库：**预期内的业务错误用 return ErrorResult，保证审计事件能被订阅者收到；意外的系统错误用 throw Exception，回滚事务并丢弃事件。**
+| 事件 | 实际行为（与代码一致） | 设计意图 |
+|------|----------------------|---------|
+| `AttemptedLoginEvent` | 方法开头无条件发布；失败时 return ErrorResult 但**已发布** → 订阅者总能收到 | 安全审计必须记录所有登录尝试，无论成功失败 |
+| `AccountRegistrationEvent` | 邮箱冲突时**提前 return** → 不走到 publish → 收不到；仅用户未验证且无冲突时才发布 | 冲突时不发邮件，避免骚扰；仅真正的新用户注册才发验证邮件 |
+| `IdentifierChangeRequestEvent` | 新邮箱冲突时**提前 return** → 不走到 publish → 收不到；仅无冲突且需要验证时才发布 | 冲突时不需要发验证邮件 |
+| `PasswordResetEvent` | 用户不存在时**不进入 if 块** → 静默跳过；仅用户存在且有本地认证时才发布 | 不泄露"该邮箱是否已注册"信息（防止账户枚举攻击） |
+| `AccountVerifiedEvent` | 验证失败时 return ErrorResult，**不走到 publish** → 收不到；仅验证成功才发布 | 只有验证成功才发欢迎邮件 |
+
+**关键修正**：之前的"邮箱冲突时也需要发通知邮件"与代码不符。实际上所有冲突/校验失败场景都是**提前 return，不走到 publish**，订阅者收不到。只有 `AttemptedLoginEvent` 是例外——它在方法开头就已经发布了。
+
+**两类"收不到"的区别**：
+1. **提前 return 导致收不到**（占 90%）：publish() 调用根本没执行到，事件从未进入 EventBus
+2. **事务回滚导致收不到**（占 10%，边缘情况）：publish() 执行了，但事务回滚时被 filter 过滤掉
+
+这个模式贯穿整个 Vendure 代码库：**审计事件（AttemptedLoginEvent）在方法开头无条件发布，业务失败用 return ErrorResult 保证已发布的审计事件能被收到；其他事件在成功路径末尾发布，失败时提前 return 保证不发布；意外的系统错误用 throw Exception，回滚事务并丢弃事件。**
