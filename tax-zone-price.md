@@ -133,11 +133,11 @@ customerGroup?: CustomerGroup;
 
 **匹配逻辑对比**:
 
-| TaxRate 属性 | test() 匹配条件 | getApplicableTaxRate() 实际行为 |
-|------------|----------------|-------------------------------|
-| zone.id    | ✅ 必须匹配 | ✅ 必须匹配 |
-| category.id | ✅ 必须匹配 | ✅ 必须匹配 |
-| customerGroup.id | ❌ 不参与匹配 | ❌ 完全忽略 |
+| TaxRate 属性 | `test()` 是否匹配 | `getApplicableTaxRate()` 是否匹配 |
+|------------|------------------|----------------------------------|
+| zone.id    | ✅ 必须相等 | ✅ 必须相等（通过 `test()` 间接匹配） |
+| category.id | ✅ 必须相等 | ✅ 必须相等（通过 `test()` 间接匹配） |
+| customerGroup.id | ❌ 不参与 | ❌ 不参与（间接，因为 `test()` 不检查） |
 
 **实际影响**:
 1. 即使在管理后台为某个税率配置了 `customerGroup`，该税率在价格计算中也**不会**仅对该客户组成员生效
@@ -192,7 +192,7 @@ export class TaxRateService {
 **设计要点**:
 - **性能优化**: 使用 `SelfRefreshingCache` 缓存所有启用的税率，避免频繁查询数据库
 - **降级策略**: 未找到匹配税率时返回 0% 的默认税率（`defaultTaxRate`）
-- **缓存失效**: 创建/更新/删除税率时触发 `updateActiveTaxRates()` 刷新缓存
+- **缓存刷新**: 仅创建和更新税率时调用 `updateActiveTaxRates()` 立即刷新缓存；删除税率时**不刷新缓存**，依赖 TTL 过期后自动刷新
 
 ---
 
@@ -202,11 +202,15 @@ export class TaxRateService {
 
 三条操作路径的缓存刷新行为有明显差异：
 
-| 操作 | 缓存刷新 | 事件发布 | 事务提交 | 说明 |
-|------|----------|----------|----------|------|
-| **create** | ✅ `updateActiveTaxRates(ctx)` | ✅ TaxRateModificationEvent<br>✅ TaxRateEvent | ❌ 不主动提交 | 立即刷新本地缓存<br>事件通知其他订阅者 |
-| **update** | ✅ `updateActiveTaxRates(ctx)` | ✅ TaxRateModificationEvent<br>✅ TaxRateEvent | ✅ `commitOpenTransaction(ctx)` | **先刷新缓存<br>**强制提交事务<br>确保 Worker 进程能读取到更新后的数据 |
-| **delete** | ❌ **不刷新缓存** | ❌ 无刷新 | ❌ 无 | ⚠️ **删除后缓存仍保留旧数据<br>仅发布 TaxRateEvent<br>依赖缓存 TTL 自动过期 |
+| 操作 | 缓存刷新 | 事件发布 | 事务提交 |
+|------|----------|----------|----------|
+| **create** | ✅ `updateActiveTaxRates(ctx)` | ✅ TaxRateModificationEvent + TaxRateEvent | ❌ 不主动提交 |
+| **update** | ✅ `updateActiveTaxRates(ctx)` | ✅ TaxRateModificationEvent + TaxRateEvent | ✅ `commitOpenTransaction(ctx)` |
+| **delete** | ❌ **不刷新缓存** | ⚠️ 仅 TaxRateEvent，**不发布 TaxRateModificationEvent** | ❌ 无 |
+
+关键差异总结：
+- **create / update**：立即刷新缓存 + 发布两种事件；update 额外提交事务以确保 Worker 进程可见
+- **delete**：不刷新缓存（依赖 TTL 过期），仅发布 TaxRateEvent，不发布 TaxRateModificationEvent
 
 #### 代码对比
 
@@ -276,7 +280,7 @@ async delete(ctx: RequestContext, id: ID): Promise<DeletionResponse> {
 
 ### 2.1.2 getApplicableTaxRate 与 test 的匹配逻辑差异
 
-**getApplicableTaxRate 实现** (`tax-rate.service.ts:192-199):
+**getApplicableTaxRate 实现** (`tax-rate.service.ts:192-199`):
 ```typescript
 async getApplicableTaxRate(
     ctx: RequestContext,
@@ -288,7 +292,7 @@ async getApplicableTaxRate(
 }
 ```
 
-**test 方法实现** (`tax-rate.entity.ts:94-98):
+**test 方法实现** (`tax-rate.entity.ts:94-98`):
 ```typescript
 test(zone: Zone | ID, taxCategory: TaxCategory | ID): boolean {
     const taxCategoryId = this.isId(taxCategory) ? taxCategory : taxCategory.id;
@@ -297,22 +301,30 @@ test(zone: Zone | ID, taxCategory: TaxCategory | ID): boolean {
 }
 ```
 
-**关键差异**:
+**对比分析**:
 
-| 维度 | test() 方法 | getApplicableTaxRate() |
-|------|-------------|----------------------|
-| 匹配条件 | zone.id + category.id | 匹配 | 调用 test() 匹配 |
-| customerGroup | ❌ 不参与匹配 | ❌ 间接不参与匹配 |
-| enabled 状态 | ❌ 不检查 | ✅ 缓存已过滤 enabled=true |
-| 返回值 | boolean | 返回匹配的 TaxRate 或 defaultTaxRate |
+`getApplicableTaxRate` 内部调用 `test()`，二者共享同一匹配逻辑（zone.id + category.id），但各自的职责边界不同：
+
+| 维度 | `test()` (TaxRate 实体方法) | `getApplicableTaxRate()` (TaxRateService 方法) |
+|------|---------------------------|----------------------------------------------|
+| 职责 | 判断单条 TaxRate 是否匹配给定的 zone + taxCategory | 在所有启用税率中找到匹配项 |
+| 匹配字段 | 仅比较 `this.zoneId` 和 `this.categoryId` | 调用 `test()`，匹配逻辑相同 |
+| customerGroup | 不参与匹配 | 不参与匹配（间接，因为 `test()` 不检查） |
+| enabled 状态 | 不检查 | 不检查（但调用前已通过 `findActiveTaxRates()` 过滤） |
+| 输入 | zone + taxCategory | zone + taxCategory |
+| 返回值 | `boolean` | `TaxRate`（匹配则返回实例，否则返回 0% 默认税率） |
 
 **enabled 过滤时机**:
-- `findActiveTaxRates() 查询时已通过 `where: { enabled: true }` 过滤
-- 所以 test() 不需要再检查 enabled 状态
+- `test()` 自身不检查 `enabled` 字段
+- `getApplicableTaxRate()` 也不检查 `enabled` 字段
+- enabled 过滤发生在上游：`findActiveTaxRates()` 查询时通过 `where: { enabled: true }` 过滤，结果进入 `SelfRefreshingCache`
+- 因此 `getApplicableTaxRate()` 从缓存取到的税率列表**已经不含** disabled 的记录，`test()` 无需再判断
 
-**实际影响**:
-1. 只有启用的税率才会被缓存和使用
-2. disabled 的税率完全不参与价格计算
+**customerGroup 的设计落差**:
+- TaxRate 实体注释声明税率取决于三个因素：TaxCategory、Zone、CustomerGroup
+- 但 `test()` 方法仅匹配 zone 和 category，完全忽略 customerGroup
+- 因此 `getApplicableTaxRate()` 实际也忽略了 customerGroup
+- 若同一 zone + category 组合下存在多条 TaxRate（仅 customerGroup 不同），`Array.find()` 返回第一条匹配项，结果取决于数据库返回顺序，具有不确定性
 
 ---
 
@@ -789,7 +801,8 @@ OrderCalculator.applyPriceAdjustments()
 
 1. **策略模式广泛应用**: 税区确定、税行计算、订单税总计均可自定义策略
 2. **多层缓存优化**: 从全局到单次计算，三级缓存确保性能
-3. **双重匹配机制**: 税率通过 **税区 + 税类** 双重条件匹配
+3. **双重匹配机制**: 税率通过 **税区 + 税类** 双重条件匹配；实体注释声称包含 customerGroup 三维匹配，但实际代码未实现
 4. **税区动态感知**: 订单计算时检测税区变更并重新计算税费
 5. **促销-税费交互**: 促销后重新计算税费，确保税基正确
 6. **降级设计**: 无匹配税率时返回 0%，避免系统异常
+7. **缓存刷新不对称**: create/update 立即刷新缓存，delete 不刷新（依赖 TTL），delete 也不发布 TaxRateModificationEvent
