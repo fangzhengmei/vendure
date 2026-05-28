@@ -115,6 +115,39 @@ export class TaxRate extends VendureEntity {
 
 ---
 
+### 1.3 关于 TaxRate.customerGroup 的说明
+
+**实体字段定义** (`packages/core/src/entity/tax-rate/tax-rate.entity.ts:52-54`):
+```typescript
+@Index()
+@ManyToOne(type => CustomerGroup, customerGroup => customerGroup.taxRates, { nullable: true })
+customerGroup?: CustomerGroup;
+```
+
+**设计意图**:
+- `customerGroup` 字段是 TaxRate 实体的**预留扩展字段**，理论上支持为特定客户组配置差异化税率
+- 例如: VIP 客户组享受 0% 税率，批发客户组享受 7% 优惠税率等
+
+**当前实现限制**:
+⚠️ **重要**: 尽管数据库字段和实体定义支持 `customerGroup`，但 **当前 `getApplicableTaxRate()` 和 `test()` 方法在匹配时完全忽略此字段**。
+
+**匹配逻辑对比**:
+
+| TaxRate 属性 | test() 匹配条件 | getApplicableTaxRate() 实际行为 |
+|------------|----------------|-------------------------------|
+| zone.id    | ✅ 必须匹配 | ✅ 必须匹配 |
+| category.id | ✅ 必须匹配 | ✅ 必须匹配 |
+| customerGroup.id | ❌ 不参与匹配 | ❌ 完全忽略 |
+
+**实际影响**:
+1. 即使在管理后台为某个税率配置了 `customerGroup`，该税率在价格计算中也**不会**仅对该客户组成员生效
+2. 只要 `zone` 和 `category` 匹配，所有客户都会应用该税率
+3. 如果同一 `zone + category` 组合下配置了多个税率（区分不同 `customerGroup`），`find()` 会返回**第一个匹配项**，结果具有不确定性
+
+**扩展点**: 如需实现客户组差异化税率，需自定义 `TaxLineCalculationStrategy` 或修改 `TaxRateService.getApplicableTaxRate()` 逻辑。
+
+---
+
 ## 二、税率解析流程
 
 ### 2.1 TaxRateService: 税率服务核心
@@ -160,6 +193,128 @@ export class TaxRateService {
 - **性能优化**: 使用 `SelfRefreshingCache` 缓存所有启用的税率，避免频繁查询数据库
 - **降级策略**: 未找到匹配税率时返回 0% 的默认税率（`defaultTaxRate`）
 - **缓存失效**: 创建/更新/删除税率时触发 `updateActiveTaxRates()` 刷新缓存
+
+---
+
+### 2.1.1 create / update / delete 缓存刷新行为差异
+
+**文件**: `packages/core/src/service/services/tax-rate.service.ts`
+
+三条操作路径的缓存刷新行为有明显差异：
+
+| 操作 | 缓存刷新 | 事件发布 | 事务提交 | 说明 |
+|------|----------|----------|----------|------|
+| **create** | ✅ `updateActiveTaxRates(ctx)` | ✅ TaxRateModificationEvent<br>✅ TaxRateEvent | ❌ 不主动提交 | 立即刷新本地缓存<br>事件通知其他订阅者 |
+| **update** | ✅ `updateActiveTaxRates(ctx)` | ✅ TaxRateModificationEvent<br>✅ TaxRateEvent | ✅ `commitOpenTransaction(ctx)` | **先刷新缓存<br>**强制提交事务<br>确保 Worker 进程能读取到更新后的数据 |
+| **delete** | ❌ **不刷新缓存** | ❌ 无刷新 | ❌ 无 | ⚠️ **删除后缓存仍保留旧数据<br>仅发布 TaxRateEvent<br>依赖缓存 TTL 自动过期 |
+
+#### 代码对比
+
+**create 路径** (`tax-rate.service.ts:114-131**):
+```typescript
+async create(ctx: RequestContext, input: CreateTaxRateInput): Promise<TaxRate> {
+    // ... 保存实体
+    const newTaxRate = await this.connection.getRepository(ctx, TaxRate).save(taxRate);
+    await this.updateActiveTaxRates(ctx);  // ✅ 刷新缓存
+    await this.eventBus.publish(new TaxRateModificationEvent(ctx, newTaxRate));
+    await this.eventBus.publish(new TaxRateEvent(ctx, newTaxRate, 'created', input));
+    return assertFound(this.findOne(ctx, newTaxRate.id));
+}
+```
+
+**update 路径** (`tax-rate.service.ts:133-168**):
+```typescript
+async update(ctx: RequestContext, input: UpdateTaxRateInput): Promise<TaxRate> {
+    // ... 更新实体
+    await this.connection.getRepository(ctx, TaxRate).save(updatedTaxRate, { reload: false });
+    await this.updateActiveTaxRates(ctx);  // ✅ 刷新缓存
+    
+    // ✅ 关键: 强制提交事务，确保 Worker 进程能访问更新后的税率
+    await this.connection.commitOpenTransaction(ctx);
+    
+    await this.eventBus.publish(new TaxRateModificationEvent(ctx, updatedTaxRate));
+    await this.eventBus.publish(new TaxRateEvent(ctx, updatedTaxRate, 'updated', input));
+    return assertFound(this.findOne(ctx, taxRate.id));
+}
+```
+
+**delete 路径** (`tax-rate.service.ts:170-185**):
+```typescript
+async delete(ctx: RequestContext, id: ID): Promise<DeletionResponse> {
+    const taxRate = await this.connection.getEntityOrThrow(ctx, TaxRate, id);
+    const deletedTaxRate = new TaxRate(taxRate);
+    try {
+        await this.connection.getRepository(ctx, TaxRate).remove(taxRate);
+        // ❌ 注意: 此处不调用 updateActiveTaxRates()!
+        await this.eventBus.publish(new TaxRateEvent(ctx, deletedTaxRate, 'deleted', id));
+        return { result: DeletionResult.DELETED };
+    } catch (e: any) {
+        return { result: DeletionResult.NOT_DELETED, message: e.toString() };
+    }
+}
+```
+
+**设计意图分析**:
+
+1. **update 路径的事务提交**:
+   - `commitOpenTransaction` 确保数据库事务立即提交
+   - 目的是让 Worker 进程在处理 `TaxRateModificationEvent` 时能读取到最新数据
+   - Worker 进程可能需要重新索引搜索索引（见 `default-search-plugin.ts:198-208`）
+
+2. **delete 路径不刷新缓存的潜在问题**:
+   - 删除税率后，缓存中仍保留旧数据
+   - 直到缓存 TTL 过期才会刷新
+   - 期间价格计算可能仍使用已删除的税率
+   - 这是一个设计上的权衡：避免频繁刷新缓存
+
+3. **TaxRateModificationEvent 的作用**:
+   - 已标记 `@deprecated`，推荐使用 `TaxRateEvent`
+   - 主要被 `DefaultSearchPlugin` 监听
+   - 当默认税区的税率变更时触发重新索引
+
+---
+
+### 2.1.2 getApplicableTaxRate 与 test 的匹配逻辑差异
+
+**getApplicableTaxRate 实现** (`tax-rate.service.ts:192-199):
+```typescript
+async getApplicableTaxRate(
+    ctx: RequestContext,
+    zone: Zone | ID,
+    taxCategory: TaxCategory | ID,
+): Promise<TaxRate> {
+    const rate = (await this.getActiveTaxRates(ctx)).find(r => r.test(zone, taxCategory));
+    return rate || this.defaultTaxRate;
+}
+```
+
+**test 方法实现** (`tax-rate.entity.ts:94-98):
+```typescript
+test(zone: Zone | ID, taxCategory: TaxCategory | ID): boolean {
+    const taxCategoryId = this.isId(taxCategory) ? taxCategory : taxCategory.id;
+    const zoneId = this.isId(zone) ? zone : zone.id;
+    return idsAreEqual(taxCategoryId, this.categoryId) && idsAreEqual(zoneId, this.zoneId);
+}
+```
+
+**关键差异**:
+
+| 维度 | test() 方法 | getApplicableTaxRate() |
+|------|-------------|----------------------|
+| 匹配条件 | zone.id + category.id | 匹配 | 调用 test() 匹配 |
+| customerGroup | ❌ 不参与匹配 | ❌ 间接不参与匹配 |
+| enabled 状态 | ❌ 不检查 | ✅ 缓存已过滤 enabled=true |
+| 返回值 | boolean | 返回匹配的 TaxRate 或 defaultTaxRate |
+
+**enabled 过滤时机**:
+- `findActiveTaxRates() 查询时已通过 `where: { enabled: true }` 过滤
+- 所以 test() 不需要再检查 enabled 状态
+
+**实际影响**:
+1. 只有启用的税率才会被缓存和使用
+2. disabled 的税率完全不参与价格计算
+
+---
 
 ### 2.2 税率匹配逻辑
 
@@ -323,6 +478,73 @@ async applyChannelPriceAndTax(
 - **两级缓存**: 
   - RequestContextCache: 同一请求内缓存税区和税率
   - TaxRateService 自刷新缓存: 跨请求缓存税率列表
+
+---
+
+### 4.1.1 pricesIncludeTax 跨税区净价换算逻辑
+
+**文件**: `packages/core/src/config/catalog/default-product-variant-price-calculation-strategy.ts`
+
+当 Channel 配置 `pricesIncludeTax = true` 时，产品价格在非默认税区展示时需要进行**净价换算**。
+
+```typescript
+async calculate(args: ProductVariantPriceCalculationArgs): Promise<PriceCalculationResult> {
+    const { inputPrice, activeTaxZone, ctx, taxCategory } = args;
+    let price = inputPrice;
+    let priceIncludesTax = false;
+
+    if (ctx.channel.pricesIncludeTax) {
+        // 判断当前税区是否为 Channel 的默认税区
+        const isDefaultZone = idsAreEqual(activeTaxZone.id, ctx.channel.defaultTaxZone.id);
+        
+        if (isDefaultZone) {
+            // 默认税区: 价格保持含税状态
+            priceIncludesTax = true;
+        } else {
+            // 非默认税区: 先换算为净价
+            // 步骤 1: 获取默认税区的税率
+            const taxRateForDefaultZone = await this.taxRateService.getApplicableTaxRate(
+                ctx,
+                ctx.channel.defaultTaxZone,
+                taxCategory,
+            );
+            // 步骤 2: 从含税价中扣除默认税区的税，得到净价
+            price = roundMoney(taxRateForDefaultZone.netPriceOf(inputPrice));
+            // priceIncludesTax 保持 false，后续展示时会按当前税区重新计税
+        }
+    }
+
+    return { price, priceIncludesTax };
+}
+```
+
+#### 换算逻辑详解
+
+**场景假设**:
+- Channel A 配置 `pricesIncludeTax = true`
+- 默认税区: 欧盟 (税率 20%)
+- 产品价格: €120 (含税)
+- 非默认税区: 美国 (税率 0%)
+
+```
+产品输入价格 (inputPrice): €120 (按默认税区 EU 20% 含税存储)
+       │
+       ├─→ 当前税区 = 默认税区 (EU)
+       │     └─→ price = €120, priceIncludesTax = true
+       │           直接展示含税价
+       │
+       └─→ 当前税区 ≠ 默认税区 (如 US)
+             ├─→ 步骤 1: 获取默认税区税率 (EU 20%)
+             ├─→ 步骤 2: netPriceOf(120, 20%) = 120 / 1.2 = €100
+             ├─→ 步骤 3: price = €100, priceIncludesTax = false
+             └─→ 后续 ProductPriceApplicator 会根据美国税率重新计算展示价格
+```
+
+**设计意图**:
+1. 价格在数据库中按默认税区的含税价存储
+2. 非默认税区访问时，先剥离默认税区的税得到净价
+3. 再根据当前税区税率重新计算含税价（在 ProductPriceApplicator 中完成）
+4. 确保不同税区的客户看到正确的当地含税价格
 
 ---
 
