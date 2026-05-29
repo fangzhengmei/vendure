@@ -512,7 +512,7 @@ if (missingChannelIds.length) {
             到达这里时，customer.channels 已包含当前渠道
 ```
 
-**草稿订单的特殊语义**：草稿订单创建时（`order.service.ts:478-490`）已通过 `channelService.assignToCurrentChannel(newOrder, ctx)` 分配到当前渠道，所以 `order.channels` 只包含当前渠道，不会有多渠道问题。
+**草稿订单的渠道归属**：草稿订单创建时（`order.service.ts:478-490`）调用 `channelService.assignToCurrentChannel(newOrder, ctx)`，将订单分配到 **`{当前渠道, 默认渠道}`**（去重后的集合）。所以 `order.channels` 至少包含这两个渠道，可能有多渠道问题（详见第 8.5 节）。
 
 ✅ **标准链路下也不可能触发"空组"** —— 两种模式都确保了客户在当前渠道。
 
@@ -659,6 +659,273 @@ await this.orderService.addCustomerToOrder(ctx, orderId, customer);
 3. **该客户在 `customer.channels` 确实不包含 `ctx.channelId`。**
 
 **标准 GraphQL 链路都在入口前拦截了，只有自定义代码绕过才会出现。**
+
+---
+
+### 7.8 `createDraft` 与 `assignToCurrentChannel` 的分配结果详解
+
+理解草稿订单的渠道归属是避免误判的关键。让我们从代码层面拆解 `assignToCurrentChannel` 的行为。
+
+**`assignToCurrentChannel` 实现**（`channel.service.ts:118-127`）：
+
+```ts
+async assignToCurrentChannel<T extends ChannelAware & VendureEntity>(
+    entity: T,
+    ctx: RequestContext,
+): Promise<T> {
+    const defaultChannel = await this.getDefaultChannel(ctx);
+    const channelIds = unique([ctx.channelId, defaultChannel.id]);
+    //                     ^^^^^^ 去重！当前渠道可能就是默认渠道
+    entity.channels = channelIds.map(id => ({ id })) as any;
+    await this.eventBus.publish(new ChangeChannelEvent(ctx, entity, [ctx.channelId], 'assigned'));
+    return entity;
+}
+```
+
+**`getDefaultChannel` 实现**（`channel.service.ts:293-301`）：
+
+```ts
+async getDefaultChannel(ctx?: RequestContext): Promise<Channel> {
+    const allChannels = await this.allChannels.value(ctx);
+    const defaultChannel = allChannels.find(channel => channel.code === DEFAULT_CHANNEL_CODE);
+    // DEFAULT_CHANNEL_CODE = '__default_channel__'
+    if (!defaultChannel) {
+        throw new InternalServerError('error.default-channel-not-found');
+    }
+    return defaultChannel;
+}
+```
+
+**草稿订单创建流程**（`order.service.ts:478-490`）：
+
+```ts
+async createDraft(ctx: RequestContext) {
+    const newOrder = await this.createEmptyOrderEntity(ctx);
+    newOrder.active = false;
+    await this.channelService.assignToCurrentChannel(newOrder, ctx);
+    // 分配到 {ctx.channelId, defaultChannel.id} 去重后的集合
+    const order = await this.connection.getRepository(ctx, Order).save(newOrder);
+    ...
+}
+```
+
+**分配结果的三种情况**：
+
+| 场景 | `ctx.channelId` | `defaultChannel.id` | `unique()` 结果 | 订单渠道集合 |
+|------|-----------------|---------------------|-----------------|------------|
+| 当前渠道就是默认渠道 | A（默认） | A | `[A]` | `{A}` |
+| 当前渠道 ≠ 默认渠道 | B | A | `[B, A]` | `{A, B}` |
+| 当前渠道 ≠ 默认渠道 | C | A | `[C, A]` | `{A, C}` |
+
+**关键结论**：
+- ✅ 草稿订单**永远包含默认渠道**
+- ✅ 草稿订单**永远包含当前操作渠道**
+- ⚠️ 如果当前渠道不是默认渠道，草稿订单属于**两个渠道**
+
+**普通订单创建流程**（`order.service.ts:459-476`）：
+
+```ts
+async create(ctx: RequestContext, userId?: ID): Promise<Order> {
+    const newOrder = await this.createEmptyOrderEntity(ctx);
+    if (userId) {
+        const customer = await this.customerService.findOneByUserId(ctx, userId);
+        if (customer) {
+            newOrder.customer = customer;
+        }
+    }
+    await this.channelService.assignToCurrentChannel(newOrder, ctx);
+    // 同样分配到 {ctx.channelId, defaultChannel.id}
+    const order = await this.connection.getRepository(ctx, Order).save(newOrder);
+    ...
+}
+```
+
+普通订单和草稿订单使用**完全相同**的渠道分配逻辑。
+
+---
+
+### 7.9 三条入口的客户与订单渠道约束对比
+
+三条标准 GraphQL 入口对"客户渠道"与"订单渠道"的约束强度各不相同。理解这一点是避免"客户未分配渠道 → 分组空组"的核心。
+
+#### 约束强度矩阵
+
+| 入口 Mutation | 订单渠道集合 | 客户来源 | 渠道校验逻辑 | 校验对象 |
+|----------------|------------|----------|------------|----------|
+| **`setOrderCustomer`**（管理端，已有订单） | `order.channels`（可能多渠道） | `customerId` 指定 | ① `findOneInChannel(ctx, Customer, customerId, ctx.channelId)`<br>② `order.channels ⊆ customer.channels` | ① 客户在当前操作渠道<br>② 客户在订单的**所有**渠道 |
+| **`setCustomerForDraftOrder`**（管理端，草稿单） | `{ctx.channelId, defaultChannel.id}` | `customerId` 或 `input` | `customerId` 模式：`findOneInChannel(ctx, Customer, customerId, ctx.channelId)`<br>`input` 模式：`createOrUpdate` 自动分配 | 仅校验客户在**当前操作渠道** |
+| **`setCustomerForOrder`**（店铺端，访客结账） | `{ctx.channelId, defaultChannel.id}` | `input` 邮箱匹配或新建 | `createOrUpdate` 自动 `push(ctx.channel)` | **不校验**，直接分配当前渠道 |
+
+#### 逐条分析
+
+##### 1. `setOrderCustomer` —— 最严格的双重校验
+
+**订单渠道**：加载 `order.channels`（可能来自历史数据，可能多渠道）
+
+**校验逻辑**（`order.service.ts:529-552`）：
+
+```ts
+// 第一层：客户在当前操作渠道吗？
+const targetCustomer = await this.customerService.findOne(ctx, customerId, ['channels']);
+// → 内部 findOneInChannel，过滤 ctx.channelId
+if (!targetCustomer) {
+    throw new EntityNotFoundError('Customer', customerId);
+}
+
+// 第二层：客户在订单的所有渠道吗？
+const channelIds = order.channels.map(c => c.id);
+const customerChannelIds = targetCustomer.channels.map(c => c.id);
+const missingChannelIds = channelIds.filter(id => !customerChannelIds.includes(id));
+if (missingChannelIds.length) {
+    throw new UserInputError(
+        `error.target-customer-not-assigned-to-order-channels`,
+        { channelIds: missingChannelIds.join(', ') }
+    );
+}
+```
+
+**设计意图**：管理端对已有订单操作要严谨，确保客户在该订单的**全部**渠道中都可见。
+
+##### 2. `setCustomerForDraftOrder` —— 只校验当前渠道
+
+**订单渠道**：`{ctx.channelId, defaultChannel.id}`（创建时确定）
+
+**校验逻辑**（`draft-order.resolver.ts:147-154`）：
+
+```ts
+if (args.customerId) {
+    const result = await this.customerService.findOne(ctx, args.customerId);
+    // → 内部 findOneInChannel，过滤 ctx.channelId
+    if (!result) {
+        throw new UserInputError(
+            `No customer with the id "${args.customerId}" was found in this Channel`
+        );
+    }
+    customer = result;
+}
+```
+
+**⚠️ 注意**：只校验客户在 `ctx.channelId`，**不校验客户在默认渠道**。
+
+**理论风险场景**：
+- 当前操作渠道 = B，默认渠道 = A
+- 草稿单渠道 = `{A, B}`
+- 客户只在 B 渠道，不在 A 渠道
+- `setCustomerForDraftOrder` 校验通过（客户在 B）
+- 但客户不在 A（默认渠道）
+- 当从 A 渠道查看该订单并触发促销计算时：
+  ```
+  getCustomerGroups(ctx_A, customerId)
+    → findOneInChannel(ctx_A, Customer, customerId, A)
+       → 客户不在 A → 返回 undefined → 返回 []
+          → 分组条件静默失败
+  ```
+
+**实际中为何很少触发**：
+- 客户创建时 `assignToCurrentChannel` 会分配到 `{当前渠道, 默认渠道}`
+- 所以正常创建的客户**永远包含默认渠道**
+- 只有自定义代码绕过 Service 层、或数据库直接操作删除了默认渠道关联，才会出现"客户不在默认渠道"
+
+##### 3. `setCustomerForOrder` —— 不校验，直接分配
+
+**订单渠道**：`{ctx.channelId, defaultChannel.id}`
+
+**分配逻辑**（`customer.service.ts:682-693`）：
+
+```ts
+// 邮箱匹配到现有客户 → push 当前渠道
+if (existing) {
+    customer = patchEntity(existing, input);
+    customer.channels.push(await this.connection.getEntityOrThrow(ctx, Channel, ctx.channelId));
+}
+// 新建客户 → assignToCurrentChannel
+else {
+    customer = await this.connection.getRepository(ctx, Customer).save(new Customer(input));
+    await this.channelService.assignToCurrentChannel(customer, ctx);
+    // → 分配到 {当前渠道, 默认渠道}
+}
+```
+
+**设计意图**：店铺端访客结账要流畅，自动完成渠道分配，不让用户感知到多渠道概念。
+
+---
+
+### 7.10 "标准链路不会空组、绕过链路才会空组"的可核对清单
+
+要确保"客户未分配渠道 → 分组空组"不会发生，可对照以下清单逐项核对。
+
+#### 前提 A：必须走标准 GraphQL 入口（✅ 不会触发）
+
+- [ ] 管理端切换已有订单客户 → 使用 `setOrderCustomer` mutation
+- [ ] 管理端给草稿单设客户 → 使用 `setCustomerForDraftOrder` mutation
+- [ ] 店铺端访客结账 → 使用 `setCustomerForOrder` mutation
+
+如果以上任一为 ✅，且不走自定义代码绕过，**不会触发"空组"**。
+
+---
+
+#### 前提 B：如果必须走自定义代码（⚠️ 可能触发，需满足所有校验）
+
+**必须同时满足以下所有条件**：
+
+- [ ] **客户实体必须经过渠道过滤加载**：
+  - ✅ 使用 `customerService.findOne(ctx, customerId, ['channels'])`
+  - ❌ 不是 `connection.getRepository(ctx, Customer).findOne(customerId)`
+  - ❌ 不是数据库直接构造的 `Customer` 对象
+
+- [ ] **如果绑定到已有订单，必须校验订单的所有渠道**：
+  ```ts
+  const order = await this.orderService.findOne(ctx, orderId, ['channels']);
+  const customer = await this.customerService.findOne(ctx, customerId, ['channels']);
+  const allOrderChannelsPresent = order.channels.every(
+    orderChannel => customer.channels.some(
+      custChannel => idsAreEqual(custChannel.id, orderChannel.id)
+    )
+  );
+  if (!allOrderChannelsPresent) {
+      // 抛错，不继续绑定
+  }
+  ```
+
+- [ ] **不跨渠道设置客户**：确保 `ctx.channelId` 是订单所在的渠道
+
+- [ ] **不绕过 `addCustomerToOrder`**：使用 `orderService.addCustomerToOrder()` 而非直接 `repository.save(order)`
+
+如果以上**全部**为 ✅，自定义代码也不会触发"空组"。
+
+---
+
+#### 前提 C：数据库层面的保证（防止历史数据出问题）
+
+- [ ] **所有 Customer 记录都包含默认渠道**：
+  ```sql
+  -- 验证查询
+  SELECT c.id, c.emailAddress
+  FROM customer c
+  LEFT JOIN customer_channels__channel cc ON cc.customerId = c.id
+  LEFT JOIN channel ch ON ch.id = cc.channelId
+  WHERE ch.code = '__default_channel__'
+    AND cc.channelId IS NULL;
+  -- 应该返回 0 行
+  ```
+
+- [ ] **没有跳过 Service 层的批量操作**：批量导入客户、批量修改渠道时必须调用 `channelService.assignToChannels()`
+
+- [ ] **没有手动删除渠道关联**：不直接操作 `customer_channels__channel` 表的 DELETE 语句
+
+如果以上全部为 ✅，历史数据层面也不会出现"客户未分配渠道"。
+
+---
+
+#### 触发"空组"的反面模式（❌ 必须避免）
+
+- [ ] ❌ 直接 `connection.getRepository(ctx, Customer).findOne(customerId)` 加载客户
+- [ ] ❌ 直接 `repository.save(order)` 设置 `order.customer`，跳过 `addCustomerToOrder`
+- [ ] ❌ 直接操作 `customer_channels__channel` 关联表
+- [ ] ❌ 批量导入客户时未调用 `channelService.assignToChannels()`
+- [ ] ❌ 在 `addCustomerToOrder` 前未校验客户的渠道归属
+
+以上任一为 ❌，就**可能**触发"客户未分配渠道 → 分组空组"。
 
 ---
 
@@ -894,6 +1161,7 @@ customerGroup.check(ctx, order, args) 结果
 | PromotionService | `packages/core/src/service/services/promotion.service.ts` |
 | ListQueryBuilder | `packages/core/src/service/helpers/list-query-builder/list-query-builder.ts` |
 | TransactionalConnection | `packages/core/src/connection/transactional-connection.ts` |
+| ChannelService | `packages/core/src/service/services/channel.service.ts` |
 | DefaultGuestCheckoutStrategy | `packages/core/src/config/order/default-guest-checkout-strategy.ts` |
 | Shop Order Resolver | `packages/core/src/api/resolvers/shop/shop-order.resolver.ts` |
 | Admin Draft Order Resolver | `packages/core/src/api/resolvers/admin/draft-order.resolver.ts` |
