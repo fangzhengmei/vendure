@@ -31,7 +31,12 @@
   - [8.5 阶段 4：判定点 — 权限在哪生效](#85-阶段-4判定点--权限在哪生效)
   - [8.6 权限字段流转汇总表](#86-权限字段流转汇总表)
   - [8.7 修正后的 AND/OR 语义对照表](#87-修正后的-andor-语义对照表)
-  - [8.8 最小排障清单](#88-最小排障清单)
+- [8.8 三层权限判定可复核矩阵](#88-三层权限判定可复核矩阵)
+  - [8.8.1 Dashboard (React) 版本矩阵](#881-dashboard-react-版本矩阵)
+  - [8.8.2 Admin UI (Angular) 版本矩阵](#882-admin-ui-angular-版本矩阵)
+  - [8.8.3 三层判定输入/输出详情](#883-三层判定输入输出详情)
+  - [8.8.4 优先排查顺序与故障关联](#884-优先排查顺序与故障关联)
+- [8.9 最小排障清单](#89-最小排障清单)
 - [10. 关键文件索引](#10-关键文件索引)
 - [11. 总结](#11-总结)
 
@@ -1389,7 +1394,173 @@ export interface ActionBarItem {
 | 组件级权限 | `PermissionGuard` → OR | `*vdrIfPermissions` → **OR**（注释 BUG），`hasPermission` 管道 → OR |
 | 自定义 AND | 手动在组件中实现 | `(perms) => perms.includes('A') && perms.includes('B')` |
 
-### 8.8 最小排障清单
+### 8.8 三层权限判定可复核矩阵
+
+以示例权限 `ReadProductBundle` 为例，跟踪同一权限在「导航菜单 → 路由入口 → 组件按钮」三层的完整生效路径，每一层都标明**输入条件、判定函数、返回分支、可见故障现象**和**代码位置**。
+
+---
+
+#### 8.8.1 Dashboard (React) 版本矩阵
+
+| 层级 | 输入条件示例 | 判定函数 | 返回分支 | 可见故障现象 | 代码位置 |
+|------|-------------|---------|---------|-------------|---------|
+| **1. 导航菜单（item）** | `requiresPermission: 'ReadProductBundle'`<br>+ `channel.permissions: ['Authenticated', 'ReadCatalog']`（无目标权限） | `isItemAllowed(item)` →<br>`hasPermissions(['ReadProductBundle'])` | ✅ **通过**：返回 `true`，item 保留<br>❌ **不通过**：返回 `false`，item 被 `filter` 移除 | ❌ 菜单项不显示 + 无控制台报错 | `nav-main.tsx:164-175` |
+| **1.1 导航菜单（section 二次过滤）** | section 下所有 item 都被过滤 | `getSortedSections()` 第二重 filter | ✅ **通过**：section 有 items → 保留<br>❌ **不通过**：`section.items.length === 0` → section 被移除 | ❌ 整个 section 消失（即使 section 自身无权限要求） | `nav-main.tsx:192-199` |
+| **2. 路由入口（认证级）** | `config.authenticated: true`（默认） + `isAuthenticated: false` | `Route.beforeLoad()` | ✅ **通过**：继续路由解析<br>❌ **不通过**：`throw redirect({ to: '/login' })` | ❌ 重定向到 `/login?redirect=...` | `_authenticated.tsx:7-17` |
+| **2.1 路由入口（细粒度权限）** | 自定义 `config.loader` 中检查权限 | 自定义 loader 函数 | ✅ **通过**：返回数据，继续渲染<br>❌ **不通过**：`throw redirect({ to: '/forbidden' })` 或 `throw new Error()` | ❌ 重定向到指定页 / 显示错误页 | `use-extended-router.tsx:71` |
+| **3. 组件按钮（通用）** | `<PermissionGuard requires={['ReadProductBundle']}>` + 无权限 | `PermissionGuard` → `hasPermissions()` | ✅ **通过**：返回 `children`<br>❌ **不通过**：返回 `null` | ❌ 按钮/区域不显示 + 无报错 | `permission-guard.tsx:44-50` |
+| **3.1 组件按钮（ActionBar）** | `<ActionBarItem itemId="create" requiresPermission={['ReadProductBundle']}>` | 内部用 `PermissionGuard` 包装 | ✅ **通过**：渲染按钮<br>❌ **不通过**：返回 `null` | ❌ 操作栏按钮不显示 + 无报错 | `action-bar-item-wrapper.tsx:156-160` |
+
+**判定链路追踪图（Dashboard）**：
+
+```
+权限声明: requiresPermission: 'ReadProductBundle'
+         │
+         ├─→ 导航菜单层: nav-main.tsx:164 isItemAllowed()
+         │     ├─ 输入: item.requiresPermission + channel.permissions
+         │     ├─ 判定: hasPermissions(permissions) → some() 匹配
+         │     └─ 输出: true/false → filter 保留/移除
+         │           └─→ 二次过滤: nav-main.tsx:192 section.items.length > 0 ?
+         │
+         ├─→ 路由入口层: use-extended-router.tsx:55
+         │     ├─ 输入: config.authenticated
+         │     ├─ 判定: 决定挂载到 /_authenticated 还是根路由
+         │     ├─ 认证守卫: _authenticated.tsx:8 beforeLoad() 检查 isAuthenticated
+         │     └─ 可选: config.loader() → 自定义权限检查
+         │
+         └─→ 组件按钮层: permission-guard.tsx:47
+               ├─ 输入: requires 属性 + channel.permissions
+               ├─ 判定: hasPermissions(permissions) → some() 匹配
+               └─ 输出: 返回 children 或 null
+```
+
+---
+
+#### 8.8.2 Admin UI (Angular) 版本矩阵
+
+| 层级 | 输入条件示例 | 判定函数 | 返回分支 | 可见故障现象 | 代码位置 |
+|------|-------------|---------|---------|-------------|---------|
+| **1. 导航菜单（section）** | `requiresPermission: allow('ReadCatalog', 'ReadProduct')` + 无权限 | `shouldDisplayLink(section)` | ✅ **通过**：返回 `true`，`*ngIf` 显示<br>❌ **不通过**：返回 `false`，`*ngIf` 隐藏 | ❌ 整个 section 不显示（含其下所有 item） | `base-nav.component.ts:35-48` + `main-nav.component.html:11` |
+| **1.1 导航菜单（item）** | `requiresPermission: 'ReadProductBundle'` + 无权限 | `shouldDisplayLink(item)` | ✅ **通过**：返回 `true`，`*ngIf` 显示<br>❌ **不通过**：返回 `false`，`*ngIf` 隐藏 | ❌ 单个菜单项不显示，section 仍存在（可能空转） | `base-nav.component.ts:35-48` + `main-nav.component.html:43` |
+| **1.2 权限未加载态** | `userPermissions` 为 `undefined` 或 `[]` | `shouldDisplayLink()` 第一行判断 | ✅ **通过**：权限加载后显示<br>❌ **不通过**：`!userPermissions` → 返回 `false` | ❌ 初始加载时所有菜单不显示（白屏） | `base-nav.component.ts:36-37` |
+| **2. 路由入口（认证级）** | 路由在 `AuthGuard` 保护下 + `isAuthenticated: false` | `AuthGuard.canActivate()` | ✅ **通过**：返回 `true`<br>❌ **不通过**：`this.router.navigate(['/login'])` | ❌ 重定向到 `/login` | `auth.guard.ts:23-35` |
+| **2.1 路由入口（业务守卫）** | 订单 `state === 'Modifying'` 但 URL 不含 `/modify` | `OrderGuard.canActivate()` | ✅ **通过**：返回 `true`<br>❌ **不通过**：返回 `UrlTree` 重定向 | ❌ 强制跳转到正确 URL（不涉及权限，只涉及状态） | `order.guard.ts:23-58` |
+| **3. 组件按钮（指令）** | `*vdrIfPermissions="'ReadProductBundle'"` + 无权限 | `IfPermissionsDirective` → `userHasPermissions()` | ✅ **通过**：显示模板内容<br>❌ **不通过**：显示 else 模板或不显示 | ❌ 按钮/区域不显示 + 无报错 | `if-permissions.directive.ts:30-70` |
+| **3.1 组件按钮（管道）** | `[disabled]="!(['UpdateProduct'] | hasPermission)"` | `HasPermissionPipe` → `userHasPermissions()` | ✅ **通过**：返回 `true`<br>❌ **不通过**：返回 `false` | ❌ 按钮**可见但禁用**（灰色，可 hover 看到禁用状态） | `has-permission.pipe.ts:31-44` |
+| **3.2 组件按钮（ActionBar）** | `<button *vdrIfPermissions="item.requiresPermission">` | `*vdrIfPermissions` 结构指令 | ✅ **通过**：渲染按钮<br>❌ **不通过**：不渲染 | ❌ 操作栏按钮不显示 + 无报错 | `action-bar-items.component.html:5` |
+
+**判定链路追踪图（Admin UI）**：
+
+```
+权限声明: requiresPermission: 'ReadProductBundle' 或 allow('A', 'B')
+         │
+         ├─→ 导航菜单层: base-nav.component.ts:35 shouldDisplayLink()
+         │     ├─ 输入: section/item.requiresPermission + userPermissions
+         │     ├─ 判定:
+         │     │   · 字符串 → userPermissions.includes(perm)
+         │     │   · 函数 → perm(userPermissions) 委托调用
+         │     │   · 无值 → 返回 true
+         │     │   · 权限未加载 → 返回 false
+         │     └─ 输出: true/false → *ngIf 显示/隐藏
+         │
+         ├─→ 路由入口层: app.routes.ts:9 canActivate: [AuthGuard]
+         │     ├─ 输入: 所有扩展路由默认挂载在 AuthGuard 下
+         │     ├─ 判定: AuthGuard.canActivate() 检查 isAuthenticated
+         │     └─ 输出: true 或 redirect
+         │           ⚠️ 扩展路由无自定义守卫入口
+         │
+         └─→ 组件按钮层:
+               ├─ 指令: if-permissions.directive.ts:46 → userHasPermissions() → OR
+               ├─ 管道: has-permission.pipe.ts:36 → userHasPermissions() → OR
+               └─ ActionBar: action-bar-items.component.html:5 → *vdrIfPermissions
+```
+
+---
+
+#### 8.8.3 三层判定输入/输出详情
+
+**导航菜单层（最容易出问题）**
+
+| 平台 | 输入源 | 判定逻辑 | 失败表现 | 排查优先级 |
+|------|--------|---------|---------|-----------|
+| Dashboard | `item.requiresPermission` + `channel.permissions` | 数组 some 匹配 → OR | item 消失 → section 可能一起消失 | ⭐⭐⭐⭐⭐ |
+| Admin UI | `item.requiresPermission` + `userPermissions` | 字符串 includes / 函数委托 | item 或 section 从 DOM 移除 | ⭐⭐⭐⭐⭐ |
+
+**路由入口层**
+
+| 平台 | 输入源 | 判定逻辑 | 失败表现 | 排查优先级 |
+|------|--------|---------|---------|-----------|
+| Dashboard | `config.authenticated` + `isAuthenticated` | beforeLoad 守卫检查登录态 | 重定向到 /login | ⭐⭐⭐⭐ |
+| Dashboard | `config.loader` 自定义 | 完全自定义 | 重定向 / 错误页 | ⭐⭐⭐ |
+| Admin UI | 固定挂载在 AuthGuard 下 | 检查登录态 | 重定向到 /login | ⭐⭐⭐⭐ |
+
+**组件按钮层**
+
+| 平台 | 输入源 | 判定逻辑 | 失败表现 | 排查优先级 |
+|------|--------|---------|---------|-----------|
+| Dashboard | `PermissionGuard.requires` | 数组 some 匹配 → OR | 组件返回 null，不渲染 | ⭐⭐⭐⭐⭐ |
+| Admin UI | `*vdrIfPermissions` | 调用 userHasPermissions → OR | 不渲染或渲染 else | ⭐⭐⭐⭐⭐ |
+| Admin UI | `hasPermission` 管道 | 调用 userHasPermissions → OR | 返回 false，按钮禁用 | ⭐⭐⭐ |
+
+---
+
+#### 8.8.4 优先排查顺序与故障关联
+
+当权限问题发生时，按以下顺序排查（按故障频率从高到低）：
+
+```
+导航不显示 (最常见 90%)
+    ↓
+1. 检查 isItemAllowed() / shouldDisplayLink()
+   ├─ 输入: requiresPermission 拼写正确吗？
+   ├─ 输入: channel/userPermissions 包含目标权限吗？
+   └─ 输出: 返回 true 还是 false？
+
+    ↓ 若此处正常
+    ↓
+2. 检查 section 二次过滤
+   └─ section.items.length > 0 吗？（所有 item 被过滤会导致 section 消失）
+
+    ↓ 若此处正常
+    ↓
+路由重定向 (80% 是登录问题)
+    ↓
+3. 检查 AuthGuard / beforeLoad()
+   └─ isAuthenticated 为 true 吗？
+
+    ↓ 若此处正常
+    ↓
+4. 检查自定义 loader（Dashboard 独有）
+   └─ loader 内部是否 throw redirect()？
+
+    ↓ 若此处正常
+    ↓
+按钮不显示/禁用 (95% 在组件层)
+    ↓
+5. 检查 PermissionGuard / vdrIfPermissions
+   ├─ 输入: requires 拼写正确吗？
+   ├─ 输入: 是 AND 还是 OR 语义？
+   └─ 输出: 返回 children 还是 null？
+
+    ↓ 若此处正常
+    ↓
+6. 检查 hasPermission 管道（Admin UI 独有）
+   └─ 返回 true 还是 false？（管道问题通常是禁用而非隐藏）
+```
+
+**故障连锁反应**：
+
+| 初始问题 | 连锁反应 | 表象 |
+|---------|---------|------|
+| 权限未推入 `customPermissions` | GraphQL enum 不含权限 → 前端权限数组不包含 → 所有判定失败 | 导航 + 按钮 + 路由全挂 |
+| 角色未分配权限 | channel.permissions 不含 → 三层全失败 | 同上 |
+| 菜单项 `requiresPermission` 拼写错误 | `isItemAllowed` 返回 false → item 过滤 → section 可能消失 | 导航不显示，按钮/路由正常 |
+| 自定义 loader 中 throw redirect | 路由拦截，页面跳走 | 导航正常，路由异常 |
+| `*vdrIfPermissions` 传数组 + 注释误导 | 实际是 OR，开发者以为是 AND | 权限控制比预期松 |
+
+---
+
+### 8.9 最小排障清单
 
 当扩展页面的导航项不可见或路由无法访问时，按以下顺序排查：
 
@@ -1502,8 +1673,11 @@ export interface ActionBarItem {
 | 侧栏导航渲染 (Angular) | `packages/admin-ui/src/lib/core/src/components/base-nav/base-nav.component.ts` | 35-83 |
 | 主导航模板 (Angular) | `packages/admin-ui/src/lib/core/src/components/main-nav/main-nav.component.html` | 11,43 |
 | 主导航组件 (Angular) | `packages/admin-ui/src/lib/core/src/components/main-nav/main-nav.component.ts` | 19-29 |
+| ActionBar 渲染模板 (Angular) | `packages/admin-ui/src/lib/core/src/shared/components/action-bar-items/action-bar-items.component.html` | 3-18 |
+| ActionBar 基类 (Angular) | `packages/admin-ui/src/lib/core/src/shared/components/action-bar-items/action-bar-base.component.ts` | 16-87 |
 | 权限指令 (Angular) | `packages/admin-ui/src/lib/core/src/shared/directives/if-permissions.directive.ts` | 30-70 |
 | 权限管道 (Angular) | `packages/admin-ui/src/lib/core/src/shared/pipes/has-permission.pipe.ts` | 31-44 |
+| Dashboard ActionBar 包装器 | `packages/dashboard/src/lib/framework/layout-engine/action-bar-item-wrapper.tsx` | 153-166 |
 | 指令基类 | `packages/admin-ui/src/lib/core/src/shared/directives/if-directive-base.ts` | 10-77 |
 | 导航类型定义 | `packages/admin-ui/src/lib/core/src/providers/nav-builder/nav-builder-types.ts` | 37-81 |
 | Dashboard 导航类型 | `packages/dashboard/src/lib/framework/nav-menu/nav-menu-extensions.ts` | 16-66 |
