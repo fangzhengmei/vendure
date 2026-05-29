@@ -787,22 +787,100 @@ asset-upload-dir/
 
 ### 4.9 HTTP 缓存头
 
+#### 两条路径的响应头差异
+
+**文件**：`packages/asset-server-plugin/src/asset-server.ts:80-153`
+
+| 路径 | 响应头设置 | Cache-Control | 说明 |
+|------|-----------|---------------|------|
+| **sendAsset()（缓存命中）** 第 97-99 行 | `res.contentType(mimeType)`<br>`res.setHeader('content-security-policy', "default-src 'self'")`<br>`res.setHeader('Cache-Control', this.cacheHeader)` | ✅ **有** | 服务端缓存命中时返回 |
+| **generateTransformedImage()（实时变换）** 第 140-142 行 | `res.set('Content-Type', mimeType)`<br>`res.setHeader('content-security-policy', "default-src 'self'")`<br>`res.send(imageBuffer)` | ❌ **没有！** | 首次请求、缓存未命中时返回 |
+
+**关键发现**：实时变换路径（`generateTransformedImage()`）**完全没有设置 `Cache-Control` 响应头**！这意味着：
+- 首次请求（缓存未命中）：浏览器/CDN 收到的响应**没有** `Cache-Control` 头，可能使用默认缓存策略（取决于浏览器实现，通常不会缓存或缓存时间很短）
+- 第二次及以后请求（缓存命中）：浏览器/CDN 收到的响应**有** `Cache-Control` 头，按配置的 `max-age` 缓存
+
+#### cache=false 对浏览器/CDN 缓存的实际影响
+
+`cache=false` 是**服务端文件缓存控制**，与 **HTTP 响应头缓存控制** 是完全独立的两个维度：
+
+| 场景 | 服务端缓存 | 响应头 Cache-Control | 浏览器/CDN 行为 |
+|------|-----------|----------------------|-----------------|
+| `?w=500`（首次） | 写入缓存文件 | ❌ 无（实时变换路径） | 可能不缓存 |
+| `?w=500`（第二次） | 命中缓存文件 | ✅ 有（命中路径） | 按 max-age 缓存 |
+| `?w=500&cache=false`（首次） | 不写入缓存文件 | ❌ 无（实时变换路径） | 可能不缓存 |
+| `?w=500&cache=false`（缓存已存在） | 命中缓存文件 | ✅ 有（命中路径） | 按 max-age 缓存 |
+
+**cache=false 的真实含义**：
+- 它只控制 `generateTransformedImage()` 中是否执行 `writeFileFromBuffer()`（第 132-134 行）
+- 它**不影响** `sendAsset()` 的缓存命中读取
+- 它**不影响** HTTP `Cache-Control` 响应头的设置
+
+**常见误区**：
+- ❌ 错误理解：`cache=false` 让浏览器不要缓存
+- ✅ 正确理解：`cache=false` 让服务端不要把本次变换结果写入缓存目录
+- ✅ 补充：如果同一参数的缓存已存在，即使带 `cache=false` 也会命中，此时响应仍有 `Cache-Control` 头
+
+#### cacheHeader 配置与 max-age 字符串拼接细节
+
 **文件**：`packages/asset-server-plugin/src/asset-server.ts:45-57`
 
-无论请求走缓存命中路径还是实时变换路径，响应都会设置相同的 `Cache-Control` 头：
-
 ```typescript
-res.setHeader('Cache-Control', this.cacheHeader);
+// Configure Cache-Control header
+const { cacheHeader } = this.options;
+if (!cacheHeader) {
+    this.cacheHeader = DEFAULT_CACHE_HEADER;
+} else {
+    if (typeof cacheHeader === 'string') {
+        this.cacheHeader = cacheHeader;
+    } else {
+        this.cacheHeader = [cacheHeader.restriction, `max-age: ${cacheHeader.maxAge}`]
+            .filter(value => !!value)
+            .join(', ');
+    }
+}
 ```
 
-默认值（`constants.ts`）：
+**配置方式 1：字符串**
+```typescript
+AssetServerPlugin.init({
+    cacheHeader: 'public, max-age=86400',
+})
+```
+→ `this.cacheHeader = 'public, max-age=86400'` ✅ 正确
+
+**配置方式 2：对象**
+```typescript
+AssetServerPlugin.init({
+    cacheHeader: {
+        maxAge: 86400,
+        restriction: 'public',
+    },
+})
+```
+→ `this.cacheHeader = 'public, max-age: 86400'` ⚠️ **注意冒号！**
+
+**⚠️ 重要细节**：对象配置时生成的是 `max-age: 86400`（冒号 + 空格），而标准 HTTP `Cache-Control` 指令语法是 `max-age=86400`（等号，无空格）。
+
+**拼接逻辑逐行解析**：
+1. `cacheHeader.restriction` → 如 `'public'` 或 `undefined`
+2. `` `max-age: ${cacheHeader.maxAge}` `` → 注意这里用的是**冒号** `:` 而不是**等号** `=`
+3. `.filter(value => !!value)` → 过滤掉 `undefined`
+4. `.join(', ')` → 用逗号加空格拼接
+
+**默认值（constants.ts）**：
 ```typescript
 export const DEFAULT_CACHE_HEADER = 'public, max-age=15552000';  // 6 个月
 ```
+默认值用的是**等号** `=`，与对象配置的冒号 `:` 不一致。
 
-可通过 `AssetServerPlugin.init({ cacheHeader })` 自定义，支持字符串或 `{ maxAge, restriction }` 对象。
+**实际效果对比**：
+| 配置方式 | 生成的 Header 值 | 标准兼容性 |
+|----------|-----------------|------------|
+| 字符串配置 | `public, max-age=86400` | ✅ 标准 |
+| 对象配置 | `public, max-age: 86400` | ⚠️ 非标准（冒号） |
 
-**注意**：`cache=false` 仅控制服务端文件缓存，**不影响 HTTP `Cache-Control` 响应头**。即使 `cache=false`，浏览器/CDN 仍会按 `Cache-Control` 缓存响应。
+虽然大部分浏览器/CDN 对 `max-age:` 也能兼容解析，但严格来说 `max-age=` 才是 RFC 7234 规定的标准格式。
 
 ---
 
@@ -927,12 +1005,16 @@ interface ImageTransformStrategy {
 
 4. **缓存键哈希化的确定性保证**：变换参数先序列化为字符串再做 MD5。由于 `getImageTransformParameters()` 对相同 `req.query` 产生确定性输出，两个中间件独立计算出的缓存键**一定相同**，这是缓存链路闭合的根本前提。
 
-5. **`cache=false` 是写入控制而非读取控制**：`cache` 不属于 `ImageTransformParameters`，不参与缓存键计算，只控制 `generateTransformedImage()` 是否写入文件。这意味着：带 `cache=false` 的请求可能命中其他请求写入的缓存文件；反过来，一直用 `cache=false` 则永远无法缓存，每次都走完整变换流程。
+5. **`cache=false` 是服务端文件缓存写入控制**：`cache` 不属于 `ImageTransformParameters`，不参与缓存键计算，只控制 `generateTransformedImage()` 是否执行 `writeFileFromBuffer()`。这意味着：带 `cache=false` 的请求可能命中其他请求写入的缓存文件；反过来，一直用 `cache=false` 则服务端永远不会生成缓存文件，每次请求都走完整变换流程。
 
-6. **PresetOnlyStrategy 的参数归一化带来缓存合并**：强制使用预设宽高、过滤非法 quality/format，使得不同 URL 若归一化到相同参数就命中同一缓存。无效预设直接抛错，在 `sendAsset()` 的 try-catch 中被拦截为 HTTP 400，请求不会到达变换阶段。
+6. **两条路径的 Cache-Control 响应头不一致**：`sendAsset()`（缓存命中）设置了 `Cache-Control` 头，而 `generateTransformedImage()`（实时变换）**完全没有设置**。因此首次请求（未命中）浏览器/CDN 可能不缓存，二次请求（命中）才会按 `max-age` 缓存。`cache=false` 与 HTTP 响应头缓存完全无关。
 
-7. **焦点裁剪算法**：先等比缩放使目标尺寸"覆盖"裁剪区域，再基于焦点坐标计算提取区域，保证焦点始终在裁剪结果中心。
+7. **PresetOnlyStrategy 的参数归一化带来缓存合并**：强制使用预设宽高、过滤非法 quality/format，使得不同 URL 若归一化到相同参数就命中同一缓存。无效预设直接抛错，在 `sendAsset()` 的 try-catch 中被拦截为 HTTP 400，请求不会到达变换阶段。
 
-8. **变换策略管道**：支持多个 `ImageTransformStrategy` 顺序执行，可用于参数校验、权限控制、预设强制等场景。策略抛错时在 `sendAsset()` 中被截获，返回 400，不触及缓存层。
+8. **cacheHeader 对象配置的冒号问题**：字符串配置用 `max-age=`（等号，标准），但对象配置拼接时用的是 `max-age:`（冒号）。虽然大部分浏览器兼容冒号格式，但 RFC 7234 标准是等号。
 
-9. **流错误防护**：`makeStreamGuard` 处理 `fs-capacitor` 的边界情况，确保流错误能被正确捕获。
+9. **焦点裁剪算法**：先等比缩放使目标尺寸"覆盖"裁剪区域，再基于焦点坐标计算提取区域，保证焦点始终在裁剪结果中心。
+
+10. **变换策略管道**：支持多个 `ImageTransformStrategy` 顺序执行，可用于参数校验、权限控制、预设强制等场景。策略抛错时在 `sendAsset()` 中被截获，返回 400，不触及缓存层。
+
+11. **流错误防护**：`makeStreamGuard` 处理 `fs-capacitor` 的边界情况，确保流错误能被正确捕获。
