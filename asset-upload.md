@@ -732,6 +732,8 @@ sendAsset():
 
 ### 4.7 完整缓存命中判定决策树
 
+#### 正常路径（无错误）
+
 ```
 请求到达 sendAsset()
        ↓
@@ -761,9 +763,116 @@ getFileNameFromParameters(req.path, params)
                                     下次同参数请求 → sendAsset() 短路命中
 ```
 
+#### sendAsset 读取失败后的 404 异常分流机制
+
+**文件**：`packages/asset-server-plugin/src/asset-server.ts:101-104, 114-116`
+
+sendAsset() 捕获 `readFileToBuffer` 的异常后，不是直接返回 404，而是**构造一个新的 Error 并设置 status 属性**，通过 Express 错误中间件机制传递：
+
+```typescript
+// sendAsset() 中
+catch (e: any) {
+    const err = new Error('File not found');
+    (err as any).status = 404;   // 关键：给 error 对象附加 status
+    return next(err);            // 传递给错误处理中间件
+}
+
+// generateTransformedImage() 中
+if (err && (err.status === 404 || err.statusCode === 404)) {
+    // 只处理 404 错误，其他错误直接 pass
+}
+```
+
+**为什么要这样设计？**
+- Express 的 `next(err)` 会跳过所有普通中间件，只进入错误处理中间件
+- `generateTransformedImage()` 作为错误处理中间件（4 个参数：err, req, res, next），只处理 `status === 404` 的情况
+- 这是一种**异常驱动的控制流**：用 404 错误作为"缓存未命中"的信号，触发实时变换流程
+
 ---
 
-### 4.8 缓存目录结构
+### 4.8 三种错误路径的响应头与缓存影响
+
+| 错误类型 | 触发场景 | 响应代码 | 响应体 | Cache-Control | CSP 头 | Content-Type | 浏览器/CDN 缓存行为 |
+|----------|---------|---------|--------|---------------|--------|--------------|---------------------|
+| **400** | ImageTransformStrategy 抛错<br>（如无效 preset） | 400 | `Invalid parameters` | ❌ 无 | ❌ 无 | ❌ 无 | 通常不缓存 |
+| **404a** | sendAsset() 中 `readFileToBuffer` 失败<br>（但**这不是最终响应！**会进入变换流程） | — | — | — | — | — | — |
+| **404b** | generateTransformedImage() 中读源文件失败 | 404 | `Resource not found` | ❌ 无 | ❌ 无 | ❌ 无 | 通常不缓存 |
+| **500** | sharp 变换异常、文件解码失败等 | 500 | `An error occurred when generating the image` | ❌ 无 | ❌ 无 | ❌ 无 | 通常不缓存 |
+| **200（命中）** | sendAsset() 缓存命中 | 200 | 文件内容 | ✅ 有 | ✅ 有 | ✅ 有 | 按 max-age 缓存 |
+| **200（变换）** | generateTransformedImage() 变换成功 | 200 | 文件内容 | ❌ 无 | ✅ 有 | ✅ 有 | 可能不缓存 |
+
+**关键发现**：
+1. **所有错误路径（400/404/500）都不设置 Cache-Control 头**，也不设置 CSP 头，浏览器/CDN 通常不会缓存错误响应
+2. **实时变换成功的 200 响应也没有 Cache-Control 头**，只有缓存命中的 200 响应才有
+3. 404a（sendAsset 读缓存失败）**不是最终响应**，它只是一个控制流信号，真正的响应由 generateTransformedImage() 决定
+
+---
+
+### 4.9 fpx/fpy = 0 的特殊行为
+
+#### 参数解析阶段
+
+**文件**：`packages/asset-server-plugin/src/asset-server.ts:198-199`
+
+```typescript
+const fpx = +queryParams.fpx || undefined;
+const fpy = +queryParams.fpy || undefined;
+```
+
+JavaScript 的 `||` 运算符会把 `0` 当作 falsy 值：
+- `?fpx=0` → `+0 = 0` → `0 || undefined = undefined`
+- `?fpx=0.5` → `+0.5 = 0.5` → `0.5 || undefined = 0.5`
+
+**结论**：`fpx=0` 或 `fpy=0` 会被解析为 `undefined`，就像没传这个参数一样。
+
+#### 缓存键生成阶段
+
+**文件**：`packages/asset-server-plugin/src/asset-server.ts:217`
+
+```typescript
+const focalPoint = fpx && fpy ? `_fpx${fpx}_fpy${fpy}` : '';
+```
+
+由于 `fpx`/`fpy` 已被解析为 `undefined`：
+- `undefined && undefined = false`
+- `focalPoint = ''` → 不追加到缓存键字符串中
+
+**结论**：`?fpx=0&fpy=0` 和不传入 fpx/fpy 生成**完全相同的缓存键**。
+
+#### 实际变换阶段
+
+**文件**：`packages/asset-server-plugin/src/transform-image.ts:32`
+
+```typescript
+if (parameters.fpx && parameters.fpy && width && height && mode === 'crop') {
+    // 焦点裁剪逻辑
+}
+```
+
+同样由于 `undefined && undefined = false`，这个条件不成立，**不会进入焦点裁剪分支**，而是执行普通的熵裁剪：
+
+```typescript
+const options: ResizeOptions = {};
+if (mode === 'crop') {
+    options.position = sharp.strategy.entropy;  // 熵裁剪
+}
+return image.resize(width, height, options);
+```
+
+#### 行为对比表
+
+| URL | fpx 参数值 | fpy 参数值 | 缓存键是否包含 focalPoint | 实际裁剪方式 |
+|-----|-----------|-----------|--------------------------|-------------|
+| `?w=200&h=200&mode=crop` | `undefined` | `undefined` | ❌ 不包含 | 熵裁剪 |
+| `?w=200&h=200&mode=crop&fpx=0&fpy=0` | `undefined` | `undefined` | ❌ 不包含 | **熵裁剪**（不是焦点裁剪！） |
+| `?w=200&h=200&mode=crop&fpx=0.0&fpy=0.0` | `undefined` | `undefined` | ❌ 不包含 | 熵裁剪 |
+| `?w=200&h=200&mode=crop&fpx=0.1&fpy=0.2` | `0.1` | `0.2` | ✅ 包含 `_fpx0.1_fpy0.2` | 焦点裁剪 |
+
+**⚠️ 重要陷阱**：用户以为 `fpx=0&fpy=0` 是"把焦点放在左上角"，但实际上它会被当作**没有设置焦点**，使用熵裁剪。如果真的想要焦点在左上角，需要用一个非常小的非零值如 `fpx=0.0001&fpy=0.0001`。
+
+---
+
+### 4.10 缓存目录结构
 
 ```
 asset-upload-dir/
@@ -785,7 +894,7 @@ asset-upload-dir/
 
 ---
 
-### 4.9 HTTP 缓存头
+### 4.11 HTTP 缓存头
 
 #### 两条路径的响应头差异
 
@@ -1017,4 +1126,10 @@ interface ImageTransformStrategy {
 
 10. **变换策略管道**：支持多个 `ImageTransformStrategy` 顺序执行，可用于参数校验、权限控制、预设强制等场景。策略抛错时在 `sendAsset()` 中被截获，返回 400，不触及缓存层。
 
-11. **流错误防护**：`makeStreamGuard` 处理 `fs-capacitor` 的边界情况，确保流错误能被正确捕获。
+11. **异常驱动的控制流**：用 404 错误作为"缓存未命中"的信号，sendAsset() 通过 `next(err)` 触发 generateTransformedImage() 接管。这种设计使得两条路径共享缓存键空间而无需显式通信。
+
+12. **fpx/fpy=0 的隐式降级**：由于 JavaScript 的 `||` 运算符会把 0 当作 falsy 值，`fpx=0&fpy=0 会被解析为 undefined，降级为熵裁剪而非左上角焦点裁剪。
+
+13. **错误响应统一无缓存头**：所有 400/404/500 响应都不设置 Cache-Control 和 CSP 头，浏览器/CDN 通常不缓存错误。
+
+14. **流错误防护**：`makeStreamGuard` 处理 `fs-capacitor` 的边界情况，确保流错误能被正确捕获。
