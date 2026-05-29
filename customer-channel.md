@@ -105,28 +105,65 @@ CustomerGroup **本身不是 ChannelAware**，不绑定渠道。它是全局概�
 - `removeCustomersFromGroup()`：把客户移出分组，同样发布事件。
 - `getCustomersFromIds()` 查询时仍然过滤 `channel.id = :channelId`，确保只操作当前渠道内可见的客户。
 
-### 3.3 分组在促销中的匹配
+### 3.3 分组在促销中的匹配——与渠道可见性的隐耦合
 
 **核心文件** `packages/core/src/config/promotion/conditions/customer-group-condition.ts`
 
 ```ts
 async check(ctx, order, args) {
-    if (!order.customer) return false;
+    if (!order.customer) {
+        return false;                                         // ← 失败路径 A
+    }
+    const customerId = order.customer.id;
     const groupIds = await groupIdCache.get(customerId, async () => {
         const groups = await customerService.getCustomerGroups(ctx, customerId);
         return groups.map(g => g.id);
     });
+
     return !!groupIds.find(id => idsAreEqual(id, args.customerGroupId));
 }
 ```
 
-匹配逻辑：
-1. 从订单取 `order.customer.id`。
-2. 调用 `customerService.getCustomerGroups()` 获取该客户所有分组 ID（带缓存，TTL 1 周）。
-3. 检查目标分组 ID 是否在其中。
-4. 当 `CustomerGroupChangeEvent` 触发时，缓存被主动清除。
+表面上看，这段代码只关心"客户是否属于某个分组"。但 `getCustomerGroups` 内部调用了 `findOneInChannel`，这使得渠道可见性成了一个**隐式前提条件**——客户必须在当前渠道可见，才能查到分组。
 
-> **注意**：分组匹配不受渠道限制——分组是全局的，只要客户属于该分组，无论在哪个渠道的促销中都能匹配。但**促销本身**受渠道约束（见下一节）。
+#### `getCustomerGroups` 的渠道过滤分支
+
+`CustomerService.getCustomerGroups()`（`customer.service.ts:179-197`）的实现：
+
+```ts
+async getCustomerGroups(ctx: RequestContext, customerId: ID): Promise<CustomerGroup[]> {
+    const customerWithGroups = await this.connection.findOneInChannel(
+        ctx,
+        Customer,
+        customerId,
+        ctx?.channelId,       // ← 关键：用当前请求的渠道过滤
+        { relations: ['groups'], where: { deletedAt: IsNull() } },
+    );
+    if (customerWithGroups) {
+        return customerWithGroups.groups;     // ← 命中路径：客户在此渠道可见
+    } else {
+        return [];                             // ← 失败路径：客户不在此渠道，返回空组
+    }
+}
+```
+
+而 `findOneInChannel`（`transactional-connection.ts:350-379`）生成的 SQL 是：
+
+```sql
+SELECT customer.* FROM customer
+  LEFT JOIN customer_channels__channel AS __channel
+    ON __channel.customerId = customer.id
+  WHERE customer.id = :id
+    AND __channel.channelId = :channelId   -- 只匹配当前渠道
+```
+
+**如果 Customer 没有被分配到 `ctx.channelId` 对应的渠道，`findOneInChannel` 返回 `undefined`，`getCustomerGroups` 走 `else` 分支，返回 `[]`。**
+
+#### 缓存键不含渠道 ID 的隐患
+
+缓存键格式为 `PromotionCondition:customer_group:${customerId}`——**不包含 `channelId`**。
+
+这意味着同一个 `customerId` 在不同渠道下首次查询后，结果会被缓存，后续渠道的请求可能命中错误渠道的缓存结果（详见第 8 节）。
 
 ---
 
@@ -307,9 +344,15 @@ getActivePromotionsInChannel(ctx) {
 
 ## 6. 关键细节与易混淆点
 
-### 6.1 CustomerGroup 不绑定渠道
+### 6.1 CustomerGroup 不绑定渠道，但分组查询受渠道约束
 
-CustomerGroup 实体没有 `channels` 关系，它是全局的。但操作分组中的客户时（如 `getGroupCustomers`、`getCustomersFromIds`），仍然会过滤 `channel.id = ctx.channelId`，确保只操作当前渠道内可见的客户。
+CustomerGroup 实体没有 `channels` 关系，它是全局的。**然而**，读取客户分组的路径（`getCustomerGroups` → `findOneInChannel`）会在查询 Customer 实体时过滤渠道。这意味着：
+
+- CustomerGroup 的**定义**是全局的——一个分组不专属于某个渠道。
+- 但**客户→分组的关系**是通过 Customer 实体间接获取的，而 Customer 是 ChannelAware 的。
+- 因此，"客户属于某分组"这个事实虽然本身与渠道无关，但**查询这个事实的代码路径**会被渠道可见性阻断。
+
+操作分组中的客户时（`getGroupCustomers`、`getCustomersFromIds`），同样会过滤 `channel.id = :channelId`。
 
 ### 6.2 客户分组匹配在促销环节，不在价目选择环节
 
@@ -345,7 +388,195 @@ await this.connection.getRepository(ctx, ProductVariantPrice).delete({ channelId
 
 ---
 
-## 7. 源文件索引
+## 8. 跨渠道场景：从 order.customer 到 customerGroup.check() 的命中与失败路径
+
+Vendure 多渠道架构下，同一个 Customer 可以属于多个 Channel（通过 `customer.channels` 多对多关系），但客户的**渠道归属并不总是对称的**。一个在 Channel A 注册的老客户，首次在 Channel B 下单时，可能尚未被分配到 Channel B。这种不对称会直接影响促销中的客户分组匹配。
+
+### 8.1 order.customer 从何而来——不受渠道过滤
+
+当 `OrderService.applyPriceAdjustments()` 被调用时（`order.service.ts:2312-2383`），传入的 `order` 对象是经 `OrderService.findOne()` 加载的（`order.service.ts:214-233`），其默认 relations 包含 `'customer'` 和 `'customer.user'`：
+
+```ts
+const effectiveRelations = relations ?? [
+    'channels',
+    'customer',          // ← 直接 LEFT JOIN customer 表
+    'customer.user',
+    'lines',
+    ...
+];
+```
+
+这是普通的 `ManyToOne` 关联加载，**不走 `findOneInChannel`，不做渠道过滤**。因此 `order.customer` 永远是有效的——只要订单上关联了客户，无论该客户是否在当前渠道可见，`order.customer` 都不为 `undefined`。
+
+### 8.2 命中路径 vs 失败路径——并列对照
+
+设定：客户 C 属于分组 G（VIP），且在 Channel A 注册。Channel B 有一个促销 P，条件为 `customer_group = G`。
+
+#### 路径 A：客户在当前渠道可见 → 分组命中
+
+```
+请求进入 Channel B（ctx.channelId = B）
+  │
+  ├─ OrderService.findOne() 加载 order
+  │    → order.customer = C（无渠道过滤，始终存在）
+  │
+  ├─ OrderService.applyPriceAdjustments(ctx, order, promotions)
+  │    ├─ promotionService.getActivePromotionsInChannel(ctx)
+  │    │    → 返回 Channel B 的促销 [P]（P 已分配到 Channel B）
+  │    │
+  │    └─ orderCalculator.applyPromotions(ctx, order, [P])
+  │         └─ P.test(ctx, order)
+  │              └─ customerGroup.check(ctx, order, { customerGroupId: G })
+  │                   │
+  │                   ├─ order.customer 存在 → 跳过失败路径 A
+  │                   │
+  │                   ├─ groupIdCache.get(C.id, fn)
+  │                   │    └─ 缓存未命中 → 调用 fn()
+  │                   │         └─ customerService.getCustomerGroups(ctx, C.id)
+  │                   │              └─ findOneInChannel(ctx, Customer, C.id, ctx.channelId=B)
+  │                   │                   → SQL: WHERE customer.id=C AND __channel.channelId=B
+  │                   │                   → 客户 C 已被分配到 Channel B ✅
+  │                   │                   → 返回 customerWithGroups
+  │                   │                   → 返回 customerWithGroups.groups = [G]
+  │                   │              → groupIds = [G.id]
+  │                   │         → 缓存写入: C.id → [G.id]
+  │                   │
+  │                   └─ groupIds.find(id === G.id) → ✅ 匹配成功
+  │                        → P.apply() → 生成 Adjustment → 折扣生效
+```
+
+**前提**：客户 C 必须已被分配到 Channel B。分配发生在：
+- C 在 Channel B 注册时：`customerService.create()` → `channelService.assignToCurrentChannel()`
+- C 在 Channel B 验证邮箱时：`verifyCustomerEmailAddress()` → `channelService.assignToChannels()`
+- C 在 Channel B 下单时（guest checkout）：`createOrUpdate()` → `customer.channels.push(ctx.channel)`
+- 管理员手动分配：`channelService.assignToChannels()`
+
+#### 路径 B：客户不在当前渠道 → 分组静默失败
+
+```
+请求进入 Channel B（ctx.channelId = B）
+  │
+  ├─ OrderService.findOne() 加载 order
+  │    → order.customer = C（无渠道过滤，仍然存在）
+  │
+  ├─ OrderService.applyPriceAdjustments(ctx, order, promotions)
+  │    ├─ promotionService.getActivePromotionsInChannel(ctx)
+  │    │    → 返回 Channel B 的促销 [P]
+  │    │
+  │    └─ orderCalculator.applyPromotions(ctx, order, [P])
+  │         └─ P.test(ctx, order)
+  │              └─ customerGroup.check(ctx, order, { customerGroupId: G })
+  │                   │
+  │                   ├─ order.customer 存在 → 跳过失败路径 A
+  │                   │
+  │                   ├─ groupIdCache.get(C.id, fn)
+  │                   │    └─ 缓存未命中 → 调用 fn()
+  │                   │         └─ customerService.getCustomerGroups(ctx, C.id)
+  │                   │              └─ findOneInChannel(ctx, Customer, C.id, ctx.channelId=B)
+  │                   │                   → SQL: WHERE customer.id=C AND __channel.channelId=B
+  │                   │                   → 客户 C 未被分配到 Channel B ❌
+  │                   │                   → LEFT JOIN 结果为空
+  │                   │                   → 返回 undefined
+  │                   │              → 走 else 分支 → 返回 []
+  │                   │         → groupIds = []
+  │                   │         → 缓存写入: C.id → []    ← 注意：空数组被缓存！
+  │                   │
+  │                   └─ groupIds.find(id === G.id) → ❌ 不匹配
+  │                        → check() 返回 false
+  │                        → 促销 P 不生效，无折扣
+  │                        → 无任何日志或错误提示
+```
+
+**关键点**：这是一个**静默失败**——没有报错，没有日志，只是分组匹配结果为 `false`。客户明明属于分组 G，但在 Channel B 中查询分组时返回了空数组。
+
+#### 失败路径的触发场景
+
+| 场景 | 为什么客户不在渠道中 |
+|------|----------------------|
+| 管理员在 Channel A 创建了客户，未分配到 Channel B | 创建客户时 `assignToCurrentChannel()` 只分配当前渠道 + 默认渠道 |
+| 客户在 Channel A 注册，从未在 Channel B 登录 | `registerCustomerAccount()` 只在当前渠道创建/关联客户 |
+| 管理员通过 `addCustomerToOrder` 切换了客户，但新客户不属于当前渠道 | `setCustomerForOrder()` 检查了渠道归属，但旧订单数据可能残留 |
+| 数据库直接操作，跳过渠道分配 | 绕过了 Service 层的渠道分配逻辑 |
+
+### 8.3 缓存键不含渠道 ID 的跨渠道污染
+
+缓存键 `PromotionCondition:customer_group:${customerId}` 只按客户 ID 缓存，**不区分渠道**。这导致两种问题：
+
+#### 污染场景 1：渠道 A 先查，渠道 B 后查——B 意外命中 A 的结果
+
+```
+T1: Channel A 请求 → getCustomerGroups(ctx_A, C.id)
+    → findOneInChannel(ctx_A, Customer, C.id, channelA)
+    → 客户在 Channel A 可见 ✅ → 返回 [G1, G2]
+    → 缓存: C.id → [G1.id, G2.id]
+
+T2: Channel B 请求（客户不在 B）→ groupIdCache.get(C.id)
+    → 缓存命中！返回 [G1.id, G2.id]
+    → customerGroup.check() 返回 true
+    → 促销在 Channel B 生效——但客户在 Channel B 不可见，不应命中分组
+```
+
+**结果**：客户本不应在 Channel B 被识别为分组 G1 成员，但因缓存了 Channel A 的结果，分组条件错误地命中了。
+
+#### 污染场景 2：渠道 B 先查，渠道 A 后查——A 被误判为无分组
+
+```
+T1: Channel B 请求（客户不在 B）→ getCustomerGroups(ctx_B, C.id)
+    → findOneInChannel(ctx_B, Customer, C.id, channelB)
+    → 客户在 Channel B 不可见 ❌ → 返回 []
+    → 缓存: C.id → []
+
+T2: Channel A 请求 → groupIdCache.get(C.id)
+    → 缓存命中！返回 []
+    → customerGroup.check() 返回 false
+    → 促销在 Channel A 也不生效——但客户明明在 Channel A 属于分组 G1
+```
+
+**结果**：本应在 Channel A 命中的分组促销，因为 Channel B 的查询先污染了缓存，导致失效。
+
+缓存 TTL 为 1 周，这意味着污染一旦发生，可能持续影响很长时间。`CustomerGroupChangeEvent` 只在客户被加入/移出分组时清除缓存，**渠道分配变更不会触发缓存清除**。
+
+### 8.4 正常情况下为什么不会频繁触发
+
+实际运行中，上述失败路径并不容易触发，原因在于 Vendure 的客户-渠道关联机制：
+
+1. **注册时自动关联**：`registerCustomerAccount()` 最终调用 `createOrUpdate()`，后者会 `customer.channels.push(ctx.channel)`，确保客户出现在新渠道。
+2. **邮箱验证时补关联**：`verifyCustomerEmailAddress()` 显式调用 `channelService.assignToChannels(ctx, Customer, customer.id, [ctx.channelId])`。
+3. **Guest checkout 时关联**：`createOrUpdate()` 同样会 push 当前渠道。
+4. **订单切换客户时校验**：`setCustomerForOrder()` 检查目标客户是否属于订单所在的所有渠道，否则抛出 `UserInputError`。
+
+因此，正常流程下，只要客户在某个渠道有活跃会话，该客户就应该已被分配到该渠道。失败路径主要发生在：
+- 数据库直接操作绕过了 Service 层
+- 渠道分配因并发问题丢失
+- 自定义代码未正确处理渠道分配
+
+### 8.5 路径判定速查表
+
+```
+customerGroup.check(ctx, order, args) 结果
+│
+├── order.customer === undefined
+│    └── → false（失败路径 A：无客户）
+│
+├── order.customer 存在
+│    ├── getCustomerGroups(ctx, customerId) 返回 []
+│    │    ├── findOneInChannel 找不到客户（客户不在当前渠道）
+│    │    │    └── → false（失败路径 B：渠道可见性阻断）
+│    │    │
+│    │    └── 客户在当前渠道，但确实不属于任何分组
+│    │         └── → false（正常不匹配）
+│    │
+│    └── getCustomerGroups(ctx, customerId) 返回 [G1, G2, ...]
+│         ├── args.customerGroupId 在 groupIds 中
+│         │    └── → true（命中路径 ✅）
+│         │
+│         └── args.customerGroupId 不在 groupIds 中
+│              └── → false（正常不匹配）
+```
+
+---
+
+## 9. 源文件索引
 
 | 概念 | 文件路径 |
 |------|----------|
@@ -368,3 +599,4 @@ await this.connection.getRepository(ctx, ProductVariantPrice).delete({ channelId
 | OrderCalculator | `packages/core/src/service/helpers/order-calculator/order-calculator.ts` |
 | PromotionService | `packages/core/src/service/services/promotion.service.ts` |
 | ListQueryBuilder | `packages/core/src/service/helpers/list-query-builder/list-query-builder.ts` |
+| TransactionalConnection | `packages/core/src/connection/transactional-connection.ts` |
