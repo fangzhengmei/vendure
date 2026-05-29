@@ -23,6 +23,16 @@
   - [6.2 路由级权限控制](#62-路由级权限控制)
   - [6.3 PermissionsService 权限服务](#63-permissionsservice-权限服务)
 - [7. 完整链路时序图](#7-完整链路时序图)
+- [8. 权限约束链路深度追踪](#8-权限约束链路深度追踪)
+  - [8.1 全链路总览](#81-全链路总览)
+  - [8.2 阶段 1：服务端声明 — 权限的诞生](#82-阶段-1服务端声明--权限的诞生)
+  - [8.3 阶段 2：前端权限获取 — 用户有什么权限](#83-阶段-2前端权限获取--用户有什么权限)
+  - [8.4 阶段 3：扩展声明中的权限字段 — 传递给注册表](#84-阶段-3扩展声明中的权限字段--传递给注册表)
+  - [8.5 阶段 4：判定点 — 权限在哪生效](#85-阶段-4判定点--权限在哪生效)
+  - [8.6 权限字段流转汇总表](#86-权限字段流转汇总表)
+  - [8.7 最小排障清单](#87-最小排障清单)
+- [10. 关键文件索引](#10-关键文件索引)
+- [11. 总结](#11-总结)
 
 ---
 
@@ -799,7 +809,452 @@ export class PermissionsService {
 
 ---
 
-## 8. 关键文件索引
+## 8. 权限约束链路深度追踪
+
+本节沿代码逐层追踪权限字段从插件声明到前端判定的完整数据流，明确每一站的来源字段、中间结构、判定点与失败症状。
+
+### 8.1 全链路总览
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ 阶段 1 · 服务端声明                                                            │
+│                                                                                 │
+│  CrudPermissionDefinition('ProductBundle')                                      │
+│  └─ .getMetadata() → [{name:'CreateProductBundle',...}, {name:'ReadProductBundle',...}, ...] │
+│  └─ 推入 config.authOptions.customPermissions[]                                  │
+│  └─ generatePermissionEnum() → 合并入 GraphQL Permission enum                   │
+│  └─ GlobalSettingsResolver.serverConfig → {permissions:[{name,description,assignable}]} │
+└────────────────────────────────┬────────────────────────────────────────────────┘
+                                 │
+                                 │  GraphQL 响应
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ 阶段 2 · 前端权限获取                                                          │
+│                                                                                 │
+│  ┌── Dashboard (React) ──────────────────────────────────┐                      │
+│  │  AuthProvider → CurrentUserQuery → me.channels[].permissions[]  │              │
+│  │  usePermissions() → hasPermissions(permissions[]) → boolean     │              │
+│  └────────────────────────────────────────────────────────────────┘              │
+│                                                                                 │
+│  ┌── Admin UI (Angular) ─────────────────────────────────┐                      │
+│  │  AuthService.logIn() → activeChannel.permissions                 │              │
+│  │  PermissionsService.setCurrentUserPermissions(permissions[])     │              │
+│  │  PermissionsService.userHasPermissions(required) → boolean      │              │
+│  └────────────────────────────────────────────────────────────────┘              │
+└────────────────────────────────┬────────────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ 阶段 3 · 扩展声明中的权限字段                                                  │
+│                                                                                 │
+│  defineDashboardExtension({                                                     │
+│    routes: [{ navMenuItem: { requiresPermission: 'ReadProductBundle' } }]        │
+│  })                                                                             │
+│  └─ registerNavigationExtensions() → addNavMenuItem({requiresPermission})        │
+│     └─ globalRegistry → navMenuConfig.sections[].items[].requiresPermission     │
+└────────────────────────────────┬────────────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ 阶段 4 · 判定点                                                                │
+│                                                                                 │
+│  判定点 A: 导航可见性 ── NavMain.isItemAllowed() / BaseNavComponent.shouldDisplayLink() │
+│  判定点 B: 路由拦截 ── _authenticated.tsx beforeLoad / LoginGuard               │
+│  判定点 C: 组件级 ── PermissionGuard / vdrIfPermissions / hasPermission pipe    │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 8.2 阶段 1：服务端声明 — 权限的诞生
+
+#### 8.2.1 来源字段
+
+**文件**：`packages/core/src/common/permission-definition.ts`
+
+| 类 | 产出权限字符串 | 示例 |
+|----|---------------|------|
+| `PermissionDefinition` | `name` 原样 | `SyncInventory` |
+| `CrudPermissionDefinition` | `{Create,Read,Update,Delete}{name}` | `CreateProductBundle`, `ReadProductBundle` |
+| `RwPermissionDefinition` | `{Read,Write}{name}` | `ReadDashboardSavedViews` |
+
+```typescript
+// packages/dev-server/example-plugins/product-bundles/constants.ts
+export const productBundlePermission = new CrudPermissionDefinition('ProductBundle');
+// 产出: CreateProductBundle, ReadProductBundle, UpdateProductBundle, DeleteProductBundle
+```
+
+#### 8.2.2 注册到配置
+
+**文件**：`packages/dev-server/example-plugins/product-bundles/product-bundles.plugin.ts:18-29`
+
+```typescript
+@VendurePlugin({
+    configuration: config => {
+        // 关键: 必须推入 customPermissions，否则 GraphQL enum 里没有这个权限
+        config.authOptions.customPermissions.push(productBundlePermission);
+        return config;
+    },
+})
+```
+
+**⚠️ 易漏点**：如果只声明了 `PermissionDefinition` 但忘记推入 `customPermissions`，权限字符串不会出现在 GraphQL `Permission` enum 中，前端拿不到也无法检查。
+
+#### 8.2.3 合并进 GraphQL Schema
+
+**文件**：`packages/core/src/api/config/generate-permissions.ts:42-67`
+
+```typescript
+export function generatePermissionEnum(schema, customPermissions) {
+    // DEFAULT_PERMISSIONS + customPermissions → 合并去重
+    const allPermissionsMetadata = getAllPermissionsMetadata(customPermissions);
+    // 生成 GraphQL enum: enum Permission { Authenticated, SuperAdmin, CreateProductBundle, ... }
+}
+```
+
+#### 8.2.4 通过 API 暴露给前端
+
+**文件**：`packages/core/src/api/resolvers/admin/global-settings.resolver.ts:63-75`
+
+```typescript
+@ResolveField()
+serverConfig(@Info() info): ServerConfig {
+    const permissions = getAllPermissionsMetadata(
+        this.configService.authOptions.customPermissions
+    ).filter(p => !p.internal);  // 过滤掉 internal 权限
+    return { permissions, ... };
+}
+```
+
+**中间结构**：`ServerConfig.permissions = [{ name: 'CreateProductBundle', description: '...', assignable: true }, ...]`
+
+### 8.3 阶段 2：前端权限获取 — 用户有什么权限
+
+#### 8.3.1 Dashboard (React) 权限流
+
+**文件**：`packages/dashboard/src/lib/providers/auth.tsx:84-103`
+
+```graphql
+query CurrentUserInformation {
+    me {
+        channels {
+            id
+            token
+            code
+            permissions   # ← 这里是用户在此 channel 下拥有的全部权限字符串
+        }
+    }
+}
+```
+
+**中间结构**：
+
+```typescript
+// AuthContext.channels
+[
+    { id: '1', token: 'xxx', code: 'default', permissions: ['Authenticated', 'ReadCatalog', 'ReadProductBundle', ...] },
+]
+```
+
+**判定函数**：`packages/dashboard/src/lib/hooks/use-permissions.ts:23-46`
+
+```typescript
+export function usePermissions() {
+    const { channels } = useAuth();
+    const { activeChannel } = useChannel();
+
+    const hasPermissions = useCallback((permissions: string[]) => {
+        if (permissions.length === 0) return true;
+        const selectedChannel = channels?.find(c => c.id === activeChannel?.id);
+        if (!selectedChannel) return false;
+        // 关键: some() → OR 逻辑，任一匹配即通过
+        return permissions.some(p => selectedChannel.permissions.includes(p as any));
+    }, [channels, activeChannel?.id]);
+
+    return { hasPermissions };
+}
+```
+
+#### 8.3.2 Admin UI (Angular) 权限流
+
+**文件**：`packages/admin-ui/src/lib/core/src/providers/auth/auth.service.ts:44-47`
+
+```typescript
+// 登录成功后立即设置权限
+const activeChannel = this.getActiveChannel(login.channels);
+this.permissionsService.setCurrentUserPermissions(activeChannel.permissions);
+```
+
+**文件**：`packages/admin-ui/src/lib/core/src/providers/permissions/permissions.service.ts:33-40`
+
+```typescript
+userHasPermissions(requiredPermissions: Array<string | Permission>): boolean {
+    // 关键: some() → OR 逻辑，任一匹配即通过
+    for (const perm of requiredPermissions) {
+        if (this.currentUserPermissions.includes(perm)) return true;
+    }
+    return false;
+}
+```
+
+**⚠️ 注意差异**：
+
+| 前端 | OR/AND 逻辑 | 权限来源 |
+|------|------------|---------|
+| Dashboard `usePermissions` | **OR** (`some`) | `channel.permissions` |
+| Admin UI `PermissionsService` | **OR** (`some`) | `activeChannel.permissions` |
+| Admin UI `vdrIfPermissions` 指令 | **AND** (all must match) | 同上 |
+
+### 8.4 阶段 3：扩展声明中的权限字段 — 传递给注册表
+
+#### 8.4.1 Dashboard 路由声明的权限字段
+
+**文件**：`packages/dashboard/src/lib/framework/extension-api/types/navigation.ts:35`
+
+```typescript
+export interface DashboardRouteDefinition {
+    navMenuItem?: Partial<NavMenuItem> & { sectionId: string };
+    authenticated?: boolean;  // 默认 true
+}
+
+// NavMenuItem.requiresPermission
+// 文件: packages/dashboard/src/lib/framework/nav-menu/nav-menu-extensions.ts:56
+export interface NavMenuItem {
+    requiresPermission?: string | string[];
+}
+```
+
+#### 8.4.2 注册流转
+
+**文件**：`packages/dashboard/src/lib/framework/extension-api/logic/navigation.ts:38-58`
+
+```typescript
+function registerRoutes(routes?: DashboardRouteDefinition[]) {
+    for (const route of routes) {
+        if (route.navMenuItem) {
+            // requiresPermission 从 route.navMenuItem 传入 navMenuConfig
+            addNavMenuItem({
+                requiresPermission: route.navMenuItem.requiresPermission,  // ← 传递
+                ...
+            }, route.navMenuItem.sectionId);
+        }
+        registerRoute(route);  // route.authenticated 存入 extensionRoutes Map
+    }
+}
+```
+
+**最终存储位置**：
+- `navMenuConfig.sections[].items[].requiresPermission` → 导航可见性判定用
+- `extensionRoutes Map<path, { authenticated: boolean }>` → 路由挂载位置判定用
+
+### 8.5 阶段 4：判定点 — 权限在哪生效
+
+#### 判定点 A：导航可见性（侧栏菜单项是否显示）
+
+**Dashboard (React)**
+
+**文件**：`packages/dashboard/src/lib/components/layout/nav-main.tsx:164-175`
+
+```typescript
+const isItemAllowed = useCallback((item: NavMenuItem) => {
+    if (!item.requiresPermission) return true;  // 无权限要求 → 始终显示
+    const permissions = Array.isArray(item.requiresPermission)
+        ? item.requiresPermission
+        : [item.requiresPermission];
+    return hasPermissions(permissions);  // OR 逻辑
+}, [hasPermissions]);
+```
+
+同文件 `getSortedSections()`（:178-202）进一步过滤：权限不通过时整节被丢弃。
+
+**Admin UI (Angular)**
+
+**文件**：`packages/admin-ui/src/lib/core/src/components/base-nav/base-nav.component.ts:35-48`
+
+```typescript
+shouldDisplayLink(menuItem: Pick<NavMenuItem, 'requiresPermission'>) {
+    if (!this.userPermissions) return false;              // 权限未加载 → 不显示
+    if (!menuItem.requiresPermission) return true;         // 无要求 → 显示
+    if (typeof menuItem.requiresPermission === 'string')   // 字符串 → includes
+        return this.userPermissions.includes(menuItem.requiresPermission);
+    if (typeof menuItem.requiresPermission === 'function') // 函数 → 委托调用
+        return menuItem.requiresPermission(this.userPermissions);
+}
+```
+
+**判定逻辑总结**：
+
+| 场景 | Dashboard | Admin UI |
+|------|-----------|----------|
+| `requiresPermission` 未设 | 显示 | 显示 |
+| 字符串 `'ReadProductBundle'` | `channel.permissions.some(...)` | `userPermissions.includes(...)` |
+| 数组 `['ReadA', 'ReadB']` | some → OR | 直接 includes 单个（Angular 版只接受 string 或函数） |
+| 函数 `(perms) => ...` | 不支持 | 委托调用 |
+| 用户权限未加载 | 视 channel 有无而定 | `userPermissions` 为 falsy → **不显示** |
+
+#### 判定点 B：路由拦截（未认证用户被重定向）
+
+**Dashboard (React)**
+
+**文件**：`packages/dashboard/src/app/routes/_authenticated.tsx:7-17`
+
+```typescript
+export const Route = createFileRoute('/_authenticated')({
+    beforeLoad: ({ context, location }) => {
+        if (!context.auth.isAuthenticated) {
+            throw redirect({ to: '/login', search: { redirect: location.href } });
+        }
+    },
+});
+```
+
+扩展路由通过 `useExtendedRouter` 根据 `config.authenticated` 决定挂载在 `/_authenticated` 下还是根路由：
+- `authenticated: true`（默认）→ 父节点有 `beforeLoad` 守卫 → 未登录重定向到 `/login`
+- `authenticated: false` → 父节点为根路由 → 无守卫
+
+**Admin UI (Angular)**
+
+**文件**：`packages/admin-ui/src/lib/login/src/providers/login.guard.ts:13-26`
+
+```typescript
+@Injectable({ providedIn: 'root' })
+export class LoginGuard {
+    canActivate(route): Observable<boolean> {
+        return this.authService.checkAuthenticatedStatus().pipe(
+            map(authenticated => {
+                if (authenticated) { this.router.navigate(['/']); }
+                return !authenticated;
+            }),
+        );
+    }
+}
+```
+
+**⚠️ 注意**：Angular Admin UI 扩展路由的权限控制是**编译时**决定的（路由配置静态写入），不是运行时 `beforeLoad` 动态检查。路由级权限只区分"是否需要登录"，不区分具体权限字符串。细粒度权限靠导航菜单隐藏 + 模板指令控制。
+
+#### 判定点 C：组件级权限（页面内的按钮/区域）
+
+**Dashboard — `<PermissionGuard>`**
+
+**文件**：`packages/dashboard/src/lib/components/shared/permission-guard.tsx:44-50`
+
+```typescript
+export function PermissionGuard({ requires, children }) {
+    const { hasPermissions } = usePermissions();
+    const permissions = Array.isArray(requires) ? requires : [requires];
+    if (!hasPermissions(permissions)) return null;  // OR 逻辑，无权限不渲染
+    return children;
+}
+```
+
+**Admin UI — `*vdrIfPermissions` 指令**
+
+**文件**：`packages/admin-ui/src/lib/core/src/shared/directives/if-permissions.directive.ts:39-49`
+
+```typescript
+// 注意: 数组形式是 AND 逻辑（所有权限都必须满足）
+return this.permissionsService.currentUserPermissions$.pipe(
+    map(() => this.permissionsService.userHasPermissions(permissions)),
+);
+```
+
+**Admin UI — `hasPermission` 管道**
+
+**文件**：`packages/admin-ui/src/lib/core/src/shared/pipes/has-permission.pipe.ts:31-44`
+
+```typescript
+transform(input: string | string[]): any {
+    const requiredPermissions = Array.isArray(input) ? input : [input];
+    this.subscription = this.permissionsService.currentUserPermissions$.subscribe(() => {
+        this.hasPermission = this.permissionsService.userHasPermissions(requiredPermissions);
+    });
+    return this.hasPermission;  // OR 逻辑
+}
+```
+
+**⚠️ AND/OR 不一致**：
+
+| 判定点 | 逻辑 |
+|--------|------|
+| `vdrIfPermissions` 指令 | **AND** — 数组中所有权限都要满足 |
+| `hasPermission` 管道 | **OR** — `PermissionsService.userHasPermissions()` |
+| `PermissionGuard` (React) | **OR** — `hasPermissions(permissions)` |
+| 导航可见性 (React) | **OR** — `isItemAllowed()` |
+| 导航可见性 (Angular) | 字符串→includes，函数→委托 |
+
+### 8.6 权限字段流转汇总表
+
+| 站点 | 字段/结构 | 类型 | 说明 |
+|------|----------|------|------|
+| 服务端 `CrudPermissionDefinition` | `.config.name` | `string` | 原始名称如 `ProductBundle` |
+| 服务端 `.getMetadata()` | `PermissionMetadata[]` | `{name,description,assignable,internal}[]` | CRUD 展开 |
+| 服务端 `customPermissions` | `PermissionDefinition[]` | 类实例数组 | 配置中收集 |
+| GraphQL `Permission` enum | enum value | 枚举值 | `CreateProductBundle` 等 |
+| GraphQL `serverConfig.permissions` | `{name,description,assignable}[]` | 对象数组 | 暴露给前端 |
+| GraphQL `me.channels[].permissions` | `string[]` | 权限字符串数组 | 用户实际拥有的权限 |
+| 扩展声明 `navMenuItem.requiresPermission` | `string \| string[]` | 权限字符串 | 声明时硬编码 |
+| 注册表 `navMenuConfig.sections[].items[].requiresPermission` | `string \| string[]` | 同上 | 运行时存储 |
+| 判定函数输入 | `string[]` | 标准化后的数组 | 判定时统一为数组 |
+
+### 8.7 最小排障清单
+
+当扩展页面的导航项不可见或路由无法访问时，按以下顺序排查：
+
+#### 症状 1：导航菜单项不显示
+
+| # | 检查项 | 验证方法 | 常见原因 |
+|---|--------|---------|---------|
+| 1 | 权限是否注册到服务端 | 在 Admin API 中执行 `{ globalSettings { serverConfig { permissions { name } } } }`，搜索你的权限名 | 忘记 `config.authOptions.customPermissions.push()` |
+| 2 | 角色是否分配了该权限 | 在 Dashboard → Settings → Roles 检查当前用户角色 | 新权限未分配给任何角色 |
+| 3 | 用户 channel 中是否包含该权限 | 浏览器 DevTools → Network → `CurrentUserInformation` query → `me.channels[N].permissions` | 角色权限未同步到 channel |
+| 4 | `requiresPermission` 拼写是否正确 | 对比 GraphQL enum 值与扩展声明中的字符串 | 拼写错误或缺少 CRUD 前缀（如写了 `ProductBundle` 而非 `ReadProductBundle`） |
+| 5 | `sectionId` 是否指向了存在的 section | 浏览器控制台搜索 `Could not add menu item` 错误 | 菜单项注册到了不存在的 section |
+| 6 | Angular 版：权限是否已加载 | 在 `BaseNavComponent.shouldDisplayLink` 断点，检查 `this.userPermissions` | `userStatus` query 未完成或 channel token 不匹配 |
+| 7 | Dashboard 版：activeChannel 是否正确 | 检查 `usePermissions` hook 中 `activeChannel.id` 与 `channels` 是否匹配 | localStorage 中的 channel token 过期 |
+
+#### 症状 2：路由被重定向到登录页
+
+| # | 检查项 | 验证方法 | 常见原因 |
+|---|--------|---------|---------|
+| 1 | `authenticated` 是否为预期值 | 检查 `DashboardRouteDefinition.authenticated` 字段 | 默认为 `true`，公开页面需显式设为 `false` |
+| 2 | Auth context 是否正确初始化 | 在 `AuthProvider` 检查 `status` 和 `isAuthenticated` | 登录 token 过期或 CORS 问题 |
+| 3 | Angular 版路由守卫 | 检查 `LoginGuard` 是否拦截了扩展路由 | 扩展路由配置在错误的路由层级 |
+
+#### 症状 3：页面内按钮/区域不可见
+
+| # | 检查项 | 验证方法 | 常见原因 |
+|---|--------|---------|---------|
+| 1 | 确认 AND/OR 语义 | Dashboard `PermissionGuard` = **OR**，Admin UI `*vdrIfPermissions` = **AND** | 传了多个权限但语义理解错误 |
+| 2 | `PermissionGuard` 的 `requires` 字段 | 确认类型为 `Permission \| string \| string[] \| Permission[]` | 传入了 PermissionDefinition 对象而非字符串 |
+| 3 | `vdrIfPermissions` 数组参数 | 传入数组 = 所有权限都必须满足 | 应该用 OR 语义却传了数组 |
+
+#### 通用调试技巧
+
+1. **GraphQL 验证**：在 Admin API playground 执行以下查询，确认权限链完整：
+   ```graphql
+   query CheckPermissions {
+     me { channels { id code permissions } }
+     globalSettings { serverConfig { permissions { name assignable } } }
+   }
+   ```
+
+2. **Dashboard 断点**：在以下位置设置断点或 `console.log`：
+   - `packages/dashboard/src/lib/hooks/use-permissions.ts:37` — 查看 `selectedChannel.permissions` 与传入的 `permissions`
+   - `packages/dashboard/src/lib/components/layout/nav-main.tsx:166` — 查看 `isItemAllowed` 结果
+   - `packages/dashboard/src/lib/framework/extension-api/logic/navigation.ts:43` — 查看 `addNavMenuItem` 的参数
+
+3. **Admin UI 断点**：
+   - `packages/admin-ui/src/lib/core/src/providers/permissions/permissions.service.ts:33` — 查看 `userHasPermissions` 输入输出
+   - `packages/admin-ui/src/lib/core/src/components/base-nav/base-nav.component.ts:35` — 查看 `shouldDisplayLink`
+
+4. **注册表快照**：在浏览器控制台执行：
+   ```javascript
+   // Dashboard
+   globalThis.globalRegistry.get('navMenuConfig')
+   globalThis.globalRegistry.get('registerDashboardExtensionCallbacks').size
+   ```
+
+---
+
+## 10. 关键文件索引
 
 | 功能模块 | 文件路径 | 关键行号 |
 |---------|---------|---------|
@@ -811,12 +1266,23 @@ export class PermissionsService {
 | 扩展路由挂载 | `packages/dashboard/src/lib/framework/page/use-extended-router.tsx` | 12-132 |
 | Angular 路由注册 | `packages/admin-ui/src/lib/core/src/extension/register-route-component.ts` | 79-148 |
 | 导航构建服务 | `packages/admin-ui/src/lib/core/src/providers/nav-builder/nav-builder.service.ts` | 25-207 |
-| 权限服务 | `packages/admin-ui/src/lib/core/src/providers/permissions/permissions.service.ts` | 10-41 |
+| 权限服务 (Angular) | `packages/admin-ui/src/lib/core/src/providers/permissions/permissions.service.ts` | 10-41 |
+| 权限 Hook (React) | `packages/dashboard/src/lib/hooks/use-permissions.ts` | 23-46 |
+| 权限守卫 (React) | `packages/dashboard/src/lib/components/shared/permission-guard.tsx` | 44-50 |
+| 权限定义 | `packages/core/src/common/permission-definition.ts` | 86-110 |
+| 权限枚举生成 | `packages/core/src/api/config/generate-permissions.ts` | 42-67 |
+| 默认权限 + 合并 | `packages/core/src/common/constants.ts` | 14-80 |
+| 全局配置暴露权限 | `packages/core/src/api/resolvers/admin/global-settings.resolver.ts` | 63-75 |
+| 认证路由守卫 | `packages/dashboard/src/app/routes/_authenticated.tsx` | 7-17 |
+| 侧栏导航渲染 | `packages/dashboard/src/lib/components/layout/nav-main.tsx` | 94-350 |
+| Angular 导航权限 | `packages/admin-ui/src/lib/core/src/components/base-nav/base-nav.component.ts` | 35-48 |
+| Angular 权限指令 | `packages/admin-ui/src/lib/core/src/shared/directives/if-permissions.directive.ts` | 30-70 |
+| Angular 权限管道 | `packages/admin-ui/src/lib/core/src/shared/pipes/has-permission.pipe.ts` | 31-44 |
 | UI 扩展类型定义 | `packages/ui-devkit/src/compiler/types.ts` | 130-264 |
 
 ---
 
-## 9. 总结
+## 11. 总结
 
 Vendure 后台扩展注册链路的设计亮点：
 
@@ -826,4 +1292,9 @@ Vendure 后台扩展注册链路的设计亮点：
 4. **两阶段注册**：先收集所有扩展再统一应用，支持跨插件的菜单合并
 5. **灵活权限**：支持字符串、数组、自定义函数三种权限声明方式
 
-该设计既保证了插件的独立性，又实现了扩展间的协同与整合。
+权限约束链路的关键发现：
+
+1. **权限必须推入 `customPermissions`**：仅声明 `PermissionDefinition` 不够，必须推入配置才能进入 GraphQL enum
+2. **前端权限来自 channel**：权限按 channel 隔离，切换 channel 后权限列表会变
+3. **AND/OR 语义不统一**：Dashboard 统一 OR，Admin UI 的 `vdrIfPermissions` 指令是 AND，管道是 OR
+4. **路由拦截只管认证不管授权**：`_authenticated` 路由守卫只检查是否登录，细粒度权限靠导航隐藏 + 组件级控制
