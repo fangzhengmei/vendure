@@ -388,6 +388,172 @@ await this.connection.getRepository(ctx, ProductVariantPrice).delete({ channelId
 
 ---
 
+## 7. 入口链路职责边界：setCustomerForOrder / updateOrderCustomer / addCustomerToOrder
+
+将客户与订单关联有三条不同的入口链路，它们的调用端、渠道校验强度、以及在"客户未分配渠道"场景下的表现各不相同。
+
+### 7.1 三条链路的定义与调用端
+
+| 链路方法 | 调用方 | GraphQL Mutation | 适用场景 |
+|----------|--------|------------------|----------|
+| `DefaultGuestCheckoutStrategy.setCustomerForOrder()` | 店铺端 | `setCustomerForOrder` | 访客结账（guest checkout），用 `CreateCustomerInput` 新建或匹配客户 |
+| `OrderService.updateOrderCustomer()` | 管理端 | `updateOrderCustomer` | 管理员在已有订单上切换客户，用 `customerId` 指定目标客户 |
+| `OrderService.addCustomerToOrder()` | 内部服务 | 被 `setCustomerForOrder` 结果调用、被 `setCustomerForDraftOrder` 调用 | 底层方法，只做 `order.customer = customer` 的关联绑定 |
+
+### 7.2 逐条链路的渠道校验分析
+
+#### 链路 A：`setCustomerForOrder`（店铺端 Guest Checkout）
+
+**核心文件** `packages/core/src/config/order/default-guest-checkout-strategy.ts:80-94`
+
+```ts
+async setCustomerForOrder(ctx, order, input) {
+    if (!this.options.allowGuestCheckouts)
+        return new GuestCheckoutError();
+    if (ctx.activeUserId)
+        return new AlreadyLoggedInError();
+    const errorOnExistingUser = !this.options.allowGuestCheckoutForRegisteredCustomers;
+    const customer = await this.customerService.createOrUpdate(ctx, input, errorOnExistingUser);
+    return customer;
+}
+```
+
+**调用链**（`shop-order.resolver.ts:514-533`）：
+```
+setCustomerForOrder Mutation
+  └─ guestCheckoutStrategy.setCustomerForOrder(ctx, order, input)
+       └─ customerService.createOrUpdate(ctx, input, ...)
+            ├─ 按邮箱查找现有客户（无渠道过滤）
+            │    ├─ 若找到 → patch 并 push(ctx.channel) → 保存
+            │    └─ 未找到 → save() → assignToCurrentChannel() → 保存
+            └─ 返回 Customer（必然已分配到当前渠道）
+  └─ orderService.addCustomerToOrder(ctx, order.id, customer)
+       └─ 直接赋值 order.customer = customer → save
+```
+
+**渠道校验分析**：
+
+✅ **自动分配，不可能触发"空组"**
+
+- `createOrUpdate()` 有两个分支都会确保客户分配到当前渠道：
+  - **现有客户匹配**（`customer.service.ts:682-688`）：
+    ```ts
+    const existing = await this.connection.getRepository(ctx, Customer).findOne({
+        relations: ['channels'],
+        where: { emailAddress: input.emailAddress },
+    });
+    if (existing) {
+        customer = patchEntity(existing, input);
+        customer.channels.push(await this.connection.getEntityOrThrow(ctx, Channel, ctx.channelId));
+        // 显式把当前渠道 push 进去
+    ```
+  - **新客户创建**（`customer.service.ts:689-691`）：
+    ```ts
+    customer = await this.connection.getRepository(ctx, Customer).save(new Customer(input));
+    await this.channelService.assignToCurrentChannel(customer, ctx);
+    ```
+
+- 无论客户是新建还是邮箱匹配，返回的 `customer.channels` 必定包含 `ctx.channelId`。
+- 后续 `getCustomerGroups` 调用 `findOneInChannel` 时必然找到客户，不会触发 `else` 分支返回空组。
+
+> **注意**：`createOrUpdate` 在查找现有客户时，是**无渠道过滤**的普通 `findOne`（只按 `emailAddress`）。这是故意设计——访客在渠道 B 用渠道 A 注册时的邮箱下单，系统会复用同一个 Customer 记录，并把渠道 B 追加到其 `channels` 数组。
+
+#### 链路 B：`updateOrderCustomer`（管理端切换订单客户）
+
+**核心文件** `packages/core/src/service/services/order.service.ts:529-567`
+
+```ts
+async updateOrderCustomer(ctx, { customerId, orderId, note }) {
+    const order = await this.getOrderOrThrow(ctx, orderId, ['channels', 'customer']);
+    if (order.customer?.id === customerId) return order;
+
+    const targetCustomer = await this.customerService.findOne(ctx, customerId, ['channels']);
+    //                           ^^^^^^^^^^^^^^^^^
+    //                           走 findOneInChannel，带渠道过滤
+    if (!targetCustomer)
+        throw new EntityNotFoundError('Customer', customerId);
+
+    const channelIds = order.channels.map(c => c.id);
+    const customerChannelIds = targetCustomer.channels.map(c => c.id);
+    const missingChannelIds = channelIds.filter(id => !customerChannelIds.includes(id));
+    if (missingChannelIds.length)
+        throw new UserInputError(`error.target-customer-not-assigned-to-order-channels`, {
+            channelIds: missingChannelIds.join(', '),
+        });
+
+    return this.addCustomerToOrder(ctx, order.id, targetCustomer);
+}
+```
+
+**渠道校验分析**：
+
+✅ **双重校验，也不可能触发"空组"**
+
+这是三条链路中**校验最严格**的：
+
+1. **第一重校验**：`customerService.findOne(ctx, customerId, ['channels'])` 内部调用 `findOneInChannel(ctx, Customer, customerId, ctx.channelId, ...)`。如果目标客户不在 `ctx.channelId`（当前管理员操作的渠道），直接抛出 `EntityNotFoundError`。
+
+2. **第二重校验**：显式比较 `order.channels` 与 `targetCustomer.channels`，确保客户在订单所属的**所有**渠道中都存在。注意订单可能同时属于多个渠道（多渠道订单），所以校验的是订单的渠道集合，而非 `ctx.channelId`。
+
+> **设计意图**：管理端操作严谨，防止管理员错误地把不属于该渠道的客户绑到订单上。用户能在 `updateOrderCustomer` 这一步就拿到明确的错误提示，而不是等到促销计算时静默失败。
+
+#### 链路 C：`addCustomerToOrder`（底层绑定方法）
+
+**核心文件** `packages/core/src/service/services/order.service.ts:2001-2028`
+
+```ts
+async addCustomerToOrder(ctx, orderIdOrOrder, customer) {
+    const order = ...;
+    order.customer = customer;
+    await this.connection.getRepository(ctx, Order).save(order, { reload: false });
+    // 后续只校验优惠券是否对该客户有效，无渠道校验
+    if (order.active && order.couponCodes) {
+        for (const couponCode of order.couponCodes.slice()) {
+            const validationResult = await this.promotionService.validateCouponCode(
+                ctx, couponCode, customer.id
+            );
+            ...
+        }
+    }
+    return order;
+}
+```
+
+**调用方**：
+- 店铺端：`setCustomerForOrder` resolver（链路 A 的尾端）
+- 管理端：`setCustomerForDraftOrder` resolver（草稿订单设置客户）
+
+**渠道校验分析**：
+
+⚠️ **本身不做任何渠道校验**——**可能**触发"空组"
+
+`addCustomerToOrder` 是一个纯粹的"绑定"操作，**它假设调用方已经完成了渠道校验**。它接收的 `customer` 参数是一个已加载的实体，直接赋值给 `order.customer`。
+
+关键在于**谁调用它、传入的 customer 是什么**：
+
+- **被链路 A 调用**：传入的 customer 来自 `createOrUpdate()`，已确保在当前渠道 → 安全 ✅
+- **被 `setCustomerForDraftOrder` 调用**：传入的 customer 有两个来源：
+  - **来源 1：`customerId` 指定** → 先走 `customerService.findOne(ctx, customerId)` → 内部是 `findOneInChannel`，带渠道过滤 → 找不到会抛 `UserInputError` → 安全 ✅
+  - **来源 2：`input` 新建** → 走 `customerService.createOrUpdate(ctx, args.input, true)` → 同链路 A，会分配渠道 → 安全 ✅
+
+> **注意**：直接调用 `addCustomerToOrder`（绕过上层链路）才是真正的风险点。如果在自定义代码中获取了一个不经过 `findOneInChannel` 过滤的 Customer 实体（例如直接 `repository.findOne(id)`），然后传给 `addCustomerToOrder`，那么：
+> 1. `order.customer` 被设置为该客户（即使客户不在当前渠道）
+> 2. 下次 `applyPriceAdjustments` 触发促销计算时，`getCustomerGroups` 调用 `findOneInChannel` 返回 `undefined` → `[]`
+> 3. 分组条件静默失败
+
+### 7.3 三条链路对比速查表
+
+| 维度 | setCustomerForOrder (店铺端) | updateOrderCustomer (管理端) | addCustomerToOrder (底层) |
+|------|------------------------------|------------------------------|---------------------------|
+| 调用方 | 店铺访客 | 管理员 | 内部服务 |
+| 客户身份方式 | `CreateCustomerInput`（邮箱匹配或新建） | `customerId` | 现成 `Customer` 实体 |
+| **渠道校验** | `createOrUpdate` 自动 push 渠道 | 1. `findOneInChannel` 过滤<br>2. 订单渠道 ⊆ 客户渠道 | **无**（依赖调用方） |
+| **校验失败处理** | 不会失败（自动分配） | 抛 `EntityNotFoundError` 或 `UserInputError` | 静默绑定，后续促销计算时空组 |
+| 能否触发"空组" | ❌ 不能 | ❌ 不能 | ⚠️ 调用方传入不在渠道的客户时**能** |
+| 客户实体加载方式 | 新建或无渠道过滤查找 | `findOneInChannel`（带渠道过滤） | 调用方传入，不重新加载 |
+
+---
+
 ## 8. 跨渠道场景：从 order.customer 到 customerGroup.check() 的命中与失败路径
 
 Vendure 多渠道架构下，同一个 Customer 可以属于多个 Channel（通过 `customer.channels` 多对多关系），但客户的**渠道归属并不总是对称的**。一个在 Channel A 注册的老客户，首次在 Channel B 下单时，可能尚未被分配到 Channel B。这种不对称会直接影响促销中的客户分组匹配。
@@ -489,20 +655,39 @@ const effectiveRelations = relations ?? [
 
 **关键点**：这是一个**静默失败**——没有报错，没有日志，只是分组匹配结果为 `false`。客户明明属于分组 G，但在 Channel B 中查询分组时返回了空数组。
 
-#### 失败路径的触发场景
+#### 8.4 按店铺端与管理端——可触发与不可触发"空组"场景分类
 
-| 场景 | 为什么客户不在渠道中 |
-|------|----------------------|
-| 管理员在 Channel A 创建了客户，未分配到 Channel B | 创建客户时 `assignToCurrentChannel()` 只分配当前渠道 + 默认渠道 |
-| 客户在 Channel A 注册，从未在 Channel B 登录 | `registerCustomerAccount()` 只在当前渠道创建/关联客户 |
-| 管理员通过 `addCustomerToOrder` 切换了客户，但新客户不属于当前渠道 | `setCustomerForOrder()` 检查了渠道归属，但旧订单数据可能残留 |
-| 数据库直接操作，跳过渠道分配 | 绕过了 Service 层的渠道分配逻辑 |
+结合第 7 节的三条链路分析，"客户未分配渠道导致分组空组"的触发路径可按操作端分类：
 
-### 8.3 缓存键不含渠道 ID 的跨渠道污染
+##### 不可触发（✅）——校验太严，客户不在渠道的情况在入口就被拦截
+
+| 操作端 | 链路 | 拦截点 | 结果 |
+|--------|------|--------|------|
+| 店铺端 | `setCustomerForOrder`（访客结账） | `createOrUpdate` 自动 `push(ctx.channel)` | 客户必然在当前渠道 |
+| 店铺端 | `registerCustomerAccount`（注册） | `createOrUpdate` 分配渠道 | 客户必然在当前渠道 |
+| 店铺端 | `verifyCustomerEmailAddress`（验证邮箱） | `assignToChannels(ctx, Customer, customer.id, [ctx.channelId])` | 自动补分配 |
+| 管理端 | `updateOrderCustomer`（切换订单客户） | ① `findOneInChannel` 过滤 + ② 订单渠道 ⊆ 客户渠道 | 客户不在渠道直接抛错 |
+| 管理端 | `setCustomerForDraftOrder`（草稿单设客户） | `customerService.findOne` / `createOrUpdate` | 客户不在渠道直接抛错 |
+| 管理端 | `createCustomer`（创建客户） | `assignToCurrentChannel` | 自动分配到当前渠道 + 默认渠道 |
+
+##### 可触发（⚠️）——不做渠道校验，后续分组查询静默失败
+
+| 操作端 | 链路/场景 | 为什么能触发 |
+|--------|----------|------------|
+| 店铺端 | 客户在渠道 A 注册，从未访问渠道 B | 渠道 A 创建客户时 `assignToCurrentChannel` 只分配当前渠道 + 默认渠道。如果默认渠道不是 B |
+| 管理端 | 管理员在渠道 A 创建客户，未手动分配到渠道 B | `create` 只分配当前渠道 + 默认渠道。如果默认渠道不是 B，且管理员未在渠道 B 再次创建该客户 |
+| 任何端 | 数据库直接操作 `customer_channels__channel` 关联表，跳过 Service 层 | 绕过了 `assignToCurrentChannel` / `assignToChannels` |
+| 自定义代码 | 直接调用 `addCustomerToOrder(ctx, order, customer)`，传入的 `customer` 未渠道过滤加载 | `addCustomerToOrder` 本身不做渠道校验，直接绑定 |
+| 自定义代码 | 直接 `repository.save(order)` 设置 `order.customer`，跳过所有入口链路 | 完全绕过渠道校验逻辑 |
+| 任何端 | 并发场景：渠道分配还未 commit，`getCustomerGroups` 先执行了 `findOneInChannel` | 竞态条件导致关联尚未建立 |
+
+> **注意**：上述"不可触发"场景的前提是走**标准 GraphQL 链路**。任何绕过 Service 层的自定义代码都可能破坏这些保证。
+
+### 8.5 缓存键不含渠道 ID 的跨渠道污染
 
 缓存键 `PromotionCondition:customer_group:${customerId}` 只按客户 ID 缓存，**不区分渠道**。这导致两种问题：
 
-#### 污染场景 1：渠道 A 先查，渠道 B 后查——B 意外命中 A 的结果
+#### 8.5.1 污染场景 1：渠道 A 先查，渠道 B 后查——B 意外命中 A 的结果
 
 ```
 T1: Channel A 请求 → getCustomerGroups(ctx_A, C.id)
@@ -518,7 +703,7 @@ T2: Channel B 请求（客户不在 B）→ groupIdCache.get(C.id)
 
 **结果**：客户本不应在 Channel B 被识别为分组 G1 成员，但因缓存了 Channel A 的结果，分组条件错误地命中了。
 
-#### 污染场景 2：渠道 B 先查，渠道 A 后查——A 被误判为无分组
+#### 8.5.2 污染场景 2：渠道 B 先查，渠道 A 后查——A 被误判为无分组
 
 ```
 T1: Channel B 请求（客户不在 B）→ getCustomerGroups(ctx_B, C.id)
@@ -536,7 +721,7 @@ T2: Channel A 请求 → groupIdCache.get(C.id)
 
 缓存 TTL 为 1 周，这意味着污染一旦发生，可能持续影响很长时间。`CustomerGroupChangeEvent` 只在客户被加入/移出分组时清除缓存，**渠道分配变更不会触发缓存清除**。
 
-### 8.4 正常情况下为什么不会频繁触发
+### 8.6 正常情况下为什么不会频繁触发
 
 实际运行中，上述失败路径并不容易触发，原因在于 Vendure 的客户-渠道关联机制：
 
@@ -550,7 +735,7 @@ T2: Channel A 请求 → groupIdCache.get(C.id)
 - 渠道分配因并发问题丢失
 - 自定义代码未正确处理渠道分配
 
-### 8.5 路径判定速查表
+### 8.7 路径判定速查表
 
 ```
 customerGroup.check(ctx, order, args) 结果
@@ -600,3 +785,7 @@ customerGroup.check(ctx, order, args) 结果
 | PromotionService | `packages/core/src/service/services/promotion.service.ts` |
 | ListQueryBuilder | `packages/core/src/service/helpers/list-query-builder/list-query-builder.ts` |
 | TransactionalConnection | `packages/core/src/connection/transactional-connection.ts` |
+| DefaultGuestCheckoutStrategy | `packages/core/src/config/order/default-guest-checkout-strategy.ts` |
+| Shop Order Resolver | `packages/core/src/api/resolvers/shop/shop-order.resolver.ts` |
+| Admin Draft Order Resolver | `packages/core/src/api/resolvers/admin/draft-order.resolver.ts` |
+| Admin Order Resolver | `packages/core/src/api/resolvers/admin/order.resolver.ts` |
