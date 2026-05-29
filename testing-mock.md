@@ -837,3 +837,210 @@ MysqlInitializer:
 - sqljs 模式下，任何涉及 entity 或 initialData 的代码变更后，都应删除 `__data__/` 目录
 - CI 环境中每次都是全新 checkout，不存在缓存文件，所以不存在此问题
 - postgres/mysql 模式没有缓存问题，但代价是每次都要重新 populate
+
+---
+
+## 九、初始化器的微妙设计问题
+
+### 9.1 `registerInitializer` 的全局覆盖行为
+
+**文件**：`packages/testing/src/initializers/initializers.ts`
+
+```ts
+const initializerRegistry: InitializerRegistry = {};
+
+export function registerInitializer(
+    type: DataSourceOptions['type'],
+    initializer: TestDbInitializer<any>,
+) {
+    initializerRegistry[type] = initializer;  // ← 直接赋值，无警告
+}
+```
+
+`registerInitializer` 没有任何保护机制——对同一 `type` 的多次调用会**静默覆盖**之前的注册。这是一个全局单例注册表，但既没有"已注册"检查，也没有返回值或警告。
+
+#### 实际冲突路径
+
+项目中有多处对 `'sqljs'` 的注册调用，它们都是**在模块加载时执行**，覆盖顺序取决于 Node.js 的模块加载顺序：
+
+| 位置 | 注册内容 | 加载时机 |
+|------|---------|---------|
+| `e2e-common/test-config.ts:32` | `registerInitializer('sqljs', new SqljsInitializer(path.join(packageDir, '__data__')))` | 导入 `test-config.ts` 时 |
+| `packages/core/e2e/default-search-plugin.bench.ts:18` | `registerInitializer('sqljs', new SqljsInitializer(path.join(__dirname, '__data__'), 1000))` | 导入 benchmark 文件时 |
+| `packages/dashboard/e2e/global-setup.ts:18` | `registerInitializer('sqljs', new SqljsInitializer(path.join(__dirname, '__data__')))` | 导入 global-setup 时 |
+
+**关键问题**：
+1. `default-search-plugin.bench.ts` 第 18 行的注册覆盖了 `e2e-common/test-config.ts` 第 32 行的注册，因为 benchmark 文件在 `import { testConfig } from '../../../e2e-common/test-config'` 之后执行了自己的 `registerInitializer` 调用。由于 benchmark 文件需要 `postPopulateTimeoutMs: 1000`，它必须覆盖才能获得这个设置。
+
+2. `dashboard/e2e/global-setup.ts` 是一个独立的 Playwright 测试入口，不通过 `e2e-common/test-config.ts`，因此它需要自己的 `registerInitializer` 调用。它使用不同的 `__data__` 目录（dashboard 自己的 `e2e/__data__`），不会与 core 包冲突。
+
+3. **潜在的静默错误**：如果有人在测试文件中不小心调用了 `registerInitializer('postgres', new SqljsInitializer(...))`（类型参数错误），`initializerRegistry['postgres']` 会被错误地赋值为 `SqljsInitializer` 实例。后续 `getInitializerFor('postgres')` 会返回这个错误的实例，在 `init()` 调用时因为类型不兼容而抛出难以理解的错误。
+
+#### 为什么这是一个设计问题
+
+1. **缺少 idempotency 保护**：对同一 type 的多次注册应该至少给出警告，或者比较实例是否相同
+2. **缺少类型约束**：`registerInitializer` 的 type 参数和 initializer 实例类型之间没有编译时关联
+3. **全局可变状态**：测试框架依赖于模块加载顺序这种不可控因素
+
+### 9.2 `SqljsInitializer` 实例字段的并发状态污染
+
+`SqljsInitializer` 有两个**实例字段**，它们会在 `init()` 调用时被修改：
+
+```ts
+private dbFilePath: string;
+private connectionOptions: SqljsConnectionOptions;
+
+async init(testFileName, connectionOptions) {
+    this.dbFilePath = this.getDbFilePath(testFileName);    // ← 写入实例字段
+    this.connectionOptions = connectionOptions;            // ← 写入实例字段
+    connectionOptions.location = this.dbFilePath;          // ← 还会修改传入的参数
+    return connectionOptions;
+}
+```
+
+由于 `SqljsInitializer` 是**作为单例注册**到全局注册表中的，同一实例会被多个测试文件的 `init()` 调用复用。
+
+#### 顺序执行时的状态流转
+
+```
+测试文件 A 调用 init():
+  this.dbFilePath = "order.e2e-spec.ts.sqlite"
+  this.connectionOptions = <config A>
+
+测试文件 A 完成 → 测试文件 B 调用 init():
+  this.dbFilePath = "payment.e2e-spec.ts.sqlite"   ← 覆盖 A 的值
+  this.connectionOptions = <config B>              ← 覆盖 A 的值
+```
+
+在**顺序执行**（vitest 默认）下这是安全的，因为 `init()` → `populate()` → `destroy()` → 下一个测试的流程是原子的。
+
+#### 并发执行时的竞态条件
+
+如果使用 `vitest --parallel` 或 `vitest --pool threads` 并发运行多个测试文件：
+
+```
+时序（T=时间点）:
+
+T0: 测试A init() → this.dbFilePath = "order.e2e-spec.ts.sqlite"
+T1: 测试B init() → this.dbFilePath = "payment.e2e-spec.ts.sqlite"  ← 覆盖！
+T2: 测试A populate() → if (!fs.existsSync(this.dbFilePath))
+                      → 检查的是 "payment.e2e-spec.ts.sqlite"，不是自己的！
+                      → 可能跳过自己应该执行的 populate，或使用错误的文件路径
+```
+
+`populate()` 中对 `this.dbFilePath` 的读取和 `init()` 中的写入之间存在**竞态窗口**。如果两个测试文件的 `init()` 调用在时间上有重叠，后续的 `populate()` 可能读取到属于另一个测试的 `dbFilePath`。
+
+#### 更隐蔽的污染：`connectionOptions` 参数的修改
+
+`SqljsInitializer.init()` 不仅修改自己的实例字段，还**修改传入的 `connectionOptions` 对象**：
+
+```ts
+connectionOptions.location = this.dbFilePath;   // ← 直接修改传入的参数对象
+```
+
+如果测试代码中：
+1. 多个测试文件共享同一个 config 对象（例如通过 `mergeConfig(testConfig(), {...})`）
+2. 且 `testConfig()` 返回的是同一个对象而不是每次创建新对象
+
+那么一个测试的 `init()` 调用会修改其他测试使用的 config 的 `location` 字段。
+
+**好消息**：`e2e-common/test-config.ts` 中的 `testConfig()` 是**函数调用**（注意 `()`），每次调用都通过 `mergeConfig` 创建新对象，所以 config 对象不会被共享。但这是一个隐含的安全假设，代码中没有任何地方显式保证这一点。
+
+### 9.3 `basename` 派生数据库/文件名的冲突边界
+
+所有 three initializers 都使用 `path.basename(filename)` 来派生数据库名或文件名：
+
+```ts
+// SqljsInitializer
+const dbFileName = path.basename(testFileName) + '.sqlite';
+
+// PostgresInitializer / MysqlInitializer
+return 'e2e_' + path.basename(filename).replace(/[^a-z0-9_]/gi, '_');
+```
+
+`path.basename()` 只返回文件名部分，不包含目录。这在以下场景会产生冲突：
+
+#### 冲突场景 1：不同目录下的同名测试文件
+
+```
+packages/
+  ├─ core/e2e/order.e2e-spec.ts
+  │     → basename = "order.e2e-spec.ts"
+  │     → sqlite: "order.e2e-spec.ts.sqlite"
+  │     → postgres: "e2e_order_e2e_spec_ts"
+  │
+  └─ admin-ui-plugin/e2e/order.e2e-spec.ts
+        → basename = "order.e2e-spec.ts"   ← 相同！
+        → sqlite: "order.e2e-spec.ts.sqlite"  ← 相同文件名！
+        → postgres: "e2e_order_e2e_spec_ts"   ← 相同数据库名！
+```
+
+**对于 sqljs**：
+- 两个测试文件会尝试使用同一 `.sqlite` 文件路径
+- 如果它们在同一台机器上运行，先运行的会创建文件，后运行的会命中缓存（但缓存的数据属于另一个测试！）
+- 如果它们同时运行，会出现**文件锁冲突**或**数据损坏**
+
+**对于 postgres/mysql**：
+- 两个测试会使用同一数据库名
+- 后运行的测试在 `init()` 中执行 `DROP DATABASE IF EXISTS` 时，会删除先运行的测试正在使用的数据库
+- 先运行的测试会在查询时因"数据库不存在"而崩溃
+
+**临时缓解**：`e2e-common/test-config.ts` 中 `SqljsInitializer` 的 `dataDir` 参数使用了 `packageDir`（通过 `getPackageDir()` 获取），所以不同包的测试文件会写入不同的 `__data__` 目录。这在一定程度上缓解了冲突，但：
+1. 只对 sqljs 有效，postgres/mysql 仍然冲突
+2. 同一包内不同目录的同名文件仍然冲突
+
+#### 冲突场景 2：文件重命名后的端口漂移
+
+端口分配也依赖于 `path.basename()` 和父目录中的文件顺序：
+
+```ts
+function getIndexOfTestFileInParentDir() {
+    const testFilePath = getCallerFilename(2);
+    const parentDir = path.dirname(testFilePath);
+    const files = fs.readdirSync(parentDir);
+    const index = files.indexOf(path.basename(testFilePath));
+    return index;
+}
+```
+
+端口 = `getBasePort() + index`。如果父目录中的文件列表发生变化（新增、删除、重命名测试文件）：
+- `index` 可能改变
+- 端口可能漂移到另一个值
+- 之前缓存的 `.sqlite` 文件现在对应不同的端口（虽然文件名没变，不会影响缓存）
+
+#### 冲突场景 3：Windows vs Unix 路径差异
+
+`path.basename()` 的行为在 Windows 和 Unix 上是一致的（总是接受 `/` 和 `\` 作为分隔符）。但 `getCallerFilename()` 返回的路径格式取决于运行环境：
+
+- Linux/macOS: `/path/to/test.spec.ts`
+- Windows: `D:\path\to\test.spec.ts`
+
+`path.basename()` 对这两种格式都能正确处理。但 `path.basename(filename).replace(/[^a-z0-9_]/gi, '_')` 会把 `.` 和 `-` 也替换成 `_`，所以：
+- `order.e2e-spec.ts` → `e2e_order_e2e_spec_ts`
+- `order_e2e_spec_ts` → `e2e_order_e2e_spec_ts`（相同！）
+
+也就是说，`order.e2e-spec.ts` 和 `order_e2e_spec_ts` 会派生相同的数据库名。
+
+#### 冲突场景 4：`getCallerFilename` 的 depth 参数错误
+
+两个地方使用了 `getCallerFilename`，但 depth 参数不同：
+
+```ts
+// test-server.ts:33 — TestServer.init() 内调用
+const testFilename = this.getCallerFilename(1);
+
+// e2e-common/test-config.ts:72 — testConfig() 内调用
+const testFilePath = getCallerFilename(2);
+```
+
+`depth` 参数决定了在调用栈中向上跳过多少层来获取"真实的调用者"。如果有人在调用链中添加了一层封装函数（例如在测试文件中包装一层 `beforeAll` 辅助函数），`depth` 参数就需要相应调整，否则会拿到错误的文件名。没有任何运行时检查来验证拿到的文件名确实是一个测试文件。
+
+### 9.4 初始化器设计的总结风险矩阵
+
+| 问题 | 影响范围 | 严重程度 | 触发条件 |
+|------|---------|---------|---------|
+| `registerInitializer` 静默覆盖 | 全局 | 高 | 两个模块对同一 type 调用 registerInitializer |
+| `SqljsInitializer` 并发状态污染 | sqljs | 中 | 使用 `vitest --parallel` 并发运行 |
+| `basename` 同名文件冲突 | 所有 initializers | 高 | 不同目录有同名测试文件 |
+| `connectionOptions` 参数变异 | 所有 initializers | 中 | 多个测试共享 config 对象 |
+| `getCallerFilename` depth 错误 | 所有 initializers | 中 | 调用链深度变化 |
