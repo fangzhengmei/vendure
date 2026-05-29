@@ -389,69 +389,381 @@ export async function transformImage(
 
 ---
 
-## 四、缓存机制详解
+## 四、缓存链路深度剖析
 
-### 4.1 缓存键生成算法
+### 4.1 核心问题：两个中间件如何共享同一个缓存键
+
+`sendAsset()` 和 `generateTransformedImage()` 是两个独立的 Express 中间件，它们通过**两次独立调用同一组函数**来保证缓存键一致：
+
+```
+sendAsset()                             generateTransformedImage()
+    │                                         │
+    ├─ getImageTransformParameters(req) ──────├─ getImageTransformParameters(req)
+    │    ↓                                    │    ↓
+    │  同一个 req，同样的 query params         │  同一个 req，同样的 query params
+    │  同样的 strategy 管道，确定性输出         │  同样的 strategy 管道，确定性输出
+    │    ↓                                    │    ↓
+    ├─ getFileNameFromParameters(path, params)├─ getFileNameFromParameters(path, params)
+    │    ↓                                    │    ↓
+    │  key = "cache/source/ab/xx_<hash>.jpg"  │  cachedFileName = "cache/source/ab/xx_<hash>.jpg"
+    │    ↓                                    │    ↓
+    ├─ readFileToBuffer(key)                  ├─ writeFileFromBuffer(cachedFileName, buffer)
+    │    ├─ 命中 → 返回                        │
+    │    └─ 404 → next(err) ──────────────────┤
+    │                                         │  (key === cachedFileName，写入的文件即下次命中的文件)
+```
+
+**关键保证**：由于 `req` 对象在两个中间件间共享，`req.query` 不变，且 `getImageTransformParameters()` 是纯函数（对相同输入产生相同输出），因此两次调用生成的缓存键**一定相同**。这是整个缓存链路能够闭合的根本前提。
+
+---
+
+### 4.2 缓存键生成算法逐行解析
 
 **文件**：`packages/asset-server-plugin/src/asset-server.ts:214-248`
 
 ```typescript
 private getFileNameFromParameters(filePath: string, params: ImageTransformParameters): string {
     const { width: w, height: h, mode, preset, fpx, fpy, format, quality: q } = params;
-    
-    // 构建参数字符串
+
+    const focalPoint = fpx && fpy ? `_fpx${fpx}_fpy${fpy}` : '';
+    const quality = q ? `_q${q}` : '';
+    const imageFormat = getValidFormat(format);
+
     let imageParamsString = '';
     if (w || h) {
+        // 分支 A：有明确宽高 → 用尺寸 + 模式构建
+        const width = w || '';
+        const height = h || '';
         imageParamsString = `_transform_w${width}_h${height}_m${mode}`;
     } else if (preset) {
-        imageParamsString = `_transform_pre_${preset}`;
+        // 分支 B：只有 preset，无宽高 → 用预设名构建
+        if (this.presets && !!this.presets.find(p => p.name === preset)) {
+            imageParamsString = `_transform_pre_${preset}`;
+        }
     }
-    
-    // 附加参数
-    if (fpx && fpy) imageParamsString += `_fpx${fpx}_fpy${fpy}`;
-    if (format)     imageParamsString += `.${format}`;
-    if (q)          imageParamsString += `_q${q}`;
-    
-    // 无变换 → 直接返回原路径
-    if (imageParamsString === '') {
-        return decodedReqPath;
+    // 分支 C：无宽高也无 preset → imageParamsString 为空
+
+    if (focalPoint) imageParamsString += focalPoint;
+    if (imageFormat) imageParamsString += imageFormat;
+    if (quality) imageParamsString += quality;
+
+    const decodedReqPath = this.sanitizeFilePath(filePath);
+    if (imageParamsString !== '') {
+        const imageParamHash = this.md5(imageParamsString);
+        return path.join(this.cacheDir, this.addSuffix(decodedReqPath, imageParamHash, imageFormat));
+    } else {
+        return decodedReqPath;  // 无变换 → 返回原路径，不做缓存
     }
-    
-    // 有变换 → 生成 MD5 哈希，存入 cache/ 目录
-    const imageParamHash = this.md5(imageParamsString);
-    return path.join(this.cacheDir, this.addSuffix(decodedReqPath, imageParamHash, imageFormat));
 }
 ```
 
+**三个分支的命中判定**：
+
+| 场景 | 分支 | 缓存键 | 说明 |
+|------|------|--------|------|
+| `?w=500&h=300` | A | `cache/.../xx_<md5("_transform_w500_h300_mcrop")>.jpg` | 宽高明确，直接 MD5 |
+| `?preset=medium`（经解析后 w=500,h=500） | A | `cache/.../xx_<md5("_transform_w500_h500_mresize")>.jpg` | preset 被解析为宽高，走分支 A |
+| `?w=500`（只指定宽） | A | `cache/.../xx_<md5("_transform_w500_h_mcrop")>.jpg` | h 为空字符串 |
+| 无任何参数 | C | `source/ab/xx.jpg`（原路径） | 不走缓存，直接读源文件/预览文件 |
+
+**重要**：`preset` 参数在 `getImageTransformParameters()` 中已被解析为具体的 `width`/`height`/`mode`，所以 `getFileNameFromParameters()` 拿到的 `w`/`h` 总是有值的（只要指定了有效 preset），**永远不会走分支 B**。分支 B 仅在 `w` 和 `h` 都为 `undefined`、但 `preset` 仍有值时才可能触发——这在正常流程中不会发生。
+
 **缓存键示例**：
 ```
-原路径：source/ab/product.jpg?w=500&h=300&mode=crop&q=80
-缓存键：cache/source/ab/product_<md5("_transform_w500_h300_mcrop_q80")>.jpg
+URL：/assets/source/ab/product.jpg?w=500&h=300&mode=crop&q=80
+参数字符串："_transform_w500_h300_mcrop_q80"
+MD5 哈希：如 "a1b2c3d4e5f6..."
+缓存键："cache/source/ab/product_a1b2c3d4e5f6....jpg"
 ```
 
-### 4.2 缓存命中流程
+---
+
+### 4.3 首次未命中 → 写回缓存：完整流程
+
+以请求 `/assets/source/ab/product.jpg?w=500&h=300` 为例，首次访问时缓存文件尚不存在：
+
+#### 阶段一：`sendAsset()` 尝试读取
 
 ```
-请求 /assets/source/ab/product.jpg?w=500&h=300
-       ↓
-1. 解析参数 → { w: 500, h: 300, mode: 'crop' }
-       ↓
-2. 生成缓存键 → cache/source/ab/product_<hash>.jpg
-       ↓
-3. 调用 assetStorageStrategy.readFileToBuffer(缓存键)
-       ├─ 命中 → 直接返回，设置 Cache-Control
-       └─ 未命中 → 进入变换流程
-                ↓
-                4. 读取源文件 source/ab/product.jpg
-                ↓
-                5. sharp 变换为 500x300
-                ↓
-                6. 写入缓存键（除非 cache=false）
-                ↓
-                7. 返回变换结果
+1. getImageTransformParameters(req)
+   → getInitialImageTransformParameters({ w: '500', h: '300', mode: undefined })
+   → { width: 500, height: 300, mode: 'crop', ... }    // mode 默认为 'crop'
+   → 无 ImageTransformStrategy → 参数不变
+   → 无 preset → 参数不变
+   → 最终: { width: 500, height: 300, mode: 'crop', quality: undefined, format: undefined, ... }
+
+2. getFileNameFromParameters('/source/ab/product.jpg', params)
+   → w=500, h=300 → 分支 A
+   → imageParamsString = "_transform_w500_h300_mcrop"
+   → 无 focalPoint、format、quality → 不追加
+   → md5("_transform_w500_h300_mcrop") = "<hash>"
+   → key = "cache/source/ab/product_<hash>.jpg"
+
+3. assetStorageStrategy.readFileToBuffer("cache/source/ab/product_<hash>.jpg")
+   → 抛出异常！文件不存在
+
+4. 构造 404 错误 → next(err)  ──→  进入阶段二
 ```
 
-### 4.3 缓存目录结构
+#### 阶段二：`generateTransformedImage()` 接管
+
+```
+5. 检查 err.status === 404 ✓
+
+6. assetStorageStrategy.readFileToBuffer("/source/ab/product.jpg")  ← 注意：读的是源文件
+   → 成功，拿到原图 Buffer
+
+7. getImageTransformParameters(req)  ← 同一个 req，产出与阶段一完全相同的参数
+   → { width: 500, height: 300, mode: 'crop', ... }
+
+8. transformImage(原图Buffer, params)  ← Sharp 执行 resize
+   → 变换后的 sharp 对象
+
+9. image.toBuffer()  → imageBuffer
+
+10. getFileNameFromParameters(req.path, params)
+    → cachedFileName = "cache/source/ab/product_<hash>.jpg"
+    → 与阶段一的 key 完全一致！
+
+11. 写入缓存判定：
+    !req.query.cache || req.query.cache === 'true'
+    → 无 cache 参数 → !undefined = true → 写入！
+
+12. assetStorageStrategy.writeFileFromBuffer(cachedFileName, imageBuffer)
+    → 缓存文件落盘
+
+13. res.send(imageBuffer)  → 返回变换结果
+```
+
+**写入后的文件系统状态**：
+```
+asset-upload-dir/
+└── cache/
+    └── source/
+        └── ab/
+            └── product_<hash>.jpg   ← 新写入的缓存文件
+```
+
+---
+
+### 4.4 同参数再次访问：入口短路命中
+
+同一参数的第二次请求 `/assets/source/ab/product.jpg?w=500&h=300`：
+
+```
+1. sendAsset() 执行
+2. getImageTransformParameters(req) → { width: 500, height: 300, mode: 'crop', ... }
+3. getFileNameFromParameters(...) → "cache/source/ab/product_<hash>.jpg"
+4. assetStorageStrategy.readFileToBuffer("cache/source/ab/product_<hash>.jpg")
+   → 成功！文件已在上次请求中写入
+5. res.contentType(mimeType)
+6. res.setHeader('Cache-Control', 'public, max-age=15552000')
+7. res.send(file)
+8. ← 返回，不进入 generateTransformedImage()
+```
+
+**短路命中路径**：只经过 `sendAsset()` 一个中间件，完全不触发 `generateTransformedImage()`。无需读取源文件、无需 Sharp 变换、无需写入缓存。这就是"入口短路"的含义——缓存命中时，请求在第一个中间件就已经终结。
+
+**性能对比**：
+```
+首次请求（未命中）：
+  readFileToBuffer(缓存键) → 失败
+  + readFileToBuffer(源文件) → 成功
+  + sharp 变换
+  + writeFileFromBuffer(缓存键)
+  = 2次存储读取 + 1次CPU密集变换 + 1次存储写入
+
+二次请求（命中）：
+  readFileToBuffer(缓存键) → 成功
+  = 1次存储读取
+```
+
+---
+
+### 4.5 `cache=false` 的行为与陷阱
+
+#### 写入判定逻辑
+
+**文件**：`packages/asset-server-plugin/src/asset-server.ts:132`
+
+```typescript
+if (!req.query.cache || req.query.cache === 'true') {
+    await this.assetStorageStrategy.writeFileFromBuffer(cachedFileName, imageBuffer);
+}
+```
+
+| `req.query.cache` 值 | `!req.query.cache` | `=== 'true'` | 结果 |
+|---|---|---|---|
+| `undefined`（未传） | `true` | — | **写入缓存** |
+| `'true'` | `false` | `true` | **写入缓存** |
+| `'false'` | `false` | `false` | **不写入缓存** |
+| `'1'` | `false` | `false` | **不写入缓存** |
+
+#### `cache` 不参与缓存键计算
+
+`cache` 参数**不属于** `ImageTransformParameters` 接口，它只在 `generateTransformedImage()` 中作为写入条件的判断依据。因此：
+
+- `?w=500` 和 `?w=500&cache=false` 生成**完全相同的缓存键**
+- `cache=false` 仅控制当前请求是否写入缓存文件，**不影响读取**
+
+#### 连续请求的行为矩阵
+
+| 请求序号 | URL | 缓存文件是否存在 | 写入？ | 结果 |
+|----------|-----|------------------|--------|------|
+| 1 | `?w=500&cache=false` | 否 | 不写入 | 实时变换，不缓存 |
+| 2 | `?w=500&cache=false` | 否 | 不写入 | 再次实时变换，再次不缓存 |
+| 3 | `?w=500`（无 cache 参数） | 否 | 写入 | 实时变换，缓存落盘 |
+| 4 | `?w=500&cache=false` | **是** | 不写入 | **命中缓存！** 直接返回 |
+
+**关键陷阱**：第 4 次请求虽然带了 `cache=false`，但因为第 3 次请求已经写入了缓存文件，`sendAsset()` 会直接命中并返回。`cache=false` 只阻止写入，**不阻止读取已有的缓存文件**。
+
+这意味着 `cache=false` 的语义是"本次不要把变换结果写入缓存"，而不是"绕过缓存"。
+
+#### `cache=false` 的典型用例
+
+- **一次性预览**：管理员在后台预览某个变换效果，不希望污染缓存空间
+- **调试**：开发者临时查看变换效果，不希望影响生产缓存
+- **注意**：如果同一参数组合的缓存已存在，`cache=false` 并不会阻止命中该缓存
+
+---
+
+### 4.6 PresetOnlyStrategy 下的缓存命中判定
+
+**文件**：`packages/asset-server-plugin/src/config/preset-only-strategy.ts`
+
+#### 策略的核心行为
+
+`PresetOnlyStrategy.getImageTransformParameters()` 对参数做了**强制归一化**：
+
+```typescript
+getImageTransformParameters({ input, availablePresets }) {
+    // 1. 强制使用预设：无 preset 则用 defaultPreset
+    const presetName = input.preset ?? this.options.defaultPreset;
+    const matchingPreset = availablePresets.find(p => p.name === presetName);
+    if (!matchingPreset) {
+        throw new Error(`Preset "${presetName}" not found`);  // 无效预设 → 抛错
+    }
+
+    // 2. 宽高模式强制覆盖为预设值，忽略 URL 中的 w/h/mode
+    // 3. quality/format 仅保留允许的值，否则置 undefined
+    const permittedQuality = this.options.permittedQuality ?? [0, 50, 75, 85, 95];
+    const permittedFormats = this.options.permittedFormats ?? ['jpg', 'webp', 'avif'];
+    const quality = input.quality && permittedQuality.includes(input.quality) ? input.quality : undefined;
+    const format = input.format && permittedFormats.includes(input.format) ? input.format : undefined;
+
+    // 4. 焦点：默认禁用
+    const fpx = this.options.allowFocalPoint ? input.fpx : undefined;
+    const fpy = this.options.allowFocalPoint ? input.fpy : undefined;
+
+    return {
+        width: matchingPreset.width,
+        height: matchingPreset.height,
+        mode: matchingPreset.mode,
+        quality, format, fpx, fpy,
+        preset: input.preset,   // 保留原始 preset 名
+    };
+}
+```
+
+#### 参数归一化对缓存键的影响
+
+由于 `PresetOnlyStrategy` 将 `width`/`height`/`mode` 强制设为预设值，以下 URL 会产生**相同的参数**，因而**命中同一缓存键**：
+
+```
+?preset=medium                → w=500, h=500, mode=resize
+?w=999&h=888&preset=medium    → w=500, h=500, mode=resize  (w/h 被忽略)
+?preset=medium&mode=crop      → w=500, h=500, mode=resize  (mode 被忽略)
+?preset=medium&q=75           → w=500, h=500, mode=resize, q=75 (如果 75 在 permittedQuality 中)
+```
+
+它们都会生成缓存键 `cache/.../xx_<md5("_transform_w500_h500_mresize_q75")>.jpg`。
+
+#### 无效参数的过滤与缓存
+
+`PresetOnlyStrategy` 会将不在白名单中的 `quality`/`format` 置为 `undefined`：
+
+```
+?preset=medium&q=42     → q=42 不在 permittedQuality [0,50,75,85,95] → quality=undefined
+?preset=medium&q=75     → q=75 在白名单中 → quality=75
+?preset=medium&format=bmp → bmp 不在 permittedFormats → format=undefined
+```
+
+因此：
+- `?preset=medium&q=42` 和 `?preset=medium`（不传 q）生成**相同的缓存键**
+- `?preset=medium&q=75` 生成**不同的缓存键**（包含 `_q75`）
+
+#### 无效预设的错误短路
+
+```
+请求：/assets/xx.jpg?preset=nonexistent
+       ↓
+sendAsset():
+  getImageTransformParameters(req)
+    → PresetOnlyStrategy: find('nonexistent') → undefined → throw Error
+  → catch (e):
+      res.status(400).send('Invalid parameters')
+      return  ← 请求在此终止！
+```
+
+当 `ImageTransformStrategy` 抛错时，`sendAsset()` 的 try-catch（第 83-88 行）直接返回 HTTP 400。**请求不会进入 `generateTransformedImage()`，不涉及任何缓存读写。**
+
+#### 无预设参数时的 defaultPreset 行为
+
+```
+请求：/assets/xx.jpg  （完全无变换参数）
+       ↓
+PresetOnlyStrategy:
+  input.preset = undefined → presetName = this.options.defaultPreset
+  → 例如 defaultPreset = 'thumbnail' → w=150, h=150, mode=crop
+       ↓
+getFileNameFromParameters():
+  w=150, h=150 → 分支 A
+  → imageParamsString = "_transform_w150_h150_mcrop"
+  → key = "cache/.../xx_<hash>.jpg"
+       ↓
+sendAsset():
+  readFileToBuffer(key) → 首次不存在 → 404 → generateTransformedImage()
+  → 变换 → 写入缓存 → 返回
+```
+
+**注意**：配置了 `PresetOnlyStrategy` 后，即使 URL 完全不带参数，也会因为 `defaultPreset` 被强制应用变换，而不是直接返回原图。
+
+---
+
+### 4.7 完整缓存命中判定决策树
+
+```
+请求到达 sendAsset()
+       ↓
+getImageTransformParameters(req)
+       ├─ ImageTransformStrategy 抛错 → 400 终止（不涉及缓存）
+       └─ 成功，返回 params
+              ↓
+getFileNameFromParameters(req.path, params)
+       ├─ params 无 w/h/preset → key = 原路径（不经过缓存目录）
+       │      ↓
+       │  readFileToBuffer(原路径)
+       │      ├─ 命中 → 返回源/预览文件
+       │      └─ 未命中 → 404 → generateTransformedImage()
+       │                      → 读源文件失败 → 404 终止
+       │
+       └─ params 有 w/h 或 preset → key = cache/.../<hash>.jpg
+              ↓
+         readFileToBuffer(缓存键)
+              ├─ 命中 → 直接返回缓存文件 ← 短路！不进入下一个中间件
+              └─ 未命中 → 404 → generateTransformedImage()
+                              ├─ 读源文件失败 → 404 终止
+                              ├─ 变换失败 → 500 终止
+                              └─ 变换成功
+                                    ├─ cache=false → 不写入，返回结果
+                                    └─ cache=true/未传 → 写入缓存键，返回结果
+                                           ↓
+                                    下次同参数请求 → sendAsset() 短路命中
+```
+
+---
+
+### 4.8 缓存目录结构
 
 ```
 asset-upload-dir/
@@ -462,19 +774,35 @@ asset-upload-dir/
 ├── preview/             # 预览图目录
 │   ├── 00/
 │   └── ...
-└── cache/               # 变换缓存目录
+└── cache/               # 变换缓存目录（onApplicationBootstrap 时 fs.ensureDirSync 创建）
     └── source/
         ├── 00/
-        │   ├── product_<hash1>.jpg   # w=500 版本
-        │   └── product_<hash2>.jpg   # w=300&q=75 版本
+        │   ├── product_<hash1>.jpg   # w=500&h=300 版本
+        │   ├── product_<hash2>.jpg   # w=500&h=300&mode=resize 版本
+        │   └── product_<hash3>.webp  # w=500&h=300&format=webp 版本
         └── ...
 ```
 
-### 4.4 HTTP 缓存头
+---
+
+### 4.9 HTTP 缓存头
 
 **文件**：`packages/asset-server-plugin/src/asset-server.ts:45-57`
 
-默认 `Cache-Control: public, max-age=15552000`（6 个月），可通过 `cacheHeader` 配置。
+无论请求走缓存命中路径还是实时变换路径，响应都会设置相同的 `Cache-Control` 头：
+
+```typescript
+res.setHeader('Cache-Control', this.cacheHeader);
+```
+
+默认值（`constants.ts`）：
+```typescript
+export const DEFAULT_CACHE_HEADER = 'public, max-age=15552000';  // 6 个月
+```
+
+可通过 `AssetServerPlugin.init({ cacheHeader })` 自定义，支持字符串或 `{ maxAge, restriction }` 对象。
+
+**注意**：`cache=false` 仅控制服务端文件缓存，**不影响 HTTP `Cache-Control` 响应头**。即使 `cache=false`，浏览器/CDN 仍会按 `Cache-Control` 缓存响应。
 
 ---
 
@@ -595,12 +923,16 @@ interface ImageTransformStrategy {
 
 2. **哈希目录分散**：通过文件名 MD5 前 2 位创建 256 个子目录，避免单目录文件过多导致的性能问题。
 
-3. **中间件链式错误处理**：第一个中间件 404 时，第二个中间件接管进行实时变换，这种设计使得缓存命中路径和未命中路径无缝衔接。
+3. **中间件链式错误驱动流转**：`sendAsset()` 通过 `readFileToBuffer` 的异常来区分缓存命中/未命中，404 错误驱动 `generateTransformedImage()` 接管。这种设计使得两条路径共享同一个缓存键空间而无需额外通信机制。
 
-4. **缓存键哈希化**：变换参数先序列化为字符串再做 MD5，确保参数顺序、格式差异不会导致同一变换生成不同缓存。
+4. **缓存键哈希化的确定性保证**：变换参数先序列化为字符串再做 MD5。由于 `getImageTransformParameters()` 对相同 `req.query` 产生确定性输出，两个中间件独立计算出的缓存键**一定相同**，这是缓存链路闭合的根本前提。
 
-5. **焦点裁剪算法**：先等比缩放使目标尺寸"覆盖"裁剪区域，再基于焦点坐标计算提取区域，保证焦点始终在裁剪结果中心。
+5. **`cache=false` 是写入控制而非读取控制**：`cache` 不属于 `ImageTransformParameters`，不参与缓存键计算，只控制 `generateTransformedImage()` 是否写入文件。这意味着：带 `cache=false` 的请求可能命中其他请求写入的缓存文件；反过来，一直用 `cache=false` 则永远无法缓存，每次都走完整变换流程。
 
-6. **变换策略管道**：支持多个 `ImageTransformStrategy` 顺序执行，可用于参数校验、权限控制、预设强制等场景。
+6. **PresetOnlyStrategy 的参数归一化带来缓存合并**：强制使用预设宽高、过滤非法 quality/format，使得不同 URL 若归一化到相同参数就命中同一缓存。无效预设直接抛错，在 `sendAsset()` 的 try-catch 中被拦截为 HTTP 400，请求不会到达变换阶段。
 
-7. **流错误防护**：`makeStreamGuard` 处理 `fs-capacitor` 的边界情况，确保流错误能被正确捕获。
+7. **焦点裁剪算法**：先等比缩放使目标尺寸"覆盖"裁剪区域，再基于焦点坐标计算提取区域，保证焦点始终在裁剪结果中心。
+
+8. **变换策略管道**：支持多个 `ImageTransformStrategy` 顺序执行，可用于参数校验、权限控制、预设强制等场景。策略抛错时在 `sendAsset()` 中被截获，返回 400，不触及缓存层。
+
+9. **流错误防护**：`makeStreamGuard` 处理 `fs-capacitor` 的边界情况，确保流错误能被正确捕获。
