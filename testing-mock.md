@@ -446,11 +446,13 @@ sqljs 的 `.sqlite` 文件缓存是一个精妙的设计：
 
 ### 6.3 两阶段 Bootstrap
 
-`TestServer.init()` 实际上启动了两次 NestJS 应用：
-1. 第一次：仅用于数据填充，填充完立即关闭
-2. 第二次：正式启动，连接填充好的数据库，供测试使用
+`TestServer.init()` 对 `bootstrapForTesting()` 进行了**两次独立调用**，而非"重启"同一实例：
 
-这种设计解耦了"数据准备"和"测试运行"两个阶段，也让 `bootstrap()` 方法可以独立使用（例如需要重启服务但不重新填充数据的场景）。
+1. **第一次调用**（populate 阶段）：由 `populateInitialData()` → `populateForTesting()` → `bootstrapFn(config)` 触发。此实例仅用于数据填充，填充完成后调用 `app.close()` 销毁。这个 NestJS 实例监听的端口与第二次相同（因为用的是同一份 `config`），但由于 `app.close()` 在 `populateInitialData()` 返回前就已执行，端口会先释放再被第二次调用占用。
+
+2. **第二次调用**（正式阶段）：由 `this.bootstrap()` → `bootstrapForTesting(this.vendureConfig)` 触发。此实例连接同一数据库文件，供测试用例使用。
+
+两次调用之间不存在"重启"关系——它们是**两次完全独立的 `NestFactory.create()` + `app.listen()`**，中间有一次 `app.close()` 确保端口释放。`bootstrap()` 方法也可独立使用，适用于需要重新启动服务但不重新填充数据的场景。
 
 ### 6.4 确定性随机
 
@@ -517,11 +519,11 @@ return app;
 
 **关键发现**：`requireVerification` 的恢复**不在 finally 块中**。如果 `populateInitialData()`、`populateProducts()`、`populateCollections()` 或 `populateCustomers()` 中任何一个抛出异常：
 
-1. `requireVerification` **永远不会恢复**为原值
-2. 由于 `config` 是引用传递且是全局共享对象，**后续使用同一 config 的测试也会受到污染**
-3. `app`（临时启动的 NestJS 实例）不会被关闭，可能导致端口未释放
-
-同样，`dbConnectionOptions.logging = false` 的修改也没有回滚机制。
+1. `requireVerification` **不会恢复**为原值
+2. `dbConnectionOptions.logging = false` 也不会恢复
+3. 由于 `config` 是引用传递，如果测试代码手动捕获 `init()` 异常后单独调用 `server.bootstrap()`，被污染的值会影响后续服务
+4. 但在正常流程中，异常冒泡到 `TestServer.init()` 的 catch 后 `this.bootstrap()` 不会执行，所以**被污染的 config 不会自动到达第二次 bootstrap**
+5. `app`（临时启动的 NestJS 实例）不会被关闭，可能导致端口未释放——这是一个独立的资源泄漏问题
 
 ### 7.3 `populateInitialData()` 的 app 关闭——另一个无保护的 close
 
@@ -629,6 +631,74 @@ async function awaitOutstandingJobs(app: INestApplicationContext) {
 - 如果 JobQueueStrategy 不支持 `findMany()` 检查（`isInspectableJobQueueStrategy` 为 false），直接跳过
 - 这种设计避免了测试框架因 JobQueue 的正常异步行为而卡死，但也意味着偶尔可能在 Job 未完成时就开始 populate，导致数据不一致
 
+**`findMany()` 抛异常的未处理分支**：
+
+```ts
+const interval = setInterval(async () => {
+    attempts++;
+    const { items } = await inspectableJobQueueStrategy.findMany();  // ← 无 try-catch
+    // ...
+}, 500);
+```
+
+`setInterval` 的回调是 `async` 函数，其中 `await inspectableJobQueueStrategy.findMany()` **没有 try-catch 保护**。如果 `findMany()` 抛出异常（例如数据库连接中断、策略内部状态异常），会产生一个 **unhandled promise rejection**。由于 `setInterval` 不会因回调内的异常而停止：
+
+- `interval` 不会被 `clearInterval()` 清除——**定时器泄漏**
+- 每隔 500ms 会持续触发同一个未处理的异常——**错误风暴**
+- `waitForJobQueueToBeIdle()` 返回的 Promise **永远不会 resolve**——**测试框架挂起**
+
+这是一个比超时更严重的故障模式：超时至少会静默继续，而 `findMany()` 异常会导致整个测试进程卡死，只能通过外部信号杀死。
+
+### 7.8 配置污染的完整传播链
+
+当 `init()` 过程中发生异常时，配置对象的临时修改会沿以下路径传播：
+
+```
+SqljsInitializer.populate() 失败
+  ├─ connectionOptions.autoSave = true     ← 未回滚
+  ├─ connectionOptions.synchronize = true  ← 未回滚
+  │
+  └─ 异常冒泡到 TestServer.init() 的 catch
+       └─ throw e;  ← 没有清理，也没有 finally
+            └─ this.bootstrap() 不会执行
+                 └─ 污染的 config 不会被第二次 bootstrap 使用
+
+populateForTesting() 内部失败（bootstrap 成功后）
+  ├─ config.authOptions.requireVerification = false  ← 未回滚
+  ├─ config.dbConnectionOptions.logging = false      ← 未回滚
+  │
+  └─ 异常冒泡到 SqljsInitializer.populate() 的 populateFn()
+       └─ 进而冒泡到 TestServer.init() 的 catch
+            └─ this.bootstrap() 不会执行
+                 └─ 污染的 config 不会被第二次 bootstrap 使用
+```
+
+**在 `init()` 失败的默认路径上，污染的 config 不会被二次使用**，因为 `this.bootstrap()` 在异常后不会执行。但如果测试代码自行处理了 `init()` 的异常并随后单独调用 `bootstrap()`，就会触发以下风险：
+
+```ts
+// 风险场景：手动捕获 init 异常后继续使用
+try {
+    await server.init(options);
+} catch (e) {
+    // 忽略错误，尝试用已有数据库启动
+    await server.bootstrap();  // ← 此时 config 已被污染
+}
+```
+
+| 被污染的字段 | 在 `bootstrap()` 中的影响 |
+|-------------|-------------------------|
+| `requireVerification = false` | 所有认证操作跳过验证步骤，可能让需要验证的测试通过但不应该通过 |
+| `dbConnectionOptions.logging = false` | 影响较小，只是禁止了 TypeORM 的 SQL 日志 |
+| `autoSave = true`（sqljs） | 第二次 bootstrap 的 TypeORM 在每次写操作后都将整个数据库序列化到文件，**严重降低性能** |
+| `synchronize = true`（sqljs） | TypeORM 启动时自动同步 schema——如果 `.sqlite` 文件已存在且 schema 有变更，可能**意外修改生产 schema**；如果是全新数据库则无影响 |
+
+**sqljs 特有的连锁风险**：如果 `populateFn()` 在 `autoSave = true` 期间抛异常，且 `.sqlite` 文件已被部分写入（但 `autoSave` 来不及在异常前保存最终状态），那么：
+- 留下的 `.sqlite` 文件可能处于**不一致的中间状态**
+- 下次运行时 `fs.existsSync()` 返回 `true`，跳过 populate
+- `bootstrap()` 连接到这个损坏的数据库，可能在查询时报错
+
+这种情况下唯一的恢复方式是手动删除对应的 `.sqlite` 文件。
+
 ---
 
 ## 八、sqljs 与 postgres/mysql 在缓存命中与重建触发条件上的详细对比
@@ -664,7 +734,21 @@ async populate(populateFn: () => Promise<void>): Promise<void> {
 
 2. **schema 变更不会自动触发重建**：如果代码中的 entity 定义改变了（加字段、改类型等），但 `.sqlite` 文件还在，sqljs 会加载旧 schema 的数据库。由于 populate 被跳过，`synchronize` 也被设为 `false`，TypeORM 不会自动同步 schema，导致运行时错误。**必须手动删除 `__data__/` 目录下的 `.sqlite` 文件**。
 
-3. **`.gitkeep` 保证目录存在**：`packages/core/e2e/__data__/.gitkeep` 确保 `__data__/` 目录被 git 跟踪（即使为空），这样 clone 后目录就已存在，`mkdirSync` 不会因为父目录不存在而失败。
+3. **`mkdirSync` 自行保证目录存在**：`SqljsInitializer.populate()` 在执行 `populateFn()` 之前会先检查目录是否存在：
+
+   ```ts
+   if (!fs.existsSync(this.dbFilePath)) {
+       const dirName = path.dirname(this.dbFilePath);
+       if (!fs.existsSync(dirName)) {
+           fs.mkdirSync(dirName);   // ← 不带 { recursive: true }
+       }
+       // ...
+   }
+   ```
+
+   注意 `fs.mkdirSync(dirName)` 不带 `{ recursive: true }`，所以它只能创建一级子目录。但在实际使用中，`dirName` 总是形如 `packages/core/e2e/__data__`，其父目录 `packages/core/e2e/` 作为源码目录在 git clone 后就已存在，所以 `mkdirSync` 不会因父目录不存在而失败。
+
+   `__data__/` 目录下的 `.gitkeep` 文件的作用**不是**保证 `mkdirSync` 不失败——即使没有 `.gitkeep`，只要 `packages/core/e2e/` 存在，`mkdirSync` 就能成功创建 `__data__/`。`.gitkeep` 的实际作用是让 git 追踪这个空目录，这样在 clone 后目录就已存在，`fs.existsSync(dirName)` 会返回 `true`，从而跳过 `mkdirSync` 调用。这只是一个微小的性能优化，不影响正确性。
 
 4. **gitignore 保护**：`.gitignore` 规则 `e2e/__data__/*.sqlite` + `!e2e/__data__/.gitkeep` 确保 `.sqlite` 文件不被提交，但 `.gitkeep` 保留。
 
@@ -686,9 +770,10 @@ connectionOptions.synchronize = false;   // 关闭自动同步
 
 **如果 `populateFn()` 抛异常**：
 - `autoSave` 和 `synchronize` **不会被恢复**为 `false`
-- `connectionOptions` 是引用传递，被修改的状态会传播到后续的 `bootstrapForTesting()`
-- 第二次 bootstrap 时 TypeORM 会以 `synchronize: true` 启动，可能意外修改已填充的 schema
-- `autoSave: true` 在 sqljs 模式下会让 TypeORM 在每次写操作后都把整个数据库序列化到磁盘，降低性能
+- 但由于异常会冒泡到 `TestServer.init()` 的 catch 块，`this.bootstrap()` 不会执行，所以**在正常流程中，被污染的 config 不会到达第二次 bootstrap**
+- 只有在测试代码手动捕获 `init()` 异常后单独调用 `bootstrap()` 时，这些被污染的值才会生效：
+  - `synchronize = true`：TypeORM 启动时自动同步 schema——如果 `.sqlite` 文件已存在且 schema 有变更，可能意外修改已有 schema
+  - `autoSave = true`：TypeORM 在每次写操作后都将整个数据库序列化到文件，严重降低性能
 
 **`postPopulateTimeoutMs` 的作用**：
 
