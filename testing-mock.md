@@ -455,3 +455,300 @@ sqljs 的 `.sqlite` 文件缓存是一个精妙的设计：
 ### 6.4 确定性随机
 
 `MockDataService` 通过 `faker.seed(1)` 确保每次生成的客户数据完全相同。这意味着不同机器、不同时间运行的测试面对的是同一组客户数据，消除了随机性带来的测试不稳定。
+
+---
+
+## 七、异常边界处理：初始化报错时的数据库清理与配置回滚
+
+### 7.1 `TestServer.init()` 的异常捕获——"裸" try-catch
+
+**文件**：`packages/testing/src/test-server.ts:30-43`
+
+```ts
+async init(options: TestServerOptions): Promise<void> {
+    const { type } = this.vendureConfig.dbConnectionOptions;
+    const { dbConnectionOptions } = this.vendureConfig;
+    const testFilename = this.getCallerFilename(1);
+    const initializer = getInitializerFor(type);
+    try {
+        await initializer.init(testFilename, dbConnectionOptions);
+        const populateFn = () => this.populateInitialData(this.vendureConfig, options);
+        await initializer.populate(populateFn);
+        await initializer.destroy();
+    } catch (e: any) {
+        throw e;   // ← 仅重新抛出，没有 finally 块做清理
+    }
+    await this.bootstrap();
+}
+```
+
+**关键发现**：这个 try-catch 实质上是透传异常，**没有 `finally` 块**。这意味着：
+
+| 异常发生位置 | initializer.destroy() 是否执行 | 数据库清理 | 后续 bootstrap() 是否执行 |
+|-------------|-------------------------------|-----------|-------------------------|
+| `initializer.init()` 抛异常 | ❌ 不执行 | 不清理 | ❌ 不执行 |
+| `initializer.populate()` 抛异常 | ❌ 不执行 | 不清理 | ❌ 不执行 |
+| `initializer.destroy()` 抛异常 | （自身失败） | 部分清理 | ❌ 不执行 |
+| 全部成功 | ✅ 正常执行 | ✅ 正常清理 | ✅ 执行 |
+
+**潜在问题**：
+- 如果 `populate()` 失败，`initializer.destroy()` 不会被调用，对于 postgres/mysql 来说意味着**初始化阶段创建的数据库连接不会被关闭**，可能造成连接泄漏
+- 对于 sqljs，`destroy()` 本身就是 no-op（返回 `undefined`），所以即使不调用也没有资源泄漏，但**可能留下不完整的 `.sqlite` 文件**
+
+### 7.2 `populateForTesting()` 的配置回滚——缺少 finally 保护
+
+**文件**：`packages/testing/src/data-population/populate-for-testing.ts:15-37`
+
+```ts
+const originalRequireVerification = config.authOptions.requireVerification;
+config.authOptions.requireVerification = false;   // ← 临时修改
+
+const app = await bootstrapFn(config);
+await awaitOutstandingJobs(app);
+
+await populateInitialData(app, options.initialData);
+await populateProducts(app, options.productsCsvPath, logging);
+await populateCollections(app, options.initialData);
+await populateCustomers(app, options.customerCount ?? 10, logFn);
+
+config.authOptions.requireVerification = originalRequireVerification;  // ← 恢复
+return app;
+```
+
+**关键发现**：`requireVerification` 的恢复**不在 finally 块中**。如果 `populateInitialData()`、`populateProducts()`、`populateCollections()` 或 `populateCustomers()` 中任何一个抛出异常：
+
+1. `requireVerification` **永远不会恢复**为原值
+2. 由于 `config` 是引用传递且是全局共享对象，**后续使用同一 config 的测试也会受到污染**
+3. `app`（临时启动的 NestJS 实例）不会被关闭，可能导致端口未释放
+
+同样，`dbConnectionOptions.logging = false` 的修改也没有回滚机制。
+
+### 7.3 `populateInitialData()` 的 app 关闭——另一个无保护的 close
+
+**文件**：`packages/testing/src/test-server.ts:92-101`
+
+```ts
+private async populateInitialData(testingConfig, options): Promise<void> {
+    const app = await populateForTesting(testingConfig, this.bootstrapForTesting, {
+        logging: false,
+        ...options,
+    });
+    await app.close();  // ← 如果 populateForTesting 内部抛异常，close() 不会执行
+}
+```
+
+如果 `populateForTesting()` 在 `bootstrapFn()` 成功后的某个步骤抛异常，临时启动的 NestJS 应用不会被关闭，端口会一直占用。
+
+### 7.4 `bootstrapForTesting()` 的异常处理
+
+**文件**：`packages/testing/src/test-server.ts:106-138`
+
+```ts
+try {
+    DefaultLogger.hideNestBoostrapLogs();
+    const app = await NestFactory.create(appModule.AppModule, {
+        abortOnError: false,   // ← NestJS 不因模块初始化错误而中止
+    });
+    // ... listen, start JobQueue ...
+    return app;
+} catch (e: any) {
+    console.log(e);   // ← 仅打印，不做清理
+    throw e;
+}
+```
+
+`abortOnError: false` 意味着即使某些 Provider 初始化失败，NestJS 仍会尝试创建应用。如果应用创建成功但 `app.listen()` 抛异常（如端口被占用），则**已经创建的 NestJS 实例不会调用 `app.close()`**。
+
+### 7.5 各 Initializer 的 destroy() 行为对比
+
+| Initializer | destroy() 行为 | 不调用时的后果 |
+|-------------|---------------|--------------|
+| `SqljsInitializer` | `return undefined`（no-op） | **无影响**——sqljs 没有外部连接需要关闭 |
+| `PostgresInitializer` | `return this.client.end()` | **pg Client 连接泄漏**——初始化时创建的管理连接不会被释放 |
+| `MysqlInitializer` | `await this.conn.end()` | **mysql2 Connection 泄漏**——同上 |
+
+这是 sqljs 与 postgres/mysql 在错误恢复上的一个重要差异：sqljs 的 `destroy()` 是安全的 no-op，而 postgres/mysql 必须被调用才能释放资源。
+
+### 7.6 `clearAllTables()` —— 手动数据库重置工具
+
+**文件**：`packages/testing/src/data-population/clear-all-tables.ts`
+
+这是唯一一个使用了 `try...finally` 模式的清理函数：
+
+```ts
+export async function clearAllTables(config: VendureConfig, logging = true) {
+    config = await preBootstrapConfig(config);
+    const connection = await createConnection({ ...config.dbConnectionOptions });
+    try {
+        await connection.synchronize(true);   // ← DROP + CREATE 所有表
+    } catch (err: any) {
+        console.error('Error occurred when attempting to clear tables!');
+        console.log(err);
+    } finally {
+        await connection.close();             // ← 无论成功失败都关闭连接
+    }
+}
+```
+
+但注意这个函数**不在 e2e 测试的自动流程中使用**，它只在以下场景被手动调用：
+- `packages/dev-server/populate-dev-server.ts`：开发服务器重置数据
+- `packages/dev-server/load-testing/`：负载测试前清理数据库
+
+这意味着 e2e 测试框架本身**没有自动的"脏数据清理"机制**——测试失败后的数据库状态取决于 initializer 的类型和失败的位置。
+
+### 7.7 `awaitOutstandingJobs()` 的容错设计
+
+**文件**：`packages/testing/src/data-population/populate-for-testing.ts:48-71`
+
+```ts
+async function awaitOutstandingJobs(app: INestApplicationContext) {
+    const maxAttempts = 10;
+    let attempts = 0;
+    if (isInspectableJobQueueStrategy(jobQueueStrategy)) {
+        function waitForJobQueueToBeIdle() {
+            return new Promise<void>(resolve => {
+                const interval = setInterval(async () => {
+                    attempts++;
+                    const { items } = await inspectableJobQueueStrategy.findMany();
+                    const jobsOutstanding = items.filter(i => i.state === 'RUNNING' || i.state === 'PENDING');
+                    if (jobsOutstanding.length === 0 || attempts >= maxAttempts) {
+                        clearInterval(interval);
+                        resolve();    // ← 超时后也 resolve，不抛异常
+                    }
+                }, 500);
+            });
+        }
+        await waitForJobQueueToBeIdle();
+    }
+}
+```
+
+这是一个**软容错**设计：
+- 最多轮询 10 次，每次间隔 500ms，总计最多等待 ~5s
+- 如果 10 次后仍有未完成的任务，**不会报错**而是静默继续
+- 如果 JobQueueStrategy 不支持 `findMany()` 检查（`isInspectableJobQueueStrategy` 为 false），直接跳过
+- 这种设计避免了测试框架因 JobQueue 的正常异步行为而卡死，但也意味着偶尔可能在 Job 未完成时就开始 populate，导致数据不一致
+
+---
+
+## 八、sqljs 与 postgres/mysql 在缓存命中与重建触发条件上的详细对比
+
+### 8.1 核心差异总表
+
+| 维度 | SqljsInitializer | PostgresInitializer / MysqlInitializer |
+|------|-----------------|---------------------------------------|
+| 存储模型 | 单个 `.sqlite` 文件 | 独立的 `e2e_xxx` 数据库 |
+| 缓存检测 | `fs.existsSync(this.dbFilePath)` | **无缓存检测**——每次 `init()` 都 DROP + CREATE |
+| 缓存命中行为 | 跳过整个 `populateFn()` | N/A（永远不命中） |
+| 重建触发 | 文件不存在时 | 每次运行 |
+| `synchronize` 时机 | 仅 populate 期间 `true`，之后改回 `false` | `init()` 时写入 `connectionOptions`，此后一直为 `true` |
+| `autoSave` 时机 | 仅 populate 期间 `true`，之后改回 `false` | N/A（postgres/mysql 没有 autoSave 概念） |
+| `destroy()` 行为 | no-op | 关闭管理连接 |
+| 初始化前的破坏性操作 | 无 | `DROP DATABASE IF EXISTS` + `CREATE DATABASE` |
+| 部分写入风险 | **有**——populate 中途失败可能留下不完整文件 | **无**——每次都从头创建 |
+
+### 8.2 sqljs 缓存命中的判断逻辑详解
+
+```ts
+async populate(populateFn: () => Promise<void>): Promise<void> {
+    if (!fs.existsSync(this.dbFilePath)) {   // ← 唯一判断条件
+        // ... 执行 populate ...
+    }
+    // 文件已存在 → 什么都不做
+}
+```
+
+缓存命中的条件**极其简单**：目标路径上存在同名文件。这带来几个微妙的行为：
+
+1. **空文件也算"命中"**：如果之前的 populate 在写入数据前就崩溃了（比如 `mkdirSync` 成功但 `populateFn()` 抛异常），可能留下一个空的或损坏的 `.sqlite` 文件。下次运行会认为"缓存命中"而跳过填充，然后 bootstrap 阶段就会因为数据库为空而报错。
+
+2. **schema 变更不会自动触发重建**：如果代码中的 entity 定义改变了（加字段、改类型等），但 `.sqlite` 文件还在，sqljs 会加载旧 schema 的数据库。由于 populate 被跳过，`synchronize` 也被设为 `false`，TypeORM 不会自动同步 schema，导致运行时错误。**必须手动删除 `__data__/` 目录下的 `.sqlite` 文件**。
+
+3. **`.gitkeep` 保证目录存在**：`packages/core/e2e/__data__/.gitkeep` 确保 `__data__/` 目录被 git 跟踪（即使为空），这样 clone 后目录就已存在，`mkdirSync` 不会因为父目录不存在而失败。
+
+4. **gitignore 保护**：`.gitignore` 规则 `e2e/__data__/*.sqlite` + `!e2e/__data__/.gitkeep` 确保 `.sqlite` 文件不被提交，但 `.gitkeep` 保留。
+
+### 8.3 sqljs populate 期间的临时配置变异
+
+```ts
+// populate 开始前
+connectionOptions.autoSave = true;      // 让 TypeORM 自动保存变更到文件
+connectionOptions.synchronize = true;    // 让 TypeORM 自动同步 schema
+
+await populateFn();                      // 执行耗时填充
+
+await new Promise(resolve => setTimeout(resolve, this.postPopulateTimeoutMs));
+
+// populate 完成后
+connectionOptions.autoSave = false;      // 关闭自动保存（文件已固化）
+connectionOptions.synchronize = false;   // 关闭自动同步
+```
+
+**如果 `populateFn()` 抛异常**：
+- `autoSave` 和 `synchronize` **不会被恢复**为 `false`
+- `connectionOptions` 是引用传递，被修改的状态会传播到后续的 `bootstrapForTesting()`
+- 第二次 bootstrap 时 TypeORM 会以 `synchronize: true` 启动，可能意外修改已填充的 schema
+- `autoSave: true` 在 sqljs 模式下会让 TypeORM 在每次写操作后都把整个数据库序列化到磁盘，降低性能
+
+**`postPopulateTimeoutMs` 的作用**：
+
+```ts
+await new Promise(resolve => setTimeout(resolve, this.postPopulateTimeoutMs));
+```
+
+这是一个延迟保护，默认值为 `0`（不等待）。`default-search-plugin.bench.ts` 中设为 `1000`（1秒），原因是 populate 完成后 JobQueue 中可能还有搜索索引更新的异步任务在执行。如果在这些任务完成前就关闭应用（`app.close()`），sqljs 的内存数据库可能来不及保存最终状态。这个 timeout 给异步任务一个"宽限期"来完成。
+
+### 8.4 postgres/mysql 的无缓存策略详解
+
+```ts
+// PostgresInitializer.init()
+const dbName = this.getDbNameFromFilename(testFileName);
+this.client = await this.getPostgresConnection(connectionOptions);
+(connectionOptions as any).database = dbName;
+(connectionOptions as any).synchronize = true;
+await this.client.query(`DROP DATABASE IF EXISTS ${dbName}`);
+await this.client.query(`CREATE DATABASE ${dbName}`);
+return connectionOptions;
+```
+
+**关键区别**：
+1. **每次都是全新开始**：`DROP + CREATE` 确保每次测试运行面对的是完全干净的数据库，不存在"脏数据"或"旧 schema"问题
+2. **不需要缓存**：postgres/mysql 的 populate 操作通常比 sqljs 快得多（无需序列化整个数据库到文件），所以没有缓存优化的需求
+3. **`synchronize` 始终为 `true`**：与 sqljs 不同，postgres/mysql 的 `synchronize` 在 `init()` 时写入 `connectionOptions` 后**永远不会再改回 `false`**。这意味着第二次 bootstrap 时 TypeORM 仍会尝试同步 schema——但由于数据库是新建的，这不会造成问题
+4. **`init()` 阶段的破坏性**：DROP DATABASE 是不可逆的。如果在并行测试中有另一个进程正在使用同名数据库，会导致严重问题。不过由于数据库名基于文件名（`e2e_<test-file-name>`），只要不同测试文件不重名就不会冲突
+
+### 8.5 三种 initializer 的完整生命周期对比
+
+```
+SqljsInitializer:
+  init()     → 计算文件路径，写入 connectionOptions.location
+  populate() → 文件不存在? → 临时变异 config → 执行 populateFn → 恢复 config
+               文件已存在? → 什么都不做（缓存命中）
+  destroy()  → no-op
+
+PostgresInitializer:
+  init()     → 连接 postgres 库 → DROP DATABASE → CREATE DATABASE → 写入 connectionOptions
+  populate() → 直接执行 populateFn（无条件）
+  destroy()  → 关闭管理连接
+
+MysqlInitializer:
+  init()     → 连接 mysql → DROP DATABASE → CREATE DATABASE → 写入 connectionOptions
+  populate() → 直接执行 populateFn（无条件）
+  destroy()  → 关闭管理连接
+```
+
+### 8.6 缓存失效场景汇总
+
+| 场景 | sqljs 行为 | postgres/mysql 行为 |
+|------|-----------|-------------------|
+| 首次运行 | 文件不存在 → populate → 创建 .sqlite | 新建数据库 → populate |
+| 再次运行（无变更） | 文件存在 → **跳过 populate**（缓存命中） | DROP + CREATE → **重新 populate** |
+| Entity schema 变更 | 文件存在但 schema 旧 → 跳过 populate → **运行时报错** | DROP + CREATE → 重新 populate → 自动适配 |
+| 数据库损坏 | 文件存在但损坏 → 跳过 populate → **运行时报错** | 不存在"损坏"概念（每次重建） |
+| 测试数据调整 | 文件存在但数据旧 → 跳过 populate → **测试断言失败** | DROP + CREATE → 重新 populate → 数据总是最新 |
+| 手动清除缓存 | `rm -rf __data__/*.sqlite` | 不需要 |
+
+**实践建议**：
+- sqljs 模式下，任何涉及 entity 或 initialData 的代码变更后，都应删除 `__data__/` 目录
+- CI 环境中每次都是全新 checkout，不存在缓存文件，所以不存在此问题
+- postgres/mysql 模式没有缓存问题，但代价是每次都要重新 populate
