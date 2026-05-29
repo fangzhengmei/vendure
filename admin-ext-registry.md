@@ -37,6 +37,11 @@
   - [8.8.3 三层判定输入/输出详情](#883-三层判定输入输出详情)
   - [8.8.4 优先排查顺序与故障关联](#884-优先排查顺序与故障关联)
 - [8.9 最小排障清单](#89-最小排障清单)
+- [9. 跨端权限异常排查手册（可直接执行）](#9-跨端权限异常排查手册可直接执行)
+  - [9.1 Dashboard (React) 权限异常最小复现样例](#91-dashboard-react-权限异常最小复现样例)
+  - [9.2 Admin UI (Angular) 权限异常最小复现样例](#92-admin-ui-angular-权限异常最小复现样例)
+  - [9.3 跨端权限异常定位路径（执行清单）](#93-跨端权限异常定位路径执行清单)
+  - [9.4 常见故障速查表](#94-常见故障速查表)
 - [10. 关键文件索引](#10-关键文件索引)
 - [11. 总结](#11-总结)
 
@@ -1643,6 +1648,745 @@ export interface ActionBarItem {
    globalThis.globalRegistry.get('navMenuConfig')
    globalThis.globalRegistry.get('registerDashboardExtensionCallbacks').size
    ```
+
+---
+
+## 9. 跨端权限异常排查手册（可直接执行）
+
+本章提供 Dashboard 和 Admin UI 各一套**最小可复现样例**，以及完整的定位路径。每一个样例都包含：触发条件、预期表现、实际表现、首个断点位置、日志观察项。
+
+---
+
+### 9.1 Dashboard (React) 权限异常最小复现样例
+
+#### 样例 1：导航菜单项不显示（最常见）
+
+**触发条件**：
+
+```typescript
+// 插件声明 - dashboard.ts
+defineDashboardExtension({
+    routes: [{
+        path: '/custom-page',
+        component: () => <div>Custom Page</div>,
+        navMenuItem: {
+            id: 'custom-page',
+            sectionId: 'catalog',
+            title: 'Custom Page',
+            // ⚠️ 关键：拼写错误或权限未分配
+            requiresPermission: 'ReadCustomPage',  // 假设该权限不存在或未分配
+        },
+    }],
+});
+```
+
+**服务端声明**（可选，用于测试权限存在性）：
+```typescript
+// my-plugin.plugin.ts
+const customPermission = new PermissionDefinition('CustomPage');
+// 产生: CreateCustomPage, ReadCustomPage, UpdateCustomPage, DeleteCustomPage
+
+// ⚠️ 如果忘记这一步，权限不会进入 GraphQL enum
+configuration: config => {
+    config.authOptions.customPermissions.push(customPermission);
+    return config;
+}
+```
+
+**预期表现**：
+- ✅ 权限存在且已分配 → Catalog 菜单下显示 "Custom Page"
+- ❌ 权限不存在或未分配 → 菜单项不显示（无报错）
+
+**实际表现**：
+- 现象：Catalog 菜单下没有 "Custom Page"
+- 控制台：无任何错误或警告
+- 路由：直接访问 `/custom-page` 可以正常进入（如果知道路径）
+
+**首个断点位置**：
+```
+packages/dashboard/src/lib/components/layout/nav-main.tsx:166
+// isItemAllowed 函数内
+```
+
+**断点时观察变量**：
+| 变量名 | 期望值 | 实际值（故障时） |
+|--------|--------|-----------------|
+| `item.requiresPermission` | `'ReadCustomPage'` | `'ReadCustomPage'` |
+| `item.id` | `'custom-page'` | `'custom-page'` |
+| `hasPermissions` 函数返回 | `true` | `false` |
+| `selectedChannel.permissions` | 包含 `'ReadCustomPage'` | 不包含 |
+
+**日志观察项**（浏览器控制台）：
+
+```javascript
+// 1. 检查权限是否在注册表中
+globalThis.globalRegistry.get('navMenuConfig').sections
+    .find(s => s.id === 'catalog')?.items
+    .map(i => ({ id: i.id, requiresPermission: i.requiresPermission }))
+
+// 2. 检查用户实际权限
+// 在 use-permissions.ts:37 断点处执行
+selectedChannel.permissions  // 查看数组中是否有目标权限
+
+// 3. 手动测试权限判定
+// 导入 usePermissions hook 后手动调用
+const { hasPermissions } = usePermissions();
+console.log(hasPermissions(['ReadCustomPage']));  // 应该返回 false（故障时）
+```
+
+---
+
+#### 样例 2：整个 section 神秘消失（二次过滤陷阱）
+
+**触发条件**：
+
+```typescript
+defineDashboardExtension({
+    routes: [{
+        path: '/page1',
+        component: () => <div>Page 1</div>,
+        navMenuItem: {
+            id: 'page1',
+            sectionId: 'my-custom-section',  // 注意：这是一个新 section
+            title: 'Page 1',
+            requiresPermission: 'NonExistentPermission',  // 权限不存在
+        },
+    }, {
+        path: '/page2',
+        component: () => <div>Page 2</div>,
+        navMenuItem: {
+            id: 'page2',
+            sectionId: 'my-custom-section',
+            title: 'Page 2',
+            requiresPermission: 'AnotherNonExistent',  // 权限也不存在
+        },
+    }],
+    navSections: [{  // 注册新 section
+        id: 'my-custom-section',
+        title: 'Custom Section',
+        icon: 'folder',
+        // ⚠️ 注意：DashboardNavSectionDefinition 不支持 requiresPermission！
+        // 即使这里写了，类型定义不包含，也不会生效
+    }],
+});
+```
+
+**预期表现**：
+- ✅ 权限存在 → "Custom Section" 显示，包含 Page 1 和 Page 2
+- ❌ 权限不存在 → 两个 item 都不显示 → **整个 section 也消失**（二次过滤）
+
+**实际表现**：
+- 现象：完全看不到 "Custom Section"，连标题都没有
+- 容易误以为：section 注册失败了
+- 实际原因：所有 item 被过滤后，section 因 `items.length === 0` 被二次过滤
+
+**首个断点位置**：
+```
+packages/dashboard/src/lib/components/layout/nav-main.tsx:192-199
+// getSortedSections 函数的第二重 filter
+```
+
+**断点时观察变量**：
+| 变量名 | 期望值 | 实际值（故障时） |
+|--------|--------|-----------------|
+| `section.id` | `'my-custom-section'` | `'my-custom-section'` |
+| `section.items.length` | `> 0` | `0` |
+| filter 返回值 | `true` | `false` |
+
+**日志观察项**：
+
+```javascript
+// 1. 检查 section 注册是否成功
+// 在 Phase 1 注册后执行
+globalThis.globalRegistry.get('navMenuConfig').sections
+    .map(s => ({ id: s.id, items: s.items?.map(i => i.id) }))
+
+// 2. 检查 item 权限过滤前的原始列表
+// 在 nav-main.tsx:187 断点前
+section.items  // 过滤前应该有 2 个 item
+
+// 3. 检查过滤后的列表
+allowedItems  // 过滤后应该是 []
+```
+
+---
+
+#### 样例 3：路由级自定义权限检查（loader 中重定向）
+
+**触发条件**：
+
+```typescript
+defineDashboardExtension({
+    routes: [{
+        path: '/restricted-page',
+        component: () => <div>Restricted Content</div>,
+        navMenuItem: {
+            id: 'restricted',
+            sectionId: 'catalog',
+            title: 'Restricted',
+            requiresPermission: ['ReadCatalog'],  // 导航可以通过
+        },
+        // ⚠️ loader 中做了额外权限检查
+        loader: async ({ context }) => {
+            // 模拟：检查更细粒度的权限
+            const hasSpecialPermission = false;  // 假设不满足
+            if (!hasSpecialPermission) {
+                // 重定向到首页
+                throw redirect({ to: '/' });
+            }
+            return { data: 'secret' };
+        },
+    }],
+});
+```
+
+**预期表现**：
+- ✅ loader 权限通过 → 正常显示页面
+- ❌ loader 权限不通过 → 重定向到 `/`
+
+**实际表现**：
+- 导航可以看到 "Restricted" 菜单项（因为 `requiresPermission: ['ReadCatalog']` 通过）
+- 点击后立即跳回首页
+- 没有任何错误提示（看起来像路由配置有问题）
+
+**首个断点位置**：
+```
+packages/dashboard/src/lib/framework/page/use-extended-router.tsx:71
+// createRoute 时的 loader 配置
+```
+
+**或者在自定义 loader 内部断点**：
+```
+your-plugin/ui/dashboard.ts: 你的 loader 函数内
+```
+
+**日志观察项**：
+
+```javascript
+// 1. 检查路由是否正确挂载
+// 在浏览器 DevTools → TanStack Router DevTools 中
+// 查看 /restricted-page 是否存在，其父节点是否是 _authenticated
+
+// 2. 检查 loader 是否执行
+// 在 loader 开头加 console.log
+console.log('loader executing, context:', context);
+
+// 3. 检查是否 throw redirect
+// 检查 Network 面板是否有两次请求：
+// - 第一次: GET /restricted-page → 302 redirect
+// - 第二次: GET / → 200
+```
+
+---
+
+#### 样例 4：组件按钮不显示（PermissionGuard）
+
+**触发条件**：
+
+```tsx
+// 自定义页面组件
+function CustomPage() {
+    return (
+        <div>
+            <h1>Custom Page</h1>
+            
+            {/* ⚠️ 按钮被 PermissionGuard 保护 */}
+            <PermissionGuard requires={['UpdateCustomPage']}>
+                <Button type="submit">Update Item</Button>
+            </PermissionGuard>
+        </div>
+    );
+}
+```
+
+**预期表现**：
+- ✅ 有 `UpdateCustomPage` 权限 → 按钮显示
+- ❌ 没有权限 → 按钮不显示（DOM 中不存在）
+
+**实际表现**：
+- 页面正常显示
+- "Update Item" 按钮完全看不到
+- 控制台：无报错
+
+**首个断点位置**：
+```
+packages/dashboard/src/lib/components/shared/permission-guard.tsx:47
+// PermissionGuard 组件 return 语句前
+```
+
+**断点时观察变量**：
+| 变量名 | 期望值 | 实际值（故障时） |
+|--------|--------|-----------------|
+| `requires` | `['UpdateCustomPage']` | `['UpdateCustomPage']` |
+| `permissions` (规范化后) | `['UpdateCustomPage']` | `['UpdateCustomPage']` |
+| `hasPermissions(permissions)` | `true` | `false` |
+
+**日志观察项**：
+
+```javascript
+// 1. 检查 PermissionGuard 的输入
+// 在 permission-guard.tsx:45 加日志
+console.log('PermissionGuard requires:', requires);
+console.log('PermissionGuard normalized:', Array.isArray(requires) ? requires : [requires]);
+
+// 2. 检查 hasPermissions 的返回值
+console.log('hasPermissions result:', hasPermissions(permissions));
+
+// 3. 检查最终返回
+// 如果返回 null，说明权限检查不通过
+// 如果返回 children，说明权限通过
+```
+
+---
+
+### 9.2 Admin UI (Angular) 权限异常最小复现样例
+
+#### 样例 1：导航菜单项不显示（类型不支持数组）
+
+**触发条件**：
+
+```typescript
+// providers.ts
+import { addNavMenuItem } from '@vendure/admin-ui/core';
+
+export default [
+    addNavMenuItem({
+        id: 'custom-menu',
+        label: 'Custom Menu',
+        routerLink: ['/extensions/custom'],
+        icon: 'star',
+        sectionId: 'catalog',
+        // ⚠️ 错误：传了数组，但类型不支持！
+        requiresPermission: ['ReadCatalog', 'ReadCustomPage'],  // ❌ 不支持数组
+    }),
+];
+```
+
+**注意**：`NavMenuItem.requiresPermission` 类型是 `string | ((perms) => boolean)`，**不支持数组**！传数组会导致编译错误或运行时意外。
+
+**正确写法**（OR 逻辑）：
+```typescript
+// 方法 1：传单个字符串
+requiresPermission: 'ReadCatalog',
+
+// 方法 2：传 allow 函数实现 OR
+requiresPermission: (perms: string[]) => 
+    perms.includes('ReadCatalog') || perms.includes('ReadCustomPage'),
+```
+
+**预期表现**：
+- ✅ 正确写法 → 菜单项显示
+- ❌ 传数组 → 编译报错或运行时不显示
+
+**实际表现**：
+- 菜单项不显示
+- 控制台：可能无报错，或类型检查失败
+- 容易误以为：权限没分配
+
+**首个断点位置**：
+```
+packages/admin-ui/src/lib/core/src/components/base-nav/base-nav.component.ts:42
+// shouldDisplayLink 函数中的 string 判断分支
+```
+
+**断点时观察变量**：
+| 变量名 | 期望值 | 实际值（故障时） |
+|--------|--------|-----------------|
+| `menuItem.requiresPermission` | `string` 或 `function` | `Array(2)` 或 `undefined` |
+| `typeof menuItem.requiresPermission` | `'string'` 或 `'function'` | `'object'`（数组） |
+| 函数返回值 | `true` 或 `false` | `undefined`（不进入任何分支） |
+
+**日志观察项**：
+
+```javascript
+// 1. 检查 requiresPermission 的类型
+// 在浏览器控制台断点处
+typeof menuItem.requiresPermission
+// 应该是 'string' 或 'function'
+// 如果是 'object'，说明传了数组
+
+// 2. 检查 userPermissions
+this.userPermissions
+// 查看是否包含预期的权限
+
+// 3. 手动测试判定逻辑
+// 在断点处执行
+if (typeof menuItem.requiresPermission === 'string') {
+    console.log('string branch:', this.userPermissions.includes(menuItem.requiresPermission));
+} else if (typeof menuItem.requiresPermission === 'function') {
+    console.log('function branch:', menuItem.requiresPermission(this.userPermissions));
+} else {
+    console.log('unknown type, no check performed!');
+}
+```
+
+---
+
+#### 样例 2：权限未加载时菜单白屏（初始态问题）
+
+**触发条件**：
+
+页面初始加载时，`userPermissions` 还未从后端获取。
+
+```typescript
+// base-nav.component.ts:35-37
+shouldDisplayLink(menuItem) {
+    if (!this.userPermissions) {
+        return false;  // ⚠️ 权限未加载时直接返回 false
+    }
+    // ...
+}
+```
+
+**预期表现**：
+- ✅ 权限加载完成后 → 菜单显示
+- ⚠️ 加载过程中 → 临时空白
+
+**实际表现**：
+- 刚进入页面时，侧栏完全空白（白屏）
+- 约 1-2 秒后，菜单突然出现
+- 网络慢时特别明显
+
+**首个断点位置**：
+```
+packages/admin-ui/src/lib/core/src/components/base-nav/base-nav.component.ts:36
+// !this.userPermissions 判断行
+```
+
+**断点时观察变量**：
+| 变量名 | 加载前 | 加载后 |
+|--------|--------|--------|
+| `this.userPermissions` | `undefined` 或 `[]` | `['Authenticated', 'ReadCatalog', ...]` |
+| `shouldDisplayLink` 返回 | `false` | `true`/`false` |
+
+**日志观察项**：
+
+```javascript
+// 1. 检查 userStatus query 状态
+// DevTools → Network → 找到 userStatus query
+// 查看是否 pending 或已完成
+
+// 2. 检查权限设置时机
+// 在 permissions.service.ts:28 断点
+// 查看 setCurrentUserPermissions 何时被调用
+
+// 3. 检查订阅时间
+// 在 base-nav.component.ts:52-57 断点
+// 查看 userStatus().mapStream 何时触发
+this.subscription = this.dataService.client
+    .userStatus()
+    .mapStream(({ userStatus }) => {
+        console.log('permissions loaded:', userStatus.permissions);
+        this.userPermissions = userStatus.permissions;
+    })
+    .subscribe();
+```
+
+---
+
+#### 样例 3：按钮禁用而非隐藏（管道 vs 指令差异）
+
+**触发条件**：
+
+```html
+<!-- 方式 1：用管道控制 disabled -->
+<button 
+    class="button"
+    [disabled]="!(['UpdateProduct'] | hasPermission)"
+>
+    Update Product
+</button>
+
+<!-- 方式 2：用结构指令控制显示 -->
+<button 
+    *vdrIfPermissions="'UpdateProduct'"
+    class="button"
+>
+    Update Product
+</button>
+```
+
+**预期表现**：
+- ✅ 有 `UpdateProduct` 权限 → 按钮正常显示并启用
+- ❌ 无权限 → 方式 1：按钮可见但禁用；方式 2：按钮完全不显示
+
+**实际表现**（开发者容易混淆）：
+- 以为管道会让按钮消失 → 实际只是禁用
+- 用户能看到按钮但点不了
+- 容易误以为：按钮样式有问题
+
+**首个断点位置**：
+
+管道问题：
+```
+packages/admin-ui/src/lib/core/src/shared/pipes/has-permission.pipe.ts:36
+// transform 函数返回处
+```
+
+指令问题：
+```
+packages/admin-ui/src/lib/core/src/shared/directives/if-permissions.directive.ts:46
+// updateViewFn 中调用 userHasPermissions 处
+```
+
+**日志观察项**：
+
+```javascript
+// 1. 检查管道输入输出
+// 在 has-permission.pipe.ts:34 加日志
+console.log('hasPermission pipe input:', input);
+console.log('hasPermission pipe output:', this.hasPermission);
+
+// 2. 检查指令逻辑
+// 在 if-permissions.directive.ts:45 加日志
+console.log('vdrIfPermissions input:', permissions);
+console.log('vdrIfPermissions result:', this.permissionsService.userHasPermissions(permissions));
+
+// 3. 关键：检查 userHasPermissions 实现
+// 确认是 OR 逻辑（for 循环任一匹配）
+this.permissionsService.userHasPermissions(['A', 'B'])
+// 返回 true 只要有一个权限匹配
+```
+
+---
+
+#### 样例 4：ActionBarItem 支持数组（与 NavMenuItem 不一致）
+
+**触发条件**：
+
+```typescript
+// providers.ts
+import { addActionBarItem } from '@vendure/admin-ui/core';
+
+export default [
+    addActionBarItem({
+        id: 'custom-action',
+        label: 'Custom Action',
+        locationId: 'product-detail',
+        routerLink: ['/extensions/custom'],
+        // ✅ ActionBarItem 支持数组！（与 NavMenuItem 不同！）
+        requiresPermission: ['UpdateProduct', 'UpdateCatalog'],  // OR 逻辑
+    }),
+];
+```
+
+**注意类型差异**：
+- `NavMenuItem.requiresPermission`: `string | ((perms) => boolean)` ❌ 不支持数组
+- `ActionBarItem.requiresPermission`: `string | string[]` ✅ 支持数组
+
+**预期表现**：
+- ✅ 任一权限满足 → 按钮显示
+- ❌ 都不满足 → 按钮不显示
+
+**实际表现**：
+- 容易混淆：开发者可能以为 NavMenuItem 也支持数组
+- 复制代码时导致 NavMenuItem 权限失效
+
+**首个断点位置**：
+```
+packages/admin-ui/src/lib/core/src/shared/components/action-bar-items/action-bar-items.component.html:5
+// *vdrIfPermissions 结构指令处
+```
+
+**日志观察项**：
+
+```javascript
+// 1. 检查 ActionBarItem 配置
+// 在 action-bar-base.component.ts:17 断点
+items.map(item => ({ 
+    id: item.id, 
+    requiresPermission: item.requiresPermission 
+}))
+
+// 2. 检查 vdrIfPermissions 实际接收的参数
+// 在 if-permissions.directive.ts:56 断点
+this.permissionToCheck
+// 应该是数组被标准化后的值
+
+// 3. 检查类型定义差异
+// 对比:
+// nav-builder-types.ts:46 (NavMenuItem)
+// nav-builder-types.ts:215 (ActionBarItem)
+```
+
+---
+
+### 9.3 跨端权限异常定位路径（执行清单）
+
+按以下顺序执行，可在 5 分钟内定位 95% 的权限异常。
+
+---
+
+#### 第一步：确认权限本身存在（服务端）
+
+**执行步骤**：
+
+1. 打开 Admin API Playground（通常是 `/admin-api`）
+2. 执行以下查询：
+   ```graphql
+   query CheckPermissionExists {
+       globalSettings {
+           serverConfig {
+               permissions {
+                   name
+                   assignable
+               }
+           }
+       }
+   }
+   ```
+3. 在结果中搜索你的权限名（如 `ReadCustomPage`）
+
+**判断标准**：
+- ✅ 权限存在 → 继续下一步
+- ❌ 权限不存在 → 问题在服务端，检查：
+  - `PermissionDefinition` 是否正确实例化
+  - 是否推入了 `config.authOptions.customPermissions`
+  - 服务是否重启（插件变更需要重启）
+
+---
+
+#### 第二步：确认用户拥有该权限
+
+**执行步骤**：
+
+1. 在 Admin API Playground 执行：
+   ```graphql
+   query CheckUserPermissions {
+       me {
+           channels {
+               id
+               code
+               permissions
+           }
+       }
+   }
+   ```
+2. 找到当前 active channel 的 permissions 数组
+3. 搜索目标权限
+
+**判断标准**：
+- ✅ 权限在数组中 → 继续下一步
+- ❌ 权限不在数组中 → 检查：
+  - 角色是否分配了该权限（Settings → Roles）
+  - 角色是否分配到当前 channel
+  - 是否切换到正确的 channel
+
+---
+
+#### 第三步：Dashboard 快速排查（30 秒）
+
+**执行步骤**：
+
+1. 打开浏览器控制台
+2. 检查注册表：
+   ```javascript
+   // 查看所有导航配置
+   const config = globalThis.globalRegistry.get('navMenuConfig');
+   console.log('nav sections:', config.sections.map(s => s.id));
+   
+   // 查看目标 section 的 items
+   const section = config.sections.find(s => s.id === 'catalog');
+   console.log('section items:', section?.items.map(i => ({
+       id: i.id,
+       requiresPermission: i.requiresPermission
+   })));
+   ```
+3. 检查 active channel：
+   ```javascript
+   // 从 React DevTools 或 localStorage 获取
+   localStorage.getItem('vendure-active-channel-token');
+   ```
+
+**判断标准**：
+- ✅ item 已注册 → 问题在判定逻辑
+- ❌ item 未注册 → 问题在扩展注册阶段
+
+---
+
+#### 第四步：Admin UI 快速排查（30 秒）
+
+**执行步骤**：
+
+1. 打开浏览器 DevTools → Sources
+2. 在 `base-nav.component.ts:35` 设断点
+3. 刷新页面，断点触发时：
+   ```javascript
+   // 检查输入
+   console.log('menuItem:', menuItem);
+   console.log('requiresPermission:', menuItem.requiresPermission);
+   console.log('type:', typeof menuItem.requiresPermission);
+   
+   // 检查用户权限
+   console.log('userPermissions:', this.userPermissions);
+   
+   // 手动执行判定
+   if (!this.userPermissions) {
+       console.log('❌ permissions not loaded yet');
+   } else if (!menuItem.requiresPermission) {
+       console.log('✅ no permission required');
+   } else if (typeof menuItem.requiresPermission === 'string') {
+       console.log('string check:', this.userPermissions.includes(menuItem.requiresPermission));
+   } else if (typeof menuItem.requiresPermission === 'function') {
+       console.log('function check:', menuItem.requiresPermission(this.userPermissions));
+   } else {
+       console.log('❌ unsupported type:', typeof menuItem.requiresPermission);
+   }
+   ```
+
+---
+
+#### 第五步：确认 AND/OR 语义（容易踩坑）
+
+**执行步骤**：
+
+1. 确认你使用的是哪种权限检查方式
+2. 对照下表：
+
+| 方式 | 平台 | 逻辑 |
+|------|------|------|
+| `requiresPermission: 'A'` | 双端 | OR（单个 = OR） |
+| `requiresPermission: ['A', 'B']` | Dashboard | **OR**（任一满足） |
+| `requiresPermission: ['A', 'B']` | Admin UI ActionBar | **OR**（任一满足） |
+| `requiresPermission: (perms) => perms.includes('A') && perms.includes('B')` | Admin UI | **AND**（自定义函数） |
+| `<PermissionGuard requires={['A', 'B']}>` | Dashboard | **OR** |
+| `*vdrIfPermissions="['A', 'B']"` | Admin UI | **OR**（注释 BUG） |
+| `['A', 'B'] \| hasPermission` | Admin UI | **OR** |
+
+3. 如需 AND 逻辑：
+   - Dashboard：在组件中手动 `&&`
+   - Admin UI：传函数 `(perms) => perms.includes('A') && perms.includes('B')`
+
+---
+
+#### 第六步：确认类型支持（最容易忽略）
+
+**执行步骤**：
+
+对照差异边界表，确认你在正确的位置使用了正确的类型：
+
+| 位置 | 支持 `string[]` | 支持函数 |
+|------|---------------|---------|
+| Dashboard NavMenuItem | ✅ | ❌ |
+| Admin UI NavMenuItem | ❌ | ✅ |
+| Admin UI NavMenuSection | ❌ | ✅ |
+| Admin UI ActionBarItem | ✅ | ❌ |
+| Dashboard NavSection（扩展声明） | ❌ | ❌ |
+
+---
+
+### 9.4 常见故障速查表
+
+| 现象 | 可能原因 | 排查优先级 |
+|------|---------|-----------|
+| **菜单项完全不显示，无报错** | 1. 权限不存在<br>2. 权限未分配给角色<br>3. `requiresPermission` 拼写错误<br>4. Admin UI 传了数组不支持 | ⭐⭐⭐⭐⭐ |
+| **整个 section 消失，item 单独看都对** | section 下所有 item 都被过滤 → 二次过滤移除 | ⭐⭐⭐⭐ |
+| **初始加载时菜单白屏，过一会出现** | `userPermissions` 未加载时返回 false，Angular 特有 | ⭐⭐⭐ |
+| **按钮可见但点击不了（灰色）** | 使用了 `hasPermission` 管道控制 `disabled`，而非 `*vdrIfPermissions` | ⭐⭐⭐⭐ |
+| **点击菜单项跳回首页** | 路由 loader 中 `throw redirect()` 自定义权限拦截 | ⭐⭐⭐ |
+| **同一个权限在 ActionBar 工作但 NavMenu 不工作** | ActionBar 支持数组，NavMenu 不支持（Admin UI 特有） | ⭐⭐⭐ |
+| **传了数组但 AND 逻辑不生效** | 数组是 OR 逻辑，AND 需要传函数 | ⭐⭐⭐⭐ |
+| **Dashboard 新 section 无法设置权限** | `DashboardNavSectionDefinition` 类型定义缺少 `requiresPermission` | ⭐⭐ |
 
 ---
 
