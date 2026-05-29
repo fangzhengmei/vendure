@@ -872,7 +872,178 @@ return image.resize(width, height, options);
 
 ---
 
-### 4.10 缓存目录结构
+### 4.10 q=0 的边界行为分析
+
+#### 初始参数解析阶段
+
+**文件**：`packages/asset-server-plugin/src/asset-server.ts:195-196`
+
+```typescript
+const quality =
+    queryParams.q != null ? Math.round(Math.max(Math.min(+queryParams.q, 100), 1)) : undefined;
+```
+
+**关键细节**：质量参数的下限是 **1**，不是 0！
+- `Math.min(+queryParams.q, 100)` → 上限 100
+- `Math.max(..., 1)` → **下限 1**
+
+| URL 参数 | 解析后的值 | 说明 |
+|----------|-----------|------|
+| `?q=0` | `1` | 被 clamp 到下限 1 |
+| `?q=0.5` | `1` | Math.round(0.5) = 1 |
+| `?q=1` | `1` | 正常 |
+| `?q=50` | `50` | 正常 |
+| `?q=100` | `100` | 正常 |
+| `?q=101` | `100` | 被 clamp 到上限 100 |
+| 不传 `q` | `undefined` | 不设置质量 |
+
+#### PresetOnlyStrategy 过滤阶段
+
+**文件**：`packages/asset-server-plugin/src/config/preset-only-strategy.ts:97-99`
+
+```typescript
+const permittedQuality = this.options.permittedQuality ?? [0, 50, 75, 85, 95];
+const quality = input.quality && permittedQuality.includes(input.quality) ? input.quality : undefined;
+```
+
+默认 `permittedQuality = [0, 50, 75, 85, 95]`，**包含 0 但不包含 1！**
+
+#### q=0 的完整流向
+
+```
+URL: ?q=0
+   ↓
+getInitialImageTransformParameters():
+   Math.round(Math.max(Math.min(0, 100), 1)) → Math.round(1) → 1
+   ↓
+PresetOnlyStrategy (默认配置):
+   permittedQuality = [0, 50, 75, 85, 95]
+   1 && [0,50,75,85,95].includes(1) → 1 && false → false
+   → quality = undefined
+   ↓
+缓存键生成:
+   const quality = q ? `_q${q}` : '' → undefined ? ... : '' → 不追加 _q 后缀
+   ↓
+实际变换 applyFormat():
+   if (quality) → undefined → 不设置质量，使用 Sharp 默认值
+```
+
+**结论**：`?q=0` 经过初始解析变成 `1`，然后被默认的 `PresetOnlyStrategy` 过滤掉，最终质量参数为 `undefined`，等同于不传入 `q` 参数。
+
+#### 对缓存键和输出的影响
+
+| 配置场景 | URL | 最终 quality 值 | 缓存键是否包含 _q | 实际输出质量 |
+|---------|-----|----------------|-------------------|-------------|
+| 无 PresetOnlyStrategy | `?q=0` | `1` | ✅ `_q1` | 质量 1 |
+| 无 PresetOnlyStrategy | `?q=1` | `1` | ✅ `_q1` | 质量 1 |
+| 默认 PresetOnlyStrategy | `?q=0` | `undefined` | ❌ 不包含 | Sharp 默认 |
+| 默认 PresetOnlyStrategy | `?q=50` | `50` | ✅ `_q50` | 质量 50 |
+| 默认 PresetOnlyStrategy | `?q=1` | `undefined` | ❌ 不包含 | Sharp 默认 |
+
+**⚠️ 注意**：`PresetOnlyStrategy` 的默认 `permittedQuality` 包含 `0`，但初始解析器的下限是 `1`，这意味着默认配置下 `q=0` 永远无法生效——它会被初始解析器变成 1，然后被策略过滤掉。这是一个设计上的不一致。
+
+---
+
+### 4.11 fpx/fpy 超出 0-1 区间的行为
+
+#### 参数解析阶段
+
+**文件**：`packages/asset-server-plugin/src/asset-server.ts:198-199`
+
+```typescript
+const fpx = +queryParams.fpx || undefined;
+const fpy = +queryParams.fpy || undefined;
+```
+
+只要不是 0/falsy，**超出范围的值会被原样保留**：
+- `?fpx=-0.5` → `-0.5`（负数保留）
+- `?fpx=1.5` → `1.5`（大于 1 保留）
+- `?fpx=2` → `2`（整数保留）
+
+#### 缓存键生成阶段
+
+**文件**：`packages/asset-server-plugin/src/asset-server.ts:217`
+
+```typescript
+const focalPoint = fpx && fpy ? `_fpx${fpx}_fpy${fpy}` : '';
+```
+
+超出范围的值会**原样写入缓存键**：
+- `?fpx=1.5&fpy=-0.2` → `_fpx1.5_fpy-0.2`
+- 不同的 fpx/fpy 值（即使超出范围）会生成不同的缓存键
+
+#### 实际变换阶段
+
+**文件**：`packages/asset-server-plugin/src/transform-image.ts:32-47, 144-148`
+
+```typescript
+if (parameters.fpx && parameters.fpy && width && height && mode === 'crop') {
+    const metadata = await image.metadata();
+    const xCenter = parameters.fpx * metadata.width;
+    const yCenter = parameters.fpy * metadata.height;
+    // ... 调用 resizeToFocalPoint
+}
+
+// 在 getExtractionRegion 中
+region.left = clamp(0, intermediate.w - target.w, Math.round(newXCenter - target.w / 2));
+region.top = clamp(0, intermediate.h - target.h, Math.round(newYCenter - target.h / 2));
+
+function clamp(min: number, max: number, input: number) {
+    return Math.min(Math.max(min, input), max);
+}
+```
+
+**完整流程（以 1000x800 原图，裁剪到 200x200，fpx=1.5 为例）**：
+
+```
+1. 计算焦点像素坐标：
+   xCenter = 1.5 * 1000 = 1500 （超出图片宽度！）
+
+2. 等比缩放中间图：
+   假设 hRatio = 800/200 = 4, wRatio = 1000/200 = 5
+   → factor = 4（较小的那个）
+   → intermediate = 250x200（等比缩放后）
+
+3. 计算中间图中的焦点：
+   newXCenter = 1500 / 4 = 375
+
+4. 计算裁剪区域左边界：
+   left = 375 - 200/2 = 375 - 100 = 275
+
+5. clamp 到有效范围：
+   intermediate.w - target.w = 250 - 200 = 50
+   clamp(0, 50, 275) → 50
+
+6. 最终裁剪区域：
+   left = 50（紧贴右边界）
+```
+
+**行为总结**：
+- fpx/fpy 超出 0-1 范围时，**不会被过滤**，会直接参与焦点计算
+- 但 `clamp()` 函数会确保最终提取区域不会超出图片边界
+- fpx < 0 会被 clamp 到 0（左边界）
+- fpx > 1 会被 clamp 到最大值（右边界）
+- 同理 fpy < 0 → 上边界，fpy > 1 → 下边界
+
+#### 超出范围的效果对比表
+
+| URL | 理论焦点 | 实际裁剪效果 | 缓存键 |
+|-----|---------|-------------|--------|
+| `?fpx=-0.5&fpy=0.5` | 图片左侧外 | 紧贴左边界裁剪 | `_fpx-0.5_fpy0.5` |
+| `?fpx=0&fpy=0` | 左上角 | 熵裁剪（不是焦点裁剪！） | 不包含 focalPoint |
+| `?fpx=0.0001&fpy=0.0001` | 近似左上角 | 左上角焦点裁剪 | `_fpx0.0001_fpy0.0001` |
+| `?fpx=0.5&fpy=0.5` | 中心 | 中心裁剪 | `_fpx0.5_fpy0.5` |
+| `?fpx=1.5&fpy=0.5` | 图片右侧外 | 紧贴右边界裁剪 | `_fpx1.5_fpy0.5` |
+| `?fpx=2&fpy=-1` | 图片外 | 右下角裁剪 | `_fpx2_fpy-1` |
+
+**重要结论**：
+1. fpx/fpy 超出 0-1 范围不会报错，会被 clamp 到边界
+2. 不同的超出值（如 1.5 vs 2）会生成**不同的缓存键**，但裁剪效果可能相同（都紧贴右边界）
+3. 这可能导致缓存膨胀——多个不同的 fpx 值产生相同的裁剪结果，但占用不同的缓存条目
+
+---
+
+### 4.12 缓存目录结构
 
 ```
 asset-upload-dir/
@@ -1132,4 +1303,8 @@ interface ImageTransformStrategy {
 
 13. **错误响应统一无缓存头**：所有 400/404/500 响应都不设置 Cache-Control 和 CSP 头，浏览器/CDN 通常不缓存错误。
 
-14. **流错误防护**：`makeStreamGuard` 处理 `fs-capacitor` 的边界情况，确保流错误能被正确捕获。
+14. **q=0 的设计不一致**：初始解析器质量下限是 1（`Math.max(..., 1)`），但 PresetOnlyStrategy 默认 `permittedQuality` 包含 0。这导致 `?q=0` 先被 clamp 到 1，再被策略过滤掉，最终变成 undefined，等同于不传 q 参数。
+
+15. **fpx/fpy 超范围的 clamp 机制**：超出 0-1 的焦点值不会报错，会直接参与计算，但最终通过 `clamp()` 函数限制在图片边界内。不同超范围值（如 1.5 vs 2）可能生成不同缓存键但裁剪效果相同，存在缓存膨胀风险。
+
+16. **流错误防护**：`makeStreamGuard` 处理 `fs-capacitor` 的边界情况，确保流错误能被正确捕获。
